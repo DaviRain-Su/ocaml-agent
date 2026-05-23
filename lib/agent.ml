@@ -64,19 +64,43 @@ let truthy s =
   | "1" | "true" | "yes" | "y" | "all" -> true
   | _ -> false
 
+let env_int name default =
+  match Sys.getenv_opt name with Some s -> ( try int_of_string s with _ -> default) | None -> default
+
+let env_float name default =
+  match Sys.getenv_opt name with Some s -> ( try float_of_string s with _ -> default) | None -> default
+
 type t =
   { mutable cfg : Llm.config;
     mutable system : string;
     mutable turns : Llm.turn list; (* chronological *)
     session : Session.t option;
     mutable auto_approve : bool;
-    tools_enabled : bool }
+    tools_enabled : bool;
+    context_window : int;
+    compact_threshold : float; (* fraction of the window that triggers compaction *)
+    auto_compact : bool;
+    mutable last_input_tokens : int;
+    mutable last_output_tokens : int }
 
 let create ?session ?(initial_turns = []) ?(tools_enabled = true) cfg =
   let auto_approve =
     match Sys.getenv_opt "AGENT_AUTO_APPROVE" with Some v -> truthy v | None -> false
   in
-  { cfg; system = build_system_prompt cfg; turns = initial_turns; session; auto_approve; tools_enabled }
+  let auto_compact =
+    match Sys.getenv_opt "AGENT_AUTO_COMPACT" with Some v -> truthy v | None -> true
+  in
+  { cfg;
+    system = build_system_prompt cfg;
+    turns = initial_turns;
+    session;
+    auto_approve;
+    tools_enabled;
+    context_window = env_int "AGENT_CONTEXT_WINDOW" 128000;
+    compact_threshold = env_float "AGENT_COMPACT_THRESHOLD" 0.75;
+    auto_compact;
+    last_input_tokens = 0;
+    last_output_tokens = 0 }
 
 (* Swap the active model/provider; rebuilds the system prompt's identity line. *)
 let set_config t cfg =
@@ -88,6 +112,9 @@ let reset t = t.turns <- []
 
 let config t = t.cfg
 let turn_count t = List.length t.turns
+
+(* Change the reasoning level live. *)
+let set_thinking t level = t.cfg <- { t.cfg with Llm.thinking = level }
 
 (* Append a turn to history and persist it if a session is open. *)
 let add t turn =
@@ -143,6 +170,81 @@ let run_tool t id name input : Llm.content =
   in
   Llm.Tool_result { id; content = result }
 
+(* --- context accounting + compaction --- *)
+
+let content_chars = function
+  | Llm.Text s -> String.length s
+  | Llm.Thinking { text; _ } -> String.length text
+  | Llm.Tool_use { input; _ } -> String.length (Yojson.Safe.to_string input)
+  | Llm.Tool_result { content; _ } -> String.length content
+
+let estimate_tokens t =
+  let chars =
+    List.fold_left
+      (fun a turn -> a + List.fold_left (fun b c -> b + content_chars c) 0 turn.Llm.content)
+      0 t.turns
+  in
+  chars / 4
+
+(* Best-known size of the current context: real input tokens if the API gave us
+   any, else a chars/4 estimate. *)
+let context_used t = if t.last_input_tokens > 0 then t.last_input_tokens else estimate_tokens t
+
+let usage_info t =
+  let used = context_used t in
+  (used, t.context_window, float_of_int used /. float_of_int t.context_window)
+
+let keep_recent = 6
+
+let has_tool_result turn =
+  List.exists (function Llm.Tool_result _ -> true | _ -> false) turn.Llm.content
+
+let turn_to_text (turn : Llm.turn) =
+  let role = match turn.Llm.role with User -> "User" | Assistant -> "Assistant" in
+  let part = function
+    | Llm.Text s -> s
+    | Llm.Thinking _ -> "" (* thinking is not carried into summaries *)
+    | Llm.Tool_use { name; input; _ } -> Printf.sprintf "[tool %s %s]" name (Yojson.Safe.to_string input)
+    | Llm.Tool_result { content; _ } -> "[result] " ^ content
+  in
+  role ^ ": " ^ String.concat "\n" (List.map part turn.Llm.content)
+
+(* Summarize all but the most recent turns into a single synthetic user turn. *)
+let compact t =
+  let n = List.length t.turns in
+  if n <= keep_recent + 1 then "Nothing to compact."
+  else begin
+    let rec split i acc = function
+      | x :: xs when i > 0 -> split (i - 1) (x :: acc) xs
+      | rest -> (List.rev acc, rest)
+    in
+    let older, recent = split (n - keep_recent) [] t.turns in
+    (* Don't strand a tool_result whose tool_use is being summarized away. *)
+    let rec fix older recent =
+      match recent with r :: rs when has_tool_result r -> fix (older @ [ r ]) rs | _ -> (older, recent)
+    in
+    let older, recent = fix older recent in
+    let transcript = String.concat "\n\n" (List.map turn_to_text older) in
+    let sys =
+      "You are a summarizer for a coding agent. Produce a concise but complete summary of \
+       the conversation so far, preserving key decisions, file changes made, important \
+       facts learned, and any open tasks. Output only the summary."
+    in
+    let prompt = [ { Llm.role = User; content = [ Llm.Text ("Summarize this conversation:\n\n" ^ transcript) ] } ] in
+    let blocks, _ = Llm.complete t.cfg ~system:sys ~tools_enabled:false prompt in
+    let summary = String.concat "\n" (List.filter_map (function Llm.Text s -> Some s | _ -> None) blocks) in
+    let summary_turn = { Llm.role = User; content = [ Llm.Text ("[Earlier conversation summary]\n" ^ summary) ] } in
+    t.turns <- summary_turn :: recent;
+    t.last_input_tokens <- 0;
+    (* force re-estimate next turn *)
+    Printf.sprintf "Compacted %d older turns into a summary." (List.length older)
+  end
+
+let should_compact t =
+  t.auto_compact
+  && float_of_int (context_used t) > t.compact_threshold *. float_of_int t.context_window
+  && List.length t.turns > keep_recent + 1
+
 let rec step t : string =
   let streamed = ref false in
   let on_text s =
@@ -150,8 +252,13 @@ let rec step t : string =
     print_string s;
     flush stdout
   in
-  let blocks = Llm.complete t.cfg ~system:t.system ~on_text ~tools_enabled:t.tools_enabled t.turns in
+  let blocks, usage = Llm.complete t.cfg ~system:t.system ~on_text ~tools_enabled:t.tools_enabled t.turns in
+  if usage.Llm.input_tokens > 0 then t.last_input_tokens <- usage.Llm.input_tokens;
+  if usage.Llm.output_tokens > 0 then t.last_output_tokens <- usage.Llm.output_tokens;
   if !streamed then print_newline ();
+  List.iter
+    (function Llm.Thinking { text; _ } when text <> "" -> Printf.printf "%s\n%!" (dim ("\xf0\x9f\x92\xad " ^ text)) | _ -> ())
+    blocks;
   add t { Llm.role = Assistant; content = blocks };
   let texts = List.filter_map (function Llm.Text s -> Some s | _ -> None) blocks in
   let tool_results =
@@ -168,5 +275,9 @@ let rec step t : string =
   else String.concat "\n" texts
 
 let send t (user_input : string) : string =
+  if should_compact t then begin
+    Printf.printf "%s\n%!" (dim "Auto-compacting context...");
+    ignore (compact t)
+  end;
   add t { Llm.role = User; content = [ Llm.Text user_input ] };
   step t

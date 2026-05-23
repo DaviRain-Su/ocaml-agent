@@ -36,7 +36,9 @@ let print_help () =
   List.iter
     (fun (c, d) -> Printf.printf "  %-22s %s\n" c d)
     [ ("/model [alias] [name]", "switch provider/model, or list providers");
-      ("/session", "show current model and turn count");
+      ("/session", "show current model, turn count, and context usage");
+      ("/compact", "summarize older turns to free up context");
+      ("/think <level>", "set reasoning level (off/low/medium/high)");
       ("/new", "clear the conversation");
       ("/help", "show this help");
       ("/exit, /quit", "quit") ];
@@ -65,7 +67,17 @@ let handle_command agent line =
   match parts with
   | "/help" :: _ -> print_help ()
   | "/session" :: _ ->
-    Printf.printf "%s | %d turns\n%!" (Llm.describe (Agent.config agent)) (Agent.turn_count agent)
+    let used, window, pct = Agent.usage_info agent in
+    let cfg = Agent.config agent in
+    Printf.printf "%s | think:%s | %d turns | context ~%d/%d (%.0f%%)\n%!" (Llm.describe cfg)
+      cfg.Llm.thinking (Agent.turn_count agent) used window (pct *. 100.)
+  | "/think" :: rest ->
+    let level = match rest with l :: _ -> l | [] -> "off" in
+    Agent.set_thinking agent level;
+    Printf.printf "%s reasoning level = %s\n%!" (dim "Set") level
+  | "/compact" :: _ ->
+    print_string (dim (Agent.compact agent ^ "\n"));
+    flush stdout
   | "/new" :: _ ->
     Agent.reset agent;
     print_string (dim "Conversation cleared.\n");

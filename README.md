@@ -23,13 +23,21 @@ test/test_tools.ml Offline smoke tests (tools, turn JSON, session, system prompt
 ## Features
 
 - **Multi-provider** via env vars (Anthropic / OpenAI / DeepSeek / Kimi / any compatible endpoint).
+- **Tools**: `read_file`, `write_file`, `edit_file` (multi-edit + diff), `list_dir`,
+  `grep` (regex search), `find` (glob), `run_bash`.
 - **Streaming output** — assistant text is printed token-by-token as it arrives (SSE).
+- **Reasoning levels** — `off/low/medium/high` mapped to Anthropic thinking budgets
+  and OpenAI `reasoning_effort`; thinking output shown dimmed.
+- **Context tracking + auto-compaction** — token usage is read from the API and
+  older turns are summarized automatically as the context window fills.
 - **Project-context injection** — `AGENTS.md` / `CLAUDE.md` in the cwd, plus the
-  working directory and date, are folded into the system prompt automatically.
+  working directory, date, and the live provider/model identity, folded into the system prompt.
 - **run_bash approval gate** — shell commands prompt for `[y]es / [N]o / [a]lways`
   before running (skip with `AGENT_AUTO_APPROVE=1`; denied automatically when there's no TTY).
-- **Session persistence** — set `AGENT_SESSION_FILE` to append each turn as JSONL
-  and resume the conversation on the next run.
+- **Session persistence** — set `AGENT_SESSION_FILE` (or use `-c`) to append each
+  turn as JSONL and resume the conversation on the next run.
+- **Interactive commands**: `/model`, `/think`, `/compact`, `/session`, `/new`, `/help`.
+- **CLI flags**: `-m/--model`, `--provider`, `--thinking`, `-c`, `-p`, `--no-tools`.
 
 The only dependencies are `yojson`, `unix`, and `str`. HTTP is done by shelling
 out to `curl`, so there's no TLS/HTTP stack to install.
@@ -99,6 +107,10 @@ Overrides (all optional):
 | `AGENT_MAX_TOKENS`   | Max output tokens (default `4096`)                           |
 | `AGENT_AUTO_APPROVE` | Skip the run_bash approval prompt when truthy                |
 | `AGENT_SESSION_FILE` | JSONL file to persist to / resume from                       |
+| `AGENT_THINKING`     | Reasoning level: `off` (default), `low`, `medium`, `high`    |
+| `AGENT_CONTEXT_WINDOW` | Context window in tokens for compaction (default `128000`) |
+| `AGENT_AUTO_COMPACT` | Auto-summarize older turns near the limit (default on)       |
+| `AGENT_COMPACT_THRESHOLD` | Fraction of the window that triggers compaction (default `0.75`) |
 
 ## Run
 

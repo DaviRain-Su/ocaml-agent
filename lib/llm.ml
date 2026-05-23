@@ -16,12 +16,19 @@ exception Api_error of string
 
 type content =
   | Text of string
+  | Thinking of { text : string; signature : string } (* Anthropic extended thinking *)
   | Tool_use of { id : string; name : string; input : Yojson.Safe.t }
   | Tool_result of { id : string; content : string }
 
 type role = User | Assistant
 
 type turn = { role : role; content : content list }
+
+(* Token accounting reported by the API. input_tokens approximates the size of
+   the whole conversation we sent, so it doubles as a context-usage gauge. *)
+type usage = { input_tokens : int; output_tokens : int }
+
+let zero_usage = { input_tokens = 0; output_tokens = 0 }
 
 (* --- configuration from environment --- *)
 
@@ -33,7 +40,8 @@ type config =
     api_key : string;
     model : string;
     max_tokens : int;
-    extra_headers : string list }
+    extra_headers : string list;
+    thinking : string (* "off" | "low" | "medium" | "high" *) }
 
 let getenv k =
   match Sys.getenv_opt k with Some v when String.trim v <> "" -> Some v | _ -> None
@@ -93,6 +101,17 @@ let all_env_keys = List.concat_map (fun k -> k.env_keys) registry
 let read_max_tokens () =
   match getenv "AGENT_MAX_TOKENS" with Some s -> ( try int_of_string s with _ -> 4096) | None -> 4096
 
+let read_thinking () =
+  match getenv "AGENT_THINKING" with
+  | Some s -> (
+    match String.lowercase_ascii (String.trim s) with
+    | ("off" | "none" | "") -> "off"
+    | ("low" | "minimal") -> "low"
+    | "medium" -> "medium"
+    | ("high" | "xhigh") -> "high"
+    | other -> other)
+  | None -> "off"
+
 (* Canonical provider names paired with whether their key env var is set. *)
 let provider_status () =
   List.map (fun k -> (List.hd k.names, first_env k.env_keys <> None)) registry
@@ -125,7 +144,8 @@ let config_for ?model alias : config =
       api_key;
       model;
       max_tokens = read_max_tokens ();
-      extra_headers = k.headers }
+      extra_headers = k.headers;
+      thinking = read_thinking () }
 
 let config () : config =
   let max_tokens = read_max_tokens () in
@@ -174,7 +194,7 @@ let config () : config =
       | Some m -> m
       | None -> raise (Config_error "AGENT_MODEL must be set for a generic openai endpoint"))
   in
-  { provider; base_url; api_key; model; max_tokens; extra_headers }
+  { provider; base_url; api_key; model; max_tokens; extra_headers; thinking = read_thinking () }
 
 let describe cfg =
   let p = match cfg.provider with Anthropic -> "anthropic" | Openai -> "openai" in
@@ -191,6 +211,8 @@ let sse_data line =
 
 let content_to_json = function
   | Text s -> `Assoc [ ("type", `String "text"); ("text", `String s) ]
+  | Thinking { text; signature } ->
+    `Assoc [ ("type", `String "thinking"); ("text", `String text); ("signature", `String signature) ]
   | Tool_use { id; name; input } ->
     `Assoc
       [ ("type", `String "tool_use"); ("id", `String id); ("name", `String name); ("input", input) ]
@@ -200,6 +222,8 @@ let content_to_json = function
 let content_of_json j =
   match j |> member "type" |> to_string with
   | "text" -> Text (j |> member "text" |> to_string)
+  | "thinking" ->
+    Thinking { text = j |> member "text" |> to_string; signature = j |> member "signature" |> to_string }
   | "tool_use" ->
     Tool_use
       { id = j |> member "id" |> to_string;
@@ -220,8 +244,13 @@ let turn_of_json j =
 
 (* --- Anthropic protocol --- *)
 
+(* Thinking budget (Anthropic) / reasoning effort (OpenAI) per level. *)
+let thinking_budget = function "low" -> 2048 | "medium" -> 8192 | "high" -> 16384 | _ -> 0
+
 let anthropic_block = function
   | Text s -> `Assoc [ ("type", `String "text"); ("text", `String s) ]
+  | Thinking { text; signature } ->
+    `Assoc [ ("type", `String "thinking"); ("thinking", `String text); ("signature", `String signature) ]
   | Tool_use { id; name; input } ->
     `Assoc
       [ ("type", `String "tool_use"); ("id", `String id); ("name", `String name); ("input", input) ]
@@ -244,17 +273,25 @@ let anthropic_messages turns =
 (* A content block under construction while streaming. *)
 type builder =
   | BText of Buffer.t
+  | BThinking of { text : Buffer.t; sign : Buffer.t }
   | BTool of { id : string; name : string; json : Buffer.t }
 
-let anthropic_complete cfg ~system ~on_text ~tools_enabled turns : content list =
+let anthropic_complete cfg ~system ~on_text ~tools_enabled turns : content list * usage =
+  let budget = thinking_budget cfg.thinking in
+  (* Extended thinking requires max_tokens strictly greater than the budget. *)
+  let max_tokens = if budget > 0 && cfg.max_tokens <= budget then budget + 4096 else cfg.max_tokens in
   let body =
     `Assoc
-      [ ("model", `String cfg.model);
-        ("max_tokens", `Int cfg.max_tokens);
-        ("system", `String system);
-        ("stream", `Bool true);
-        ("tools", `List (if tools_enabled then Tools.anthropic_schemas else []));
-        ("messages", `List (anthropic_messages turns)) ]
+      ([ ("model", `String cfg.model);
+         ("max_tokens", `Int max_tokens);
+         ("system", `String system);
+         ("stream", `Bool true);
+         ("tools", `List (if tools_enabled then Tools.anthropic_schemas else []));
+         ("messages", `List (anthropic_messages turns)) ]
+      @
+      if budget > 0 then
+        [ ("thinking", `Assoc [ ("type", `String "enabled"); ("budget_tokens", `Int budget) ]) ]
+      else [])
   in
   let url = cfg.base_url ^ "/v1/messages" in
   let headers =
@@ -267,10 +304,17 @@ let anthropic_complete cfg ~system ~on_text ~tools_enabled turns : content list 
   let builders : (int, builder) Hashtbl.t = Hashtbl.create 8 in
   let blocks = ref [] in
   let err = Buffer.create 64 in
+  let in_tok = ref 0 and out_tok = ref 0 in
+  let read_usage u =
+    (match u |> member "input_tokens" with `Int n -> in_tok := n | _ -> ());
+    match u |> member "output_tokens" with `Int n -> out_tok := n | _ -> ()
+  in
   let finalize idx =
     match Hashtbl.find_opt builders idx with
     | None -> ()
     | Some (BText b) -> blocks := Text (Buffer.contents b) :: !blocks
+    | Some (BThinking { text; sign }) ->
+      blocks := Thinking { text = Buffer.contents text; signature = Buffer.contents sign } :: !blocks
     | Some (BTool { id; name; json }) ->
       let input =
         let s = Buffer.contents json in
@@ -286,11 +330,15 @@ let anthropic_complete cfg ~system ~on_text ~tools_enabled turns : content list 
     | j -> (
       match j |> member "type" |> to_string with
       | "error" -> raise (Api_error data)
+      | "message_start" -> read_usage (j |> member "message" |> member "usage")
+      | "message_delta" -> read_usage (j |> member "usage")
       | "content_block_start" ->
         let idx = j |> member "index" |> to_int in
         let cb = j |> member "content_block" in
         (match cb |> member "type" |> to_string with
          | "text" -> Hashtbl.replace builders idx (BText (Buffer.create 256))
+         | "thinking" ->
+           Hashtbl.replace builders idx (BThinking { text = Buffer.create 256; sign = Buffer.create 64 })
          | "tool_use" ->
            Hashtbl.replace builders idx
              (BTool
@@ -308,6 +356,10 @@ let anthropic_complete cfg ~system ~on_text ~tools_enabled turns : content list 
           on_text t
         | "input_json_delta", Some (BTool { json; _ }) ->
           Buffer.add_string json (d |> member "partial_json" |> to_string)
+        | "thinking_delta", Some (BThinking { text; _ }) ->
+          Buffer.add_string text (d |> member "thinking" |> to_string)
+        | "signature_delta", Some (BThinking { sign; _ }) ->
+          Buffer.add_string sign (d |> member "signature" |> to_string)
         | _ -> ())
       | "content_block_stop" -> finalize (j |> member "index" |> to_int)
       | _ -> ())
@@ -320,7 +372,7 @@ let anthropic_complete cfg ~system ~on_text ~tools_enabled turns : content list 
          | None -> if String.trim line <> "" then Buffer.add_string err (line ^ "\n"))
    with Http.Http_error e -> raise (Api_error e));
   if !blocks = [] && Buffer.length err > 0 then raise (Api_error (Buffer.contents err));
-  List.rev !blocks
+  (List.rev !blocks, { input_tokens = !in_tok; output_tokens = !out_tok })
 
 (* --- OpenAI protocol --- *)
 
@@ -338,7 +390,7 @@ let openai_messages ~system turns =
               [ ("role", `String "tool");
                 ("tool_call_id", `String id);
                 ("content", `String content) ]
-          | Tool_use _ -> `Null (* not expected in a user turn *))
+          | Thinking _ | Tool_use _ -> `Null (* not represented in OpenAI user turns *))
         t.content
       |> List.filter (fun j -> j <> `Null)
     | Assistant ->
@@ -368,13 +420,15 @@ let openai_messages ~system turns =
   in
   sys_msg :: List.concat_map of_turn turns
 
-let openai_complete cfg ~system ~on_text ~tools_enabled turns : content list =
+let openai_complete cfg ~system ~on_text ~tools_enabled turns : content list * usage =
   let body =
     `Assoc
       ([ ("model", `String cfg.model);
          ("max_tokens", `Int cfg.max_tokens);
          ("stream", `Bool true);
+         ("stream_options", `Assoc [ ("include_usage", `Bool true) ]);
          ("messages", `List (openai_messages ~system turns)) ]
+      @ (if cfg.thinking <> "off" then [ ("reasoning_effort", `String cfg.thinking) ] else [])
       @
       if tools_enabled then
         [ ("tools", `List Tools.openai_schemas); ("tool_choice", `String "auto") ]
@@ -389,6 +443,7 @@ let openai_complete cfg ~system ~on_text ~tools_enabled turns : content list =
   let tools : (int, string ref * string ref * Buffer.t) Hashtbl.t = Hashtbl.create 4 in
   let order = ref [] in
   let err = Buffer.create 64 in
+  let in_tok = ref 0 and out_tok = ref 0 in
   let get_tool idx =
     match Hashtbl.find_opt tools idx with
     | Some t -> t
@@ -404,6 +459,11 @@ let openai_complete cfg ~system ~on_text ~tools_enabled turns : content list =
     | j -> (
       match j |> member "error" with
       | `Null -> (
+        (match j |> member "usage" with
+         | `Null -> ()
+         | u ->
+           (match u |> member "prompt_tokens" with `Int n -> in_tok := n | _ -> ());
+           (match u |> member "completion_tokens" with `Int n -> out_tok := n | _ -> ()));
         match j |> member "choices" |> to_list with
         | choice :: _ -> (
           let d = choice |> member "delta" in
@@ -452,11 +512,11 @@ let openai_complete cfg ~system ~on_text ~tools_enabled turns : content list =
   in
   if text_blocks = [] && tool_blocks = [] && Buffer.length err > 0 then
     raise (Api_error (Buffer.contents err));
-  text_blocks @ tool_blocks
+  (text_blocks @ tool_blocks, { input_tokens = !in_tok; output_tokens = !out_tok })
 
 (* --- dispatch --- *)
 
-let complete cfg ~system ?(on_text = fun _ -> ()) ?(tools_enabled = true) turns : content list =
+let complete cfg ~system ?(on_text = fun _ -> ()) ?(tools_enabled = true) turns : content list * usage =
   match cfg.provider with
   | Anthropic -> anthropic_complete cfg ~system ~on_text ~tools_enabled turns
   | Openai -> openai_complete cfg ~system ~on_text ~tools_enabled turns

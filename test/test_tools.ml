@@ -83,7 +83,8 @@ let () =
     [ { Llm.role = User; content = [ Llm.Text "hello" ] };
       { Llm.role = Assistant;
         content =
-          [ Llm.Text "thinking";
+          [ Llm.Thinking { text = "let me think"; signature = "sig123" };
+            Llm.Text "thinking";
             Llm.Tool_use { id = "t1"; name = "read_file"; input = j {|{"path":"a.txt"}|} } ] };
       { Llm.role = User; content = [ Llm.Tool_result { id = "t1"; content = "file body" } ] } ]
   in
@@ -109,7 +110,8 @@ let () =
       api_key = "sk-test";
       model = "deepseek-chat";
       max_tokens = 4096;
-      extra_headers = [] }
+      extra_headers = [];
+      thinking = "off" }
   in
   let prompt = Agent.build_system_prompt cfg in
   check "system prompt injects AGENTS.md" (contains prompt "PROJECT_RULE_XYZ");
