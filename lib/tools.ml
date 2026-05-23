@@ -373,9 +373,23 @@ let find =
         if !count = 0 then "No files found."
         else Buffer.contents out ^ if !truncated then Printf.sprintf "\n(truncated at %d files)" find_limit else "") }
 
+(* --- task: spawn a sub-agent (executed by the agent loop, not here) --- *)
+
+let task =
+  { name = "task";
+    description =
+      "Delegate a self-contained sub-task to a fresh sub-agent with its own tool loop. \
+       Give a complete, standalone instruction; the sub-agent cannot see this \
+       conversation. Returns the sub-agent's final answer. Use for focused research or \
+       multi-step work you want to isolate.";
+    parameters =
+      params ~props:[ ("prompt", strprop "The full, self-contained task for the sub-agent.") ] ~required:[ "prompt" ];
+    (* Intercepted by the agent loop; never actually called. *)
+    execute = (fun _ -> "Error: task tool must be handled by the agent") }
+
 (* --- registry --- *)
 
-let all = [ read_file; write_file; edit_file; list_dir; grep; find; run_bash ]
+let all = [ read_file; write_file; edit_file; list_dir; grep; find; run_bash; task ]
 
 (* Anthropic tool schema: {name, description, input_schema}. *)
 let anthropic_schema t =

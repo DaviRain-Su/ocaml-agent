@@ -14,10 +14,12 @@ Anthropic-compatible endpoint — all selected through environment variables.
 bin/main.ml        REPL / one-shot entrypoint
 lib/http.ml        Shared curl-based JSON POST + streaming (SSE) helper
 lib/llm.ml         Config (from env) + normalized types + Anthropic & OpenAI adapters
-lib/tools.ml       Tool schemas + executors (read/write/edit/list/bash)
+lib/tools.ml       Tool schemas + executors (read/write/edit/list/grep/find/bash/task)
 lib/session.ml     JSONL session persistence (save + resume)
-lib/agent.ml       The agent loop: system prompt, approval gate, run tools, repeat
-test/test_tools.ml Offline smoke tests (tools, turn JSON, session, system prompt)
+lib/render.ml      Streaming markdown renderer + colorized tool-result previews
+lib/skills.ml      Skill discovery (markdown + frontmatter) and prompt injection
+lib/agent.ml       The agent loop: system prompt, approval, tools, sub-agents, compaction
+test/test_tools.ml Offline smoke tests (tools, turn JSON, session, prompt, render, skills)
 ```
 
 ## Features
@@ -39,6 +41,11 @@ test/test_tools.ml Offline smoke tests (tools, turn JSON, session, system prompt
   before running (skip with `AGENT_AUTO_APPROVE=1`; denied automatically when there's no TTY).
 - **Session persistence** — set `AGENT_SESSION_FILE` (or use `-c`) to append each
   turn as JSONL and resume the conversation on the next run.
+- **Sub-agents** — the `task` tool delegates a self-contained sub-task to a fresh
+  nested agent (bounded depth) and returns its answer.
+- **Skills** — markdown files with frontmatter in `.ocaml-agent/skills/` or
+  `.claude/skills/` are discovered and listed in the system prompt; the model reads
+  a skill's file on demand (prompt-injection model, no separate runtime).
 - **Interactive commands**: `/model`, `/think`, `/compact`, `/session`, `/new`, `/help`.
 - **CLI flags**: `-m/--model`, `--provider`, `--thinking`, `-c`, `-p`, `--no-tools`.
 

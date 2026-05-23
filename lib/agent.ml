@@ -53,6 +53,7 @@ let build_system_prompt cfg =
       present;
     Buffer.add_string buf "</project_context>\n"
   end;
+  Buffer.add_string buf (Skills.format (Skills.discover ()));
   let tm = Unix.localtime (Unix.time ()) in
   Buffer.add_string buf
     (Printf.sprintf "\n\nCurrent date: %04d-%02d-%02d\nCurrent working directory: %s"
@@ -80,10 +81,13 @@ type t =
     context_window : int;
     compact_threshold : float; (* fraction of the window that triggers compaction *)
     auto_compact : bool;
+    depth : int; (* sub-agent nesting depth; 0 for the top-level agent *)
     mutable last_input_tokens : int;
     mutable last_output_tokens : int }
 
-let create ?session ?(initial_turns = []) ?(tools_enabled = true) cfg =
+let max_depth = 2
+
+let create ?session ?(initial_turns = []) ?(tools_enabled = true) ?(depth = 0) cfg =
   let auto_approve =
     match Sys.getenv_opt "AGENT_AUTO_APPROVE" with Some v -> truthy v | None -> false
   in
@@ -99,6 +103,7 @@ let create ?session ?(initial_turns = []) ?(tools_enabled = true) cfg =
     context_window = env_int "AGENT_CONTEXT_WINDOW" 128000;
     compact_threshold = env_float "AGENT_COMPACT_THRESHOLD" 0.75;
     auto_compact;
+    depth;
     last_input_tokens = 0;
     last_output_tokens = 0 }
 
@@ -158,18 +163,6 @@ let approve t name input =
         | _ -> false)
     end
   end
-
-let run_tool t id name input : Llm.content =
-  Printf.printf "%s %s %s\n%!" (cyan "⚙") (green name) (dim (preview_input input));
-  let result =
-    if not (approve t name input) then "Error: command not approved by user"
-    else
-      match Tools.find name with
-      | Some tool -> ( try tool.execute input with e -> "Error: " ^ Printexc.to_string e)
-      | None -> Printf.sprintf "Error: unknown tool %s" name
-  in
-  if String.trim result <> "" then Printf.printf "%s\n%!" (Render.tool_result result);
-  Llm.Tool_result { id; content = result }
 
 (* --- context accounting + compaction --- *)
 
@@ -246,7 +239,34 @@ let should_compact t =
   && float_of_int (context_used t) > t.compact_threshold *. float_of_int t.context_window
   && List.length t.turns > keep_recent + 1
 
-let rec step t : string =
+(* Run a sub-agent for the `task` tool: a fresh, session-less agent at one
+   greater depth that inherits config/tools but starts with an empty history. *)
+let rec run_sub_agent t input =
+  if t.depth >= max_depth then "Error: maximum sub-agent depth reached"
+  else
+    let prompt = try Yojson.Safe.Util.(input |> member "prompt" |> to_string) with _ -> "" in
+    if prompt = "" then "Error: task requires a prompt"
+    else begin
+      let sub =
+        { t with turns = []; session = None; depth = t.depth + 1; last_input_tokens = 0; last_output_tokens = 0 }
+      in
+      try send sub prompt with e -> "Error: " ^ Printexc.to_string e
+    end
+
+and run_tool t id name input : Llm.content =
+  Printf.printf "%s %s %s\n%!" (cyan "⚙") (green name) (dim (preview_input input));
+  let result =
+    if name = "task" then run_sub_agent t input
+    else if not (approve t name input) then "Error: command not approved by user"
+    else
+      match Tools.find name with
+      | Some tool -> ( try tool.execute input with e -> "Error: " ^ Printexc.to_string e)
+      | None -> Printf.sprintf "Error: unknown tool %s" name
+  in
+  if String.trim result <> "" then Printf.printf "%s\n%!" (Render.tool_result result);
+  Llm.Tool_result { id; content = result }
+
+and step t : string =
   let r = Render.create () in
   let streamed = ref false in
   let on_text s =
@@ -275,7 +295,7 @@ let rec step t : string =
   end
   else String.concat "\n" texts
 
-let send t (user_input : string) : string =
+and send t (user_input : string) : string =
   if should_compact t then begin
     Printf.printf "%s\n%!" (dim "Auto-compacting context...");
     ignore (compact t)

@@ -133,5 +133,24 @@ let () =
   let tr = Render.tool_result "-old\n+new\n@@ x" in
   check "tool_result colors diff" (has tr "\027[31m" && has tr "\027[32m");
 
+  (* --- skills --- *)
+  let _ =
+    run "write_file"
+      {|{"path":".ocaml-agent/skills/deploy.md","content":"---\nname: deploy\ndescription: How to deploy the app\n---\nDetailed steps."}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":".ocaml-agent/skills/hidden.md","content":"---\nname: hidden\ndescription: nope\ndisable-model-invocation: true\n---\nx"}|}
+  in
+  let skills = Skills.discover () in
+  check "skills discovered" (List.exists (fun (s : Skills.t) -> s.name = "deploy") skills);
+  check "skills honor disable flag" (not (List.exists (fun (s : Skills.t) -> s.name = "hidden") skills));
+  let sf = Skills.format skills in
+  check "skills format has name + location"
+    (contains0 sf "deploy" && contains0 sf ".ocaml-agent/skills/deploy.md");
+
+  (* --- task tool registered --- *)
+  check "task tool present" (Tools.find "task" <> None);
+
   Printf.printf "\n%s\n" (if !failures = 0 then "All tests passed." else "FAILURES present.");
   exit (if !failures = 0 then 0 else 1)
