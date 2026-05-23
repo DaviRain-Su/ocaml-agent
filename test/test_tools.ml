@@ -69,6 +69,8 @@ let () =
   check "run_bash reports exit code" (contains r "(exit 3)");
   let code, out = Tools.run_process ~timeout_s:1 "sleep 2" in
   check "run_process enforces timeout" (code = 124 && contains out "timed out");
+  let code, out = Tools.run_process ~stdin_data:{|{"x":1}|} "cat" in
+  check "run_process passes stdin data" (code = 0 && out = {|{"x":1}|});
 
   (* --- grep --- *)
   let _ = run "write_file" {|{"path":"src/foo.ml","content":"let answer = 42\nlet x = 1\n"}|} in
@@ -125,6 +127,18 @@ let () =
    | Some i -> check "session rename persists" (i.Session.name = "beta")
    | None -> check "session rename persists" false);
   check "set_name keeps turns" (List.length (Session.load_turns ns.Session.path) = List.length turns);
+  check "session resolves by path" (Session.resolve_path ns.Session.path = Some ns.Session.path);
+  check "session resolves by id" (Session.resolve_path ns.Session.id = Some ns.Session.path);
+  check "session resolves by partial id"
+    (Session.resolve_path (String.sub ns.Session.id 0 (min 8 (String.length ns.Session.id))) = Some ns.Session.path);
+  let forked =
+    match Session.fork_from ns.Session.id with
+    | Some s -> s
+    | None -> failwith "fork failed"
+  in
+  check "session fork copies turns" (List.length (Session.load_turns forked.Session.path) = List.length turns);
+  check "session fork creates new file" (forked.Session.id <> ns.Session.id);
+  Session.close forked;
   let cfg_for_reset =
     { Llm.provider = Llm.Openai;
       base_url = "https://api.example.test";
@@ -140,6 +154,20 @@ let () =
   Agent.reset reset_agent;
   check "reset truncates active session" (Session.load_turns reset_session.Session.path = []);
   Session.close reset_session;
+  let bang_agent = Agent.create cfg_for_reset in
+  let bang_result = Agent.run_user_bash bang_agent "printf bang" in
+  check "bang shell captures output" (contains bang_result "bang");
+  check "bang shell records context" (Agent.turn_count bang_agent = 1);
+  let bang_context =
+    match Agent.turns bang_agent with
+    | [ { Llm.content = [ Llm.Text s ]; _ } ] -> s
+    | _ -> ""
+  in
+  check "bang shell context includes command output" (contains bang_context "Ran `printf bang`" && contains bang_context "bang");
+  let hidden_count = Agent.turn_count bang_agent in
+  let hidden_result = Agent.run_user_bash ~exclude_from_context:true bang_agent "printf hidden" in
+  check "hidden bang shell captures output" (contains hidden_result "hidden");
+  check "hidden bang shell does not record context" (Agent.turn_count bang_agent = hidden_count);
   let cl = Session.clone_from turns in
   check "clone duplicates turns" (List.length (Session.load_turns cl.Session.path) = List.length turns);
   check "clone is a new id" (cl.Session.id <> ns.Session.id);
@@ -163,6 +191,10 @@ let () =
   check "system prompt includes date" (contains prompt "Current date:");
   check "system prompt states model identity" (contains prompt "deepseek-v4-pro");
   check "system prompt states provider identity" (contains prompt "OpenAI-compatible");
+  Unix.putenv "AGENT_NO_CONTEXT_FILES" "1";
+  let no_context_prompt = Agent.build_system_prompt cfg in
+  check "system prompt can disable context files" (not (contains no_context_prompt "PROJECT_RULE_XYZ"));
+  Unix.putenv "AGENT_NO_CONTEXT_FILES" "";
   let _ = run "write_file" {|{"path":"base_prompt.md","content":"CUSTOM_BASE_PROMPT"}|} in
   let _ = run "write_file" {|{"path":"append_prompt.md","content":"APPENDED_PROMPT"}|} in
   Unix.putenv "AGENT_SYSTEM_PROMPT" "base_prompt.md";
@@ -173,6 +205,13 @@ let () =
     (contains custom_prompt "APPENDED_PROMPT" && contains custom_prompt "INLINE_APPEND");
   Unix.putenv "AGENT_SYSTEM_PROMPT" "";
   Unix.putenv "AGENT_APPEND_SYSTEM_PROMPT" "";
+  let reload_agent = Agent.create cfg in
+  let before_reload = Agent.system_prompt reload_agent in
+  let _ = run "write_file" {|{"path":"AGENTS.md","content":"PROJECT_RULE_AFTER_RELOAD"}|} in
+  Agent.reload_system_prompt reload_agent;
+  check "reload command target can rebuild system prompt"
+    (contains (Agent.system_prompt reload_agent) "PROJECT_RULE_AFTER_RELOAD"
+     && not (before_reload = Agent.system_prompt reload_agent));
 
   (* --- @file mentions / CLI file args --- *)
   let _ = run "write_file" {|{"path":"mention.txt","content":"MENTION_BODY"}|} in
@@ -208,6 +247,40 @@ let () =
   let sf = Skills.format skills in
   check "skills format has name + location"
     (contains0 sf "deploy" && contains0 sf ".ocaml-agent/skills/deploy.md");
+  let _ =
+    run "write_file"
+      {|{"path":"extra_skill.md","content":"---\nname: extra\ndescription: Loaded explicitly\n---\nExtra skill."}|}
+  in
+  Unix.putenv "AGENT_NO_SKILLS" "1";
+  Unix.putenv "AGENT_SKILL_PATHS" "extra_skill.md";
+  let only_extra = Skills.discover () in
+  check "skill CLI path works when discovery disabled"
+    (List.exists (fun (s : Skills.t) -> s.name = "extra") only_extra
+     && not (List.exists (fun (s : Skills.t) -> s.name = "deploy") only_extra));
+  Unix.putenv "AGENT_NO_SKILLS" "";
+  Unix.putenv "AGENT_SKILL_PATHS" "";
+
+  (* --- prompt templates --- *)
+  let _ =
+    run "write_file"
+      {|{"path":".ocaml-agent/prompts/component.md","content":"---\ndescription: Create a component\nargument-hint: <name> [features]\n---\nBuild component $1 with: ${@:2}\nAll: $ARGUMENTS"}|}
+  in
+  let prompts = Prompts.discover () in
+  check "prompt templates discovered" (List.exists (fun (p : Prompts.t) -> p.name = "component") prompts);
+  check "prompt templates appear in completion" (List.mem_assoc "/component" (Complete.menu "/co"));
+  let expanded = Prompts.expand_command {|/component Button "click handler" disabled|} in
+  check "prompt template expands positional and rest args"
+    (expanded = Some "Build component Button with: click handler disabled\nAll: Button click handler disabled");
+  let _ =
+    run "write_file"
+      {|{"path":"extra_prompt.md","content":"---\ndescription: Extra prompt\n---\nExtra ${@:2:1} / $@"}|}
+  in
+  Unix.putenv "AGENT_NO_PROMPT_TEMPLATES" "1";
+  Unix.putenv "AGENT_PROMPT_TEMPLATE_PATHS" "extra_prompt.md";
+  check "prompt template CLI path works when discovery disabled"
+    (Prompts.expand_command "/extra_prompt first second third" = Some "Extra second / first second third");
+  Unix.putenv "AGENT_NO_PROMPT_TEMPLATES" "";
+  Unix.putenv "AGENT_PROMPT_TEMPLATE_PATHS" "";
 
   (* --- task tool registered --- *)
   check "task tool present" (Tools.find "task" <> None);

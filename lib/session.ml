@@ -129,7 +129,10 @@ let open_file path : t =
     let id = Filename.remove_extension (Filename.basename path) in
     let created = Unix.time () in
     let cwd = Sys.getcwd () in
-    let exists_nonempty = Sys.file_exists path && (Unix.stat path).Unix.st_size > 0 in
+    let exists_nonempty =
+      try Sys.file_exists path && (Unix.stat path).Unix.st_size > 0
+      with Unix.Unix_error _ -> false
+    in
     let oc = open_out_gen [ Open_append; Open_creat ] 0o644 path in
     if not exists_nonempty then write_header oc id "" created cwd;
     { id; path; name = ""; created; cwd; oc }
@@ -176,20 +179,53 @@ let list () : info list =
     |> List.filter_map (fun f -> read_header (Filename.concat d f))
     |> List.sort (fun (a : info) (b : info) -> compare b.created a.created)
 
+let has_path_separator s = String.contains s '/' || String.contains s '\\'
+
+let starts_with ~prefix s =
+  String.length s >= String.length prefix && String.sub s 0 (String.length prefix) = prefix
+
+let find spec =
+  if spec = "" then None
+  else if Sys.file_exists spec || has_path_separator spec || Filename.check_suffix spec ".jsonl" then
+    Some
+      (match read_header spec with
+       | Some i -> i
+       | None ->
+         { id = Filename.remove_extension (Filename.basename spec);
+           path = spec;
+           name = "";
+           created = 0.;
+           cwd = "" })
+  else
+    list ()
+    |> List.find_opt (fun (i : info) -> i.id = spec || starts_with ~prefix:spec i.id || i.name = spec)
+
+let resolve_path spec =
+  match find spec with Some i -> Some i.path | None -> None
+
 (* Duplicate [turns] into a brand-new session; returns the new session. *)
 let clone_from ?(name = "") turns : t =
   let s = create_new ~name () in
   List.iter (append s) turns;
   s
 
+let fork_from spec : t option =
+  match resolve_path spec with
+  | None -> None
+  | Some path ->
+    let turns = load_turns path in
+    Some (clone_from turns)
+
 let export_jsonl turns path =
   let oc = open_out path in
-  List.iter
-    (fun turn ->
-      output_string oc (Yojson.Safe.to_string (Llm.turn_to_json turn));
-      output_char oc '\n')
-    turns;
-  close_out oc
+  Fun.protect
+    ~finally:(fun () -> close_out_noerr oc)
+    (fun () ->
+      List.iter
+        (fun turn ->
+          output_string oc (Yojson.Safe.to_string (Llm.turn_to_json turn));
+          output_char oc '\n')
+        turns)
 
 let html_escape s =
   let b = Buffer.create (String.length s) in
@@ -205,24 +241,26 @@ let html_escape s =
 
 let export_html (i : info) turns path =
   let oc = open_out path in
-  Printf.fprintf oc
-    "<!doctype html><meta charset=utf-8><title>%s</title><style>body{font:14px/1.5 monospace;max-width:900px;margin:2rem auto;padding:0 1rem}.u{color:#06c}.a{color:#080}pre{background:#f4f4f4;padding:.5rem;white-space:pre-wrap}</style><h1>%s</h1>"
-    (html_escape (if i.name = "" then i.id else i.name))
-    (html_escape (if i.name = "" then i.id else i.name));
-  List.iter
-    (fun (turn : Llm.turn) ->
-      let role, cls = match turn.Llm.role with User -> ("user", "u") | Assistant -> ("assistant", "a") in
-      Printf.fprintf oc "<h3 class=%s>%s</h3>" cls role;
+  Fun.protect
+    ~finally:(fun () -> close_out_noerr oc)
+    (fun () ->
+      Printf.fprintf oc
+        "<!doctype html><meta charset=utf-8><title>%s</title><style>body{font:14px/1.5 monospace;max-width:900px;margin:2rem auto;padding:0 1rem}.u{color:#06c}.a{color:#080}pre{background:#f4f4f4;padding:.5rem;white-space:pre-wrap}</style><h1>%s</h1>"
+        (html_escape (if i.name = "" then i.id else i.name))
+        (html_escape (if i.name = "" then i.id else i.name));
       List.iter
-        (fun c ->
-          let text =
-            match c with
-            | Llm.Text s -> s
-            | Llm.Thinking { text; _ } -> "[thinking] " ^ text
-            | Llm.Tool_use { name; input; _ } -> Printf.sprintf "[tool %s] %s" name (Yojson.Safe.to_string input)
-            | Llm.Tool_result { content; _ } -> "[result]\n" ^ content
-          in
-          Printf.fprintf oc "<pre>%s</pre>" (html_escape text))
-        turn.Llm.content)
-    turns;
-  close_out oc
+        (fun (turn : Llm.turn) ->
+          let role, cls = match turn.Llm.role with User -> ("user", "u") | Assistant -> ("assistant", "a") in
+          Printf.fprintf oc "<h3 class=%s>%s</h3>" cls role;
+          List.iter
+            (fun c ->
+              let text =
+                match c with
+                | Llm.Text s -> s
+                | Llm.Thinking { text; _ } -> "[thinking] " ^ text
+                | Llm.Tool_use { name; input; _ } -> Printf.sprintf "[tool %s] %s" name (Yojson.Safe.to_string input)
+                | Llm.Tool_result { content; _ } -> "[result]\n" ^ content
+              in
+              Printf.fprintf oc "<pre>%s</pre>" (html_escape text))
+            turn.Llm.content)
+        turns)

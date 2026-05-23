@@ -84,6 +84,10 @@ let run agent =
   let rec loop () =
     match In_channel.input_line stdin with
     | None -> ()
-    | Some line -> if String.trim line <> "" then handle line; loop ()
+    | Some line ->
+      if String.trim line <> "" then begin
+        try handle line with e -> error (Printexc.to_string e)
+      end;
+      loop ()
   in
   (try loop () with Exit -> ())

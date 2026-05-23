@@ -31,6 +31,14 @@ let resolve_prompt_input input =
 let join_prompt_inputs inputs =
   inputs |> List.map resolve_prompt_input |> String.concat "\n\n"
 
+let truthy s =
+  match String.lowercase_ascii (String.trim s) with
+  | "1" | "true" | "yes" | "y" | "all" -> true
+  | _ -> false
+
+let env_truthy name =
+  match Sys.getenv_opt name with Some s -> truthy s | None -> false
+
 (* Read context files from the cwd and fold them, plus cwd/date, into the prompt. *)
 let build_system_prompt cfg =
   let buf = Buffer.create 1024 in
@@ -47,7 +55,7 @@ let build_system_prompt cfg =
         asked which model or provider you are, answer with exactly these values and do not \
         guess or claim to be a different model."
        provider cfg.Llm.base_url cfg.Llm.model);
-  let context_files = [ "AGENTS.md"; "CLAUDE.md" ] in
+  let context_files = if env_truthy "AGENT_NO_CONTEXT_FILES" then [] else [ "AGENTS.md"; "CLAUDE.md" ] in
   let present =
     List.filter_map
       (fun name ->
@@ -81,11 +89,6 @@ let build_system_prompt cfg =
    | Some s when String.trim s <> "" -> Buffer.add_string buf ("\n\n" ^ resolve_prompt_input s)
    | _ -> ());
   Buffer.contents buf
-
-let truthy s =
-  match String.lowercase_ascii (String.trim s) with
-  | "1" | "true" | "yes" | "y" | "all" -> true
-  | _ -> false
 
 let env_int name default =
   match Sys.getenv_opt name with Some s -> ( try int_of_string s with _ -> default) | None -> default
@@ -214,6 +217,9 @@ let set_config t cfg =
   t.cfg <- cfg;
   t.system <- build_system_prompt cfg
 
+let reload_system_prompt t =
+  t.system <- build_system_prompt t.cfg
+
 (* Clear the active conversation and persist that empty state when a session is open. *)
 let reset t =
   t.turns <- [];
@@ -222,6 +228,7 @@ let reset t =
   Option.iter (fun s -> Session.save_all s []) t.session
 
 let config t = t.cfg
+let system_prompt t = t.system
 let turn_count t = List.length t.turns
 let turns t = t.turns
 let session t = t.session
@@ -254,6 +261,20 @@ let tool_allowed t name =
 let add t turn =
   t.turns <- t.turns @ [ turn ];
   Option.iter (fun s -> Session.append s turn) t.session
+
+let bash_context_text command code output =
+  let body =
+    if output = "" then "(no output)"
+    else Printf.sprintf "```\n%s\n```" output
+  in
+  Printf.sprintf "Ran `%s`\n%s%s" command body
+    (if code = 0 then "" else Printf.sprintf "\n\nCommand exited with code %d" code)
+
+let run_user_bash ?(exclude_from_context = false) t command =
+  let code, output = Tools.run_process command in
+  if not exclude_from_context then
+    add t { Llm.role = User; content = [ Llm.Text (bash_context_text command code output) ] };
+  Printf.sprintf "(exit %d)\n%s" code output
 
 let approval_text name input =
   if name = "run_bash" then

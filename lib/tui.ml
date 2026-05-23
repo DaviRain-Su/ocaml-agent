@@ -362,7 +362,7 @@ let rec settings ui =
   | _ -> redraw ui
 
 (* --- slash commands (TUI-native) --- *)
-let cmd ui line =
+let rec cmd ui line =
   let parts = String.split_on_char ' ' line |> List.filter (fun s -> s <> "") in
   match parts with
   | ("/exit" | "/quit") :: _ -> ui.running <- false
@@ -378,10 +378,12 @@ let cmd ui line =
         "/clone                 duplicate the current session";
         "/export <file>         export (.html or .jsonl)";
         "/copy                  copy last reply to clipboard";
+        "/reload                reload context / skills / prompts / extensions";
         "/settings              toggle auto-approve / compact / thinking";
         "/new                   clear the conversation";
         "Tab / type /           live command completion menu";
         "Tab                    complete command / file path";
+        "!cmd / !!cmd          run shell (with / without model context)";
         "Alt-Enter / Ctrl-J     insert a newline (multi-line input)";
         "Ctrl-A/E/U/K/W         line edit (home/end/kill-start/kill-end/kill-word)";
         "PgUp/PgDn or wheel     scroll · End jumps to latest · Ctrl-P model picker";
@@ -402,6 +404,11 @@ let cmd ui line =
   | "/clone" :: _ -> push ui A.(fg (gray 12)) (Commands.clone ui.agent); redraw ui
   | "/export" :: p :: _ -> push ui A.(fg (gray 12)) (Commands.export ui.agent p); redraw ui
   | "/copy" :: _ -> push ui A.(fg (gray 12)) (Commands.copy ui.agent); redraw ui
+  | "/reload" :: _ ->
+    ignore (Extensions.load ());
+    Agent.reload_system_prompt ui.agent;
+    push ui A.(fg (gray 12)) "Reloaded resources.";
+    redraw ui
   | "/settings" :: _ -> settings ui
   | "/think" :: rest ->
     let lvl = match rest with l :: _ -> l | [] -> "off" in
@@ -415,11 +422,14 @@ let cmd ui line =
      | c -> Agent.set_config ui.agent c; push ui A.(fg green) ("Switched: " ^ Llm.describe c)
      | exception Llm.Config_error e -> push ui A.(fg red) ("Error: " ^ e));
     redraw ui
-  | c :: _ -> push ui A.(fg red) ("Unknown command " ^ c ^ " (try /help)"); redraw ui
+  | c :: _ -> (
+    match Prompts.expand_command line with
+    | Some prompt -> run_turn ui prompt
+    | None -> push ui A.(fg red) ("Unknown command " ^ c ^ " (try /help)"); redraw ui)
   | [] -> ()
 
 (* Run one turn with an animated spinner thread. *)
-let run_turn ui line =
+and run_turn ui line =
   ui.turn_active <- true;
   ui.turn_start <- Unix.gettimeofday ();
   ui.spin <- 0;
@@ -440,6 +450,22 @@ let run_turn ui line =
   flush_assistant ui;
   redraw ui
 
+and run_bang ui line =
+  let starts_with prefix s =
+    String.length s >= String.length prefix && String.sub s 0 (String.length prefix) = prefix
+  in
+  let exclude = starts_with "!!" line in
+  let off = if exclude then 2 else 1 in
+  let command = String.trim (String.sub line off (String.length line - off)) in
+  if command = "" then false
+  else begin
+    push ui A.(fg cyan) ("$ " ^ command ^ if exclude then " (no context)" else "");
+    redraw ui;
+    let result = Agent.run_user_bash ~exclude_from_context:exclude ui.agent command in
+    push_result ui result;
+    true
+  end
+
 let submit ui =
   let line = String.trim ui.input in
   ui.input <- "";
@@ -454,7 +480,9 @@ let submit ui =
       (fun i l -> push ui A.(fg green) ((if i = 0 then prompt_label else indent) ^ l))
       (String.split_on_char '\n' line);
     redraw ui;
-    if line.[0] = '/' then cmd ui line else run_turn ui line
+    if line.[0] = '!' && run_bang ui line then ()
+    else if line.[0] = '/' then cmd ui line
+    else run_turn ui line
   end
 
 (* --- input editing --- *)
@@ -572,7 +600,7 @@ let run agent =
         | `Paste `End -> ui.pasting <- false; redraw ui
         | `Key (`Enter, mods) when ui.pasting || List.mem `Meta mods -> insert ui "\n"; ui.menu_sel <- 0; redraw ui
         | `Key (`Enter, _) ->
-          if menu_items () <> [] && not (List.mem ui.input Complete.commands) then (accept_menu (); redraw ui)
+          if menu_items () <> [] && not (List.mem ui.input (Complete.commands ())) then (accept_menu (); redraw ui)
           else submit ui
         | `Key (`Backspace, _) -> backspace ui; ui.menu_sel <- 0; redraw ui
         | `Key (`Escape, _) -> ui.input <- ""; ui.cursor <- 0; ui.menu_sel <- 0; redraw ui

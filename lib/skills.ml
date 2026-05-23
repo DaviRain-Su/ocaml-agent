@@ -11,6 +11,19 @@ let skill_dirs = [ ".ocaml-agent/skills"; ".claude/skills" ]
 (* Also check for Veldt scaffold in the project root *)
 let veldt_scaffold_marker = "scaffold/veldt"
 
+let getenv_nonempty k =
+  match Sys.getenv_opt k with Some s when String.trim s <> "" -> Some s | _ -> None
+
+let extra_paths () =
+  match getenv_nonempty "AGENT_SKILL_PATHS" with
+  | None -> []
+  | Some s -> s |> String.split_on_char '\n' |> List.map String.trim |> List.filter (fun p -> p <> "")
+
+let disabled () =
+  match getenv_nonempty "AGENT_NO_SKILLS" with
+  | Some ("1" | "true" | "yes" | "y") -> true
+  | _ -> false
+
 let read_file path =
   let ic = open_in_bin path in
   Fun.protect ~finally:(fun () -> close_in_noerr ic) (fun () -> really_input_string ic (in_channel_length ic))
@@ -49,16 +62,22 @@ let parse_skill path : t option =
      | Some ("true" | "yes" | "1") -> None
      | _ -> Some { name; description; location = path })
 
+let discover_dir dir =
+  if (try Sys.is_directory dir with _ -> false) then
+    Sys.readdir dir |> Array.to_list
+    |> List.filter (fun f -> Filename.check_suffix f ".md")
+    |> List.sort compare
+    |> List.filter_map (fun f -> parse_skill (Filename.concat dir f))
+  else []
+
+let discover_path path =
+  if (try Sys.is_directory path with _ -> false) then discover_dir path
+  else if Sys.file_exists path && Filename.check_suffix path ".md" then (match parse_skill path with Some s -> [ s ] | None -> [])
+  else []
+
 let discover () : t list =
-  List.concat_map
-    (fun dir ->
-      if (try Sys.is_directory dir with _ -> false) then
-        Sys.readdir dir |> Array.to_list
-        |> List.filter (fun f -> Filename.check_suffix f ".md")
-        |> List.sort compare
-        |> List.filter_map (fun f -> parse_skill (Filename.concat dir f))
-      else [])
-    skill_dirs
+  if disabled () then List.concat_map discover_path (extra_paths ())
+  else List.concat_map discover_dir skill_dirs @ List.concat_map discover_path (extra_paths ())
 
 (* Render the skill inventory for the system prompt. Returns "" if none. *)
 let format = function

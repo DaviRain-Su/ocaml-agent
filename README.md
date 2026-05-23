@@ -17,6 +17,7 @@ lib/llm.ml         Config (from env) + normalized types + Anthropic & OpenAI ada
 lib/tools.ml       Tool schemas + executors (read/write/edit/list/grep/find/bash/task)
 lib/render.ml      Streaming markdown renderer + colorized tool-result previews
 lib/skills.ml      Skill discovery (markdown + frontmatter) and prompt injection
+lib/prompts.ml     Prompt templates loaded as slash commands
 lib/models.ml      Best-effort model catalog (context windows) for --list-models
 lib/mentions.ml    @file expansion for prompts and CLI file arguments
 lib/extensions.ml  Load custom subprocess-backed tools from a JSON manifest
@@ -51,6 +52,8 @@ test/test_tools.ml Offline tests (tools, sessions, render, skills, models, exten
   working directory, date, and the live provider/model identity, folded into the system prompt.
 - **File references** — pass `@path` on the CLI or mention `@path` in a prompt to
   include readable file contents as `<file>` blocks.
+- **Bang shell commands** — type `!command` to run shell and add the output to
+  model context, or `!!command` to run shell without adding it to context.
 - **Pi subagent CLI compatibility** — supports `--no-session`, `--tools/-t`, and
   file-backed `--append-system-prompt`, which are the flags Pi's subagent
   extension uses when spawning isolated child agents.
@@ -63,18 +66,24 @@ test/test_tools.ml Offline tests (tools, sessions, render, skills, models, exten
   nested agent (bounded depth) and returns its answer.
 - **Skills** — markdown files with frontmatter in `.ocaml-agent/skills/` or
   `.claude/skills/` are discovered and listed in the system prompt; the model reads
-  a skill's file on demand (prompt-injection model, no separate runtime).
+  a skill's file on demand (prompt-injection model, no separate runtime). Use
+  `--skill`/`--no-skills` for Pi-style resource control.
+- **Prompt templates** — markdown files in `.ocaml-agent/prompts/` or `.pi/prompts/`
+  become slash commands with `$1`, `$@`, `$ARGUMENTS`, and `${@:N[:L]}` expansion.
 - **Extensions** — declare custom tools in `.ocaml-agent/tools.json` (or
   `AGENT_TOOLS_FILE`); each runs an external command receiving the tool input as
   JSON on stdin and returning its output. Extension tools cannot replace built-ins
   and require the same approval path as shell commands.
 - **Interactive commands**: `/model`, `/think`, `/compact`, `/session`, `/sessions`,
-  `/resume`, `/name`, `/clone`, `/export`, `/copy`, `/new`, `/help`.
+  `/resume`, `/name`, `/clone`, `/export`, `/copy`, `/reload`, `/new`, `/help`.
 - **Embeddable**: `--mode rpc` exposes a JSON-RPC (JSONL) interface over stdin/stdout;
   `--mode json` prints Pi-style JSONL turn/tool events; `--list-models [pat]`; `--export`.
-- **CLI flags**: `-m/--model`, `--provider`, `--thinking`, `--system-prompt`,
-  `--append-system-prompt`, `-c`, `-p`, `--no-session`, `--tools/-t`,
-  `--no-tools`, `--no-tui`, `--mode`, `--list-models`, `--export`.
+- **CLI flags**: `-m/--model`, `--provider`, `--api-key`, `--thinking`,
+  `--system-prompt`, `--append-system-prompt`, `-c`, `-r`, `--session`,
+  `--fork`, `--session-dir`, `-p`, `--no-session`, `--tools/-t`,
+  `--no-tools`, `--skill`, `--no-skills`, `--prompt-template`,
+  `--no-prompt-templates`, `--no-context-files`, `--no-tui`, `--mode`,
+  `--list-models`, `--export`.
 
 The only dependencies are `yojson`, `unix`, and `str`. HTTP is done by shelling
 out to `curl`, so there's no TLS/HTTP stack to install.
@@ -146,9 +155,15 @@ Overrides (all optional):
 | `AGENT_AUTO_APPROVE` | Auto-run tools without prompting (default on; set `0` to require approval) |
 | `AGENT_MAX_TOOL_ROUNDS` | Max tool-use rounds per turn before stopping (default `20`) |
 | `AGENT_SESSION_FILE` | JSONL file to persist to / resume from                       |
+| `AGENT_SESSION_DIR` | Directory for saved sessions (overridden by `--session-dir`) |
 | `AGENT_THINKING`     | Reasoning level: `off` (default), `low`, `medium`, `high`    |
 | `AGENT_SYSTEM_PROMPT` | Replace the default system prompt; if it names a file, that file is read |
 | `AGENT_APPEND_SYSTEM_PROMPT` | Append extra system prompt text; if it names a file, that file is read |
+| `AGENT_NO_CONTEXT_FILES` | Disable `AGENTS.md` / `CLAUDE.md` prompt injection |
+| `AGENT_SKILL_PATHS` | Newline-separated skill files or directories to load |
+| `AGENT_NO_SKILLS` | Disable default skill discovery while still allowing explicit paths |
+| `AGENT_PROMPT_TEMPLATE_PATHS` | Newline-separated prompt template files or directories to load |
+| `AGENT_NO_PROMPT_TEMPLATES` | Disable default prompt template discovery while still allowing explicit paths |
 | `AGENT_CONTEXT_WINDOW` | Context window in tokens for compaction (default `128000`) |
 | `AGENT_AUTO_COMPACT` | Auto-summarize older turns near the limit (default on)       |
 | `AGENT_COMPACT_THRESHOLD` | Fraction of the window that triggers compaction (default `0.75`) |

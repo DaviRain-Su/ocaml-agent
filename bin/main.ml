@@ -32,6 +32,22 @@ let run_turn agent input =
   | exception Llm.Api_error msg -> Printf.eprintf "%s %s\n%!" (red "API error:") msg
   | exception e -> Printf.eprintf "%s %s\n%!" (red "Error:") (Printexc.to_string e)
 
+let starts_with prefix s =
+  String.length s >= String.length prefix && String.sub s 0 (String.length prefix) = prefix
+
+let handle_bang agent line =
+  if not (starts_with "!" line) then false
+  else
+    let exclude = starts_with "!!" line in
+    let off = if exclude then 2 else 1 in
+    let command = String.trim (String.sub line off (String.length line - off)) in
+    if command = "" then false
+    else begin
+      let result = Agent.run_user_bash ~exclude_from_context:exclude agent command in
+      Printf.printf "%s\n%!" (Render.tool_result result);
+      true
+    end
+
 let print_help () =
   List.iter
     (fun (c, d) -> Printf.printf "  %-22s %s\n" c d)
@@ -45,9 +61,12 @@ let print_help () =
       ("/clone", "duplicate the current session");
       ("/export <file>", "export session (.html or .jsonl)");
       ("/copy", "copy last reply to the clipboard");
+      ("/reload", "reload context files, skills, prompt templates, and extensions");
       ("/new", "clear the conversation");
       ("/help", "show this help");
       ("/exit, /quit", "quit") ];
+  Printf.printf "  %-22s %s\n" "!cmd" "run shell and add output to model context";
+  Printf.printf "  %-22s %s\n" "!!cmd" "run shell without adding output to model context";
   flush stdout
 
 let list_providers agent =
@@ -90,12 +109,19 @@ let handle_command agent line =
   | "/clone" :: _ -> Printf.printf "%s\n%!" (dim (Commands.clone agent))
   | "/export" :: p :: _ -> Printf.printf "%s\n%!" (dim (Commands.export agent p))
   | "/copy" :: _ -> Printf.printf "%s\n%!" (dim (Commands.copy agent))
+  | "/reload" :: _ ->
+    ignore (Extensions.load ());
+    Agent.reload_system_prompt agent;
+    Printf.printf "%s\n%!" (dim "Reloaded resources.")
   | "/new" :: _ ->
     Agent.reset agent;
     print_string (dim "Conversation cleared.\n");
     flush stdout
   | "/model" :: rest -> switch_model agent rest
-  | cmd :: _ -> Printf.printf "%s %s (try /help)\n%!" (red "Unknown command") cmd
+  | cmd :: _ -> (
+    match Prompts.expand_command line with
+    | Some prompt -> run_turn agent prompt
+    | None -> Printf.printf "%s %s (try /help)\n%!" (red "Unknown command") cmd)
   | [] -> ()
 
 let interactive agent cfg resumed =
@@ -110,7 +136,8 @@ let interactive agent cfg resumed =
       if line = "/exit" || line = "/quit" then ()
       else begin
         if line <> "" then
-          if String.length line > 0 && line.[0] = '/' then handle_command agent line
+          if handle_bang agent line then ()
+          else if String.length line > 0 && line.[0] = '/' then handle_command agent line
           else run_turn agent line;
         print_newline ();
         loop ()
@@ -121,6 +148,7 @@ let interactive agent cfg resumed =
 type opts =
   { mutable model : string option;
     mutable provider : string option;
+    mutable api_key : string option;
     mutable thinking : string option;
     mutable cont : bool;
     mutable print : bool;
@@ -129,8 +157,17 @@ type opts =
     mutable mode : string; (* text | json | rpc *)
     mutable list_models : string option;
     mutable export : string option;
+    mutable resume : bool;
+    mutable session_spec : string option;
+    mutable fork_spec : string option;
+    mutable session_dir : string option;
     mutable no_session : bool;
     mutable tools : string list option;
+    mutable no_prompt_templates : bool;
+    mutable prompt_templates : string list;
+    mutable no_skills : bool;
+    mutable skills : string list;
+    mutable no_context_files : bool;
     mutable system_prompt : string option;
     mutable append_system_prompt : string list;
     mutable file_args : string list;
@@ -141,14 +178,24 @@ let usage =
    Options:\n\
   \  -m, --model <name>       model to use\n\
   \      --provider <alias>   provider (anthropic, deepseek, kimi, zai, ...)\n\
+  \      --api-key <key>      API key override\n\
   \      --thinking <level>   reasoning level (off/low/medium/high)\n\
   \      --system-prompt <s>  replace the base system prompt (or read file path)\n\
   \      --append-system-prompt <s>  append text or file contents (repeatable)\n\
   \  -c, --continue           resume the last session (.ocaml-agent/session.jsonl)\n\
+  \  -r, --resume             resume the last session in non-TTY mode\n\
+  \      --session <path|id>  use a specific session file or partial id\n\
+  \      --fork <path|id>     fork a session into a new session\n\
+  \      --session-dir <dir>  custom session storage directory\n\
   \  -p, --print              one-shot mode; prompt from args or stdin\n\
   \      --no-session         do not create or resume a session\n\
   \  -t, --tools <list>       comma-separated tool allowlist (Pi aliases accepted)\n\
   \      --no-tools           disable all tools for this run\n\
+  \      --prompt-template <path> load a prompt template file or directory\n\
+  \      --no-prompt-templates disable prompt template discovery\n\
+  \      --skill <path>        load a skill file or directory\n\
+  \      --no-skills           disable skill discovery\n\
+  \      --no-context-files    disable AGENTS.md / CLAUDE.md injection\n\
   \      --no-tui             use the plain line REPL instead of the full-screen TUI\n\
   \      --mode <text|json|rpc>  output mode; rpc = JSON-RPC over stdin/stdout\n\
   \      --list-models [pat]  list known models and exit\n\
@@ -162,6 +209,7 @@ let parse_args argv =
   let o =
     { model = None;
       provider = None;
+      api_key = None;
       thinking = None;
       cont = false;
       print = false;
@@ -170,8 +218,17 @@ let parse_args argv =
       mode = "text";
       list_models = None;
       export = None;
+      resume = false;
+      session_spec = None;
+      fork_spec = None;
+      session_dir = None;
       no_session = false;
       tools = None;
+      no_prompt_templates = false;
+      prompt_templates = [];
+      no_skills = false;
+      skills = [];
+      no_context_files = false;
       system_prompt = None;
       append_system_prompt = [];
       file_args = [];
@@ -182,18 +239,32 @@ let parse_args argv =
     | "--" :: rest -> o.prompt <- rest
     | ("-m" | "--model") :: v :: rest -> o.model <- Some v; go rest
     | "--provider" :: v :: rest -> o.provider <- Some v; go rest
+    | "--api-key" :: v :: rest -> o.api_key <- Some v; go rest
     | "--thinking" :: v :: rest -> o.thinking <- Some v; go rest
     | "--system-prompt" :: v :: rest -> o.system_prompt <- Some v; go rest
     | "--append-system-prompt" :: v :: rest ->
       o.append_system_prompt <- o.append_system_prompt @ [ v ];
       go rest
     | ("-c" | "--continue") :: rest -> o.cont <- true; go rest
+    | ("-r" | "--resume") :: rest -> o.resume <- true; go rest
+    | "--session" :: v :: rest -> o.session_spec <- Some v; go rest
+    | "--fork" :: v :: rest -> o.fork_spec <- Some v; go rest
+    | "--session-dir" :: v :: rest -> o.session_dir <- Some v; go rest
     | ("-p" | "--print") :: rest -> o.print <- true; go rest
     | "--no-session" :: rest -> o.no_session <- true; go rest
     | ("--tools" | "-t") :: v :: rest ->
       o.tools <- Some (String.split_on_char ',' v |> List.map String.trim |> List.filter (fun s -> s <> ""));
       go rest
     | ("--no-tools" | "-nt") :: rest -> o.no_tools <- true; go rest
+    | "--prompt-template" :: v :: rest ->
+      o.prompt_templates <- o.prompt_templates @ [ v ];
+      go rest
+    | "--no-prompt-templates" :: rest -> o.no_prompt_templates <- true; go rest
+    | "--skill" :: v :: rest ->
+      o.skills <- o.skills @ [ v ];
+      go rest
+    | "--no-skills" :: rest -> o.no_skills <- true; go rest
+    | ("--no-context-files" | "-nc") :: rest -> o.no_context_files <- true; go rest
     | "--no-tui" :: rest -> o.no_tui <- true; go rest
     | "--mode" :: v :: rest -> o.mode <- v; go rest
     | "--rpc" :: rest -> o.mode <- "rpc"; go rest
@@ -309,10 +380,17 @@ let file_arg_text paths =
 let () =
   Random.self_init ();
   let o = parse_args (Array.to_list Sys.argv |> List.tl) in
+  Option.iter (fun k -> Unix.putenv "AGENT_API_KEY" k) o.api_key;
+  Option.iter (fun d -> Unix.putenv "AGENT_SESSION_DIR" d) o.session_dir;
   Option.iter (fun t -> Unix.putenv "AGENT_THINKING" t) o.thinking;
   Option.iter (fun s -> Unix.putenv "AGENT_SYSTEM_PROMPT" s) o.system_prompt;
   if o.append_system_prompt <> [] then
     Unix.putenv "AGENT_APPEND_SYSTEM_PROMPT" (Agent.join_prompt_inputs o.append_system_prompt);
+  if o.no_prompt_templates then Unix.putenv "AGENT_NO_PROMPT_TEMPLATES" "1";
+  if o.prompt_templates <> [] then Unix.putenv "AGENT_PROMPT_TEMPLATE_PATHS" (String.concat "\n" o.prompt_templates);
+  if o.no_skills then Unix.putenv "AGENT_NO_SKILLS" "1";
+  if o.skills <> [] then Unix.putenv "AGENT_SKILL_PATHS" (String.concat "\n" o.skills);
+  if o.no_context_files then Unix.putenv "AGENT_NO_CONTEXT_FILES" "1";
   (match o.list_models with
    | Some pat -> list_models pat; exit 0
    | None -> ());
@@ -332,18 +410,36 @@ let () =
     exit 1
   | cfg ->
     let one_shot_mode = o.print || o.prompt <> [] || o.file_args <> [] in
+    let open_resolved_session spec =
+      match Session.resolve_path spec with
+      | Some path -> (Some (Session.open_file path), Session.load_turns path)
+      | None ->
+        Printf.eprintf "%s no matching session: %s\n%!" (red "Error:") spec;
+        exit 1
+    in
     let session, initial_turns =
       match Sys.getenv_opt "AGENT_SESSION_FILE" with
-      | Some p when (not o.no_session) && String.trim p <> "" -> (Some (Session.open_file p), Session.load_turns p)
+      | Some p when (not o.no_session) && o.session_spec = None && o.fork_spec = None && String.trim p <> "" ->
+        (Some (Session.open_file p), Session.load_turns p)
       | _ ->
         if o.no_session then (None, [])
-        else if o.cont then
-          (* Resume the most recent session in the sessions dir. *)
-          match Session.list () with
-          | i :: _ -> (Some (Session.open_file i.Session.path), Session.load_turns i.Session.path)
-          | [] -> (Some (Session.create_new ()), [])
-        else if one_shot_mode then (None, []) (* one-shot is ephemeral by default *)
-        else (Some (Session.create_new ()), []) (* interactive runs are persisted + resumable *)
+        else
+          match (o.fork_spec, o.session_spec) with
+          | Some spec, _ -> (
+            match Session.fork_from spec with
+            | Some s -> (Some s, Session.load_turns s.Session.path)
+            | None ->
+              Printf.eprintf "%s no matching session to fork: %s\n%!" (red "Error:") spec;
+              exit 1)
+          | None, Some spec -> open_resolved_session spec
+          | None, None when o.cont || o.resume ->
+            (* Resume the most recent session in the sessions dir. *)
+            (match Session.list () with
+             | i :: _ -> (Some (Session.open_file i.Session.path), Session.load_turns i.Session.path)
+             | [] -> (Some (Session.create_new ()), []))
+          | None, None ->
+            if one_shot_mode then (None, []) (* one-shot is ephemeral by default *)
+            else (Some (Session.create_new ()), []) (* interactive runs are persisted + resumable *)
     in
     let allowed_tools = Option.map Tools.canonical_names o.tools in
     let agent = Agent.create ?session ~initial_turns ~tools_enabled:(not o.no_tools) ?allowed_tools cfg in

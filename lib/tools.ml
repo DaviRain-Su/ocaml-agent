@@ -151,12 +151,14 @@ let write_file =
 
 (* Replace the first occurrence of [old_] with [new_] in [s]; None if absent. *)
 let replace_first s old_ new_ =
-  match Str.search_forward (Str.regexp_string old_) s 0 with
-  | i ->
-    let before = String.sub s 0 i in
-    let after = String.sub s (i + String.length old_) (String.length s - i - String.length old_) in
-    Some (before ^ new_ ^ after)
-  | exception Not_found -> None
+  if old_ = "" then None
+  else
+    match Str.search_forward (Str.regexp_string old_) s 0 with
+    | i ->
+      let before = String.sub s 0 i in
+      let after = String.sub s (i + String.length old_) (String.length s - i - String.length old_) in
+      Some (before ^ new_ ^ after)
+    | exception Not_found -> None
 
 (* Prefix every line of [s] with [p] for diff display. *)
 let prefix_lines p s =
@@ -265,11 +267,15 @@ let close_noerr fd = try Unix.close fd with Unix.Unix_error _ -> ()
 
 let write_temp_stdin content =
   let path = Filename.temp_file "agent_stdin" ".json" in
-  let oc = open_out_bin path in
-  Fun.protect
-    ~finally:(fun () -> close_out_noerr oc)
-    (fun () -> output_string oc content);
-  path
+  try
+    let oc = open_out_bin path in
+    Fun.protect
+      ~finally:(fun () -> close_out_noerr oc)
+      (fun () -> output_string oc content);
+    path
+  with e ->
+    (try Sys.remove path with Sys_error _ -> ());
+    raise e
 
 let run_process ?stdin_data ?(timeout_s = command_timeout_s) command =
   let stdin_path = ref None in

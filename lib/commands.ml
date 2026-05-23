@@ -69,7 +69,8 @@ let copy agent =
   | Some text -> (
     try
       let oc = Unix.open_process_out "pbcopy" in
-      output_string oc text;
-      ignore (Unix.close_process_out oc);
+      Fun.protect
+        ~finally:(fun () -> ignore (Unix.close_process_out oc))
+        (fun () -> output_string oc text);
       "Copied last reply to clipboard."
     with _ -> "Clipboard copy failed (is pbcopy available?).")
