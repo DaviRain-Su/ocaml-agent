@@ -39,6 +39,12 @@ let print_help () =
       ("/session", "show current model, turn count, and context usage");
       ("/compact", "summarize older turns to free up context");
       ("/think <level>", "set reasoning level (off/low/medium/high)");
+      ("/sessions", "list saved sessions");
+      ("/resume <n|id>", "resume a saved session");
+      ("/name <text>", "name the current session");
+      ("/clone", "duplicate the current session");
+      ("/export <file>", "export session (.html or .jsonl)");
+      ("/copy", "copy last reply to the clipboard");
       ("/new", "clear the conversation");
       ("/help", "show this help");
       ("/exit, /quit", "quit") ];
@@ -78,6 +84,12 @@ let handle_command agent line =
   | "/compact" :: _ ->
     print_string (dim (Agent.compact agent ^ "\n"));
     flush stdout
+  | "/sessions" :: _ -> Printf.printf "%s\n%!" (Commands.format_sessions ())
+  | "/resume" :: a :: _ -> Printf.printf "%s\n%!" (dim (Commands.resume agent a))
+  | "/name" :: rest when rest <> [] -> Printf.printf "%s\n%!" (dim (Commands.name agent (String.concat " " rest)))
+  | "/clone" :: _ -> Printf.printf "%s\n%!" (dim (Commands.clone agent))
+  | "/export" :: p :: _ -> Printf.printf "%s\n%!" (dim (Commands.export agent p))
+  | "/copy" :: _ -> Printf.printf "%s\n%!" (dim (Commands.copy agent))
   | "/new" :: _ ->
     Agent.reset agent;
     print_string (dim "Conversation cleared.\n");
@@ -177,21 +189,24 @@ let () =
     Printf.eprintf "%s %s\n%!" (red "Config error:") msg;
     exit 1
   | cfg ->
+    let one_shot_mode = o.print || o.prompt <> [] in
     let session, initial_turns =
-      let path =
-        match Sys.getenv_opt "AGENT_SESSION_FILE" with
-        | Some p when String.trim p <> "" -> Some p
-        | _ -> if o.cont then Some ".ocaml-agent/session.jsonl" else None
-      in
-      match path with
-      | Some path -> (Some (Session.create path), Session.load path)
-      | None -> (None, [])
+      match Sys.getenv_opt "AGENT_SESSION_FILE" with
+      | Some p when String.trim p <> "" -> (Some (Session.open_file p), Session.load_turns p)
+      | _ ->
+        if o.cont then
+          (* Resume the most recent session in the sessions dir. *)
+          match Session.list () with
+          | i :: _ -> (Some (Session.open_file i.Session.path), Session.load_turns i.Session.path)
+          | [] -> (Some (Session.create_new ()), [])
+        else if one_shot_mode then (None, []) (* one-shot is ephemeral by default *)
+        else (Some (Session.create_new ()), []) (* interactive runs are persisted + resumable *)
     in
     let agent = Agent.create ?session ~initial_turns ~tools_enabled:(not o.no_tools) cfg in
     let one_shot () =
       let prompt = if o.prompt = [] then String.trim (read_stdin_all ()) else String.concat " " o.prompt in
       if prompt <> "" then run_turn agent prompt
     in
-    if o.print || o.prompt <> [] then one_shot ()
+    if one_shot_mode then one_shot ()
     else if (not o.no_tui) && Unix.isatty Unix.stdin && Unix.isatty Unix.stdout then Tui.run agent
     else interactive agent cfg (List.length initial_turns)

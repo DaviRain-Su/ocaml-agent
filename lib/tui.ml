@@ -169,6 +169,12 @@ let cmd ui line =
         "/think <level>         reasoning level (off/low/medium/high)";
         "/compact               summarize older turns";
         "/session               model, turns, context usage";
+        "/sessions              list saved sessions";
+        "/resume <n|id>         resume a saved session";
+        "/name <text>           name the current session";
+        "/clone                 duplicate the current session";
+        "/export <file>         export (.html or .jsonl)";
+        "/copy                  copy last reply to clipboard";
         "/new                   clear the conversation";
         "/exit                  quit" ];
     redraw ui
@@ -181,6 +187,14 @@ let cmd ui line =
     redraw ui
   | "/new" :: _ -> Agent.reset ui.agent; push ui A.(fg (gray 12)) "Conversation cleared."; redraw ui
   | "/compact" :: _ -> push ui A.(fg (gray 12)) (Agent.compact ui.agent); redraw ui
+  | "/sessions" :: _ ->
+    List.iter (push ui A.empty) (String.split_on_char '\n' (Commands.format_sessions ()));
+    redraw ui
+  | "/resume" :: a :: _ -> push ui A.(fg (gray 12)) (Commands.resume ui.agent a); redraw ui
+  | "/name" :: rest when rest <> [] -> push ui A.(fg (gray 12)) (Commands.name ui.agent (String.concat " " rest)); redraw ui
+  | "/clone" :: _ -> push ui A.(fg (gray 12)) (Commands.clone ui.agent); redraw ui
+  | "/export" :: p :: _ -> push ui A.(fg (gray 12)) (Commands.export ui.agent p); redraw ui
+  | "/copy" :: _ -> push ui A.(fg (gray 12)) (Commands.copy ui.agent); redraw ui
   | "/think" :: rest ->
     let lvl = match rest with l :: _ -> l | [] -> "off" in
     Agent.set_thinking ui.agent lvl;

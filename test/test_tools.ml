@@ -94,13 +94,31 @@ let () =
 
   (* --- Session save/load --- *)
   let spath = "session.jsonl" in
-  let s = Session.create spath in
+  let s = Session.open_file spath in
   List.iter (Session.append s) turns;
   Session.close s;
   let loaded = Session.load spath in
   check "session reloads same turn count" (List.length loaded = List.length turns);
   check "session preserves content"
     (List.map Llm.turn_to_json loaded = List.map Llm.turn_to_json turns);
+
+  (* --- session manager: dir, headers, list, name, clone --- *)
+  let ns = Session.create_new ~name:"alpha" () in
+  List.iter (Session.append ns) turns;
+  (match Session.read_header ns.Session.path with
+   | Some i -> check "session header has name" (i.Session.name = "alpha")
+   | None -> check "session header has name" false);
+  check "session in listing" (List.exists (fun (i : Session.info) -> i.Session.id = ns.Session.id) (Session.list ()));
+  Session.set_name ns "beta" turns;
+  (match Session.read_header ns.Session.path with
+   | Some i -> check "session rename persists" (i.Session.name = "beta")
+   | None -> check "session rename persists" false);
+  check "set_name keeps turns" (List.length (Session.load_turns ns.Session.path) = List.length turns);
+  let cl = Session.clone_from turns in
+  check "clone duplicates turns" (List.length (Session.load_turns cl.Session.path) = List.length turns);
+  check "clone is a new id" (cl.Session.id <> ns.Session.id);
+  Session.close ns;
+  Session.close cl;
 
   (* --- system prompt context injection + identity --- *)
   let _ = run "write_file" {|{"path":"AGENTS.md","content":"PROJECT_RULE_XYZ"}|} in

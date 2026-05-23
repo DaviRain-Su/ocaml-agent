@@ -126,7 +126,7 @@ type t =
   { mutable cfg : Llm.config;
     mutable system : string;
     mutable turns : Llm.turn list; (* chronological *)
-    session : Session.t option;
+    mutable session : Session.t option;
     mutable auto_approve : bool;
     tools_enabled : bool;
     context_window : int;
@@ -172,6 +172,19 @@ let reset t = t.turns <- []
 
 let config t = t.cfg
 let turn_count t = List.length t.turns
+let turns t = t.turns
+let session t = t.session
+
+(* Rewrite the whole session file to reflect the current (e.g. compacted) turns. *)
+let persist_full t = Option.iter (fun s -> Session.save_all s t.turns) t.session
+
+(* Switch to a different session and its history (used by /resume, /clone, /new). *)
+let adopt_session t ?(turns = []) session =
+  Option.iter Session.close t.session;
+  t.session <- session;
+  t.turns <- turns;
+  t.last_input_tokens <- 0;
+  t.last_output_tokens <- 0
 
 (* Change the reasoning level live. *)
 let set_thinking t level = t.cfg <- { t.cfg with Llm.thinking = level }
@@ -264,6 +277,7 @@ let compact t =
     t.turns <- summary_turn :: recent;
     t.last_input_tokens <- 0;
     (* force re-estimate next turn *)
+    Option.iter (fun s -> Session.save_all s t.turns) t.session;
     Printf.sprintf "Compacted %d older turns into a summary." (List.length older)
   end
 
