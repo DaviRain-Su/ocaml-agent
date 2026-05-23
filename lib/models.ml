@@ -7,8 +7,8 @@ type entry = { provider : string; id : string; context_window : int }
 let catalog : entry list =
   [ { provider = "anthropic"; id = "claude-opus-4-7"; context_window = 200000 };
     { provider = "anthropic"; id = "claude-sonnet-4-6"; context_window = 200000 };
-    { provider = "deepseek"; id = "deepseek-chat"; context_window = 128000 };
-    { provider = "deepseek"; id = "deepseek-reasoner"; context_window = 128000 };
+    { provider = "deepseek"; id = "deepseek-v4-flash"; context_window = 1000000 };
+    { provider = "deepseek"; id = "deepseek-v4-pro"; context_window = 1000000 };
     { provider = "kimi"; id = "kimi-for-coding"; context_window = 262144 };
     { provider = "kimi"; id = "kimi-k2-thinking"; context_window = 262144 };
     { provider = "moonshot"; id = "kimi-k2-0905-preview"; context_window = 131072 };

@@ -126,7 +126,7 @@ let () =
     { Llm.provider = Llm.Openai;
       base_url = "https://api.deepseek.com";
       api_key = "sk-test";
-      model = "deepseek-chat";
+      model = "deepseek-v4-pro";
       max_tokens = 4096;
       extra_headers = [];
       thinking = "off" }
@@ -135,7 +135,7 @@ let () =
   check "system prompt injects AGENTS.md" (contains prompt "PROJECT_RULE_XYZ");
   check "system prompt includes cwd" (contains prompt "Current working directory:");
   check "system prompt includes date" (contains prompt "Current date:");
-  check "system prompt states model identity" (contains prompt "deepseek-chat");
+  check "system prompt states model identity" (contains prompt "deepseek-v4-pro");
   check "system prompt states provider identity" (contains prompt "OpenAI-compatible");
 
   (* --- Render --- *)
@@ -171,7 +171,7 @@ let () =
   check "task tool present" (Tools.find "task" <> None);
 
   (* --- model catalog --- *)
-  check "model context window lookup" (Models.context_window "deepseek-chat" = Some 128000);
+  check "model context window lookup" (Models.context_window "deepseek-v4-pro" = Some 1000000);
   check "model unknown -> None" (Models.context_window "no-such-model" = None);
   check "model list filters" (List.for_all (fun (e : Models.entry) -> contains0 e.Models.id "glm" || contains0 e.Models.provider "zai") (Models.list ~pat:"zai" ()));
   check "model list nonempty" (Models.list () <> []);

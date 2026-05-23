@@ -70,7 +70,7 @@ let mk ?(headers = []) names protocol base_url env_keys default_model =
 let registry : known list =
   [ mk [ "anthropic"; "claude" ] Anthropic "https://api.anthropic.com" [ "ANTHROPIC_API_KEY" ]
       "claude-opus-4-7";
-    mk [ "deepseek" ] Openai "https://api.deepseek.com" [ "DEEPSEEK_API_KEY" ] "deepseek-chat";
+    mk [ "deepseek" ] Openai "https://api.deepseek.com" [ "DEEPSEEK_API_KEY" ] "deepseek-v4-pro";
     (* Kimi For Coding subscription: dedicated Anthropic-protocol endpoint,
        keyed by KIMI_API_KEY, requires the Kimi CLI User-Agent. *)
     mk [ "kimi"; "kimi-coding"; "kfc" ] Anthropic "https://api.kimi.com/coding" [ "KIMI_API_KEY" ]
