@@ -189,6 +189,7 @@ let html_escape s =
       | '<' -> Buffer.add_string b "&lt;"
       | '>' -> Buffer.add_string b "&gt;"
       | '&' -> Buffer.add_string b "&amp;"
+      | '"' -> Buffer.add_string b "&quot;"
       | c -> Buffer.add_char b c)
     s;
   Buffer.contents b

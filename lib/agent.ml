@@ -315,7 +315,9 @@ let rec run_sub_agent t input =
       let sub =
         { t with turns = []; session = None; depth = t.depth + 1; last_input_tokens = 0; last_output_tokens = 0 }
       in
-      try send sub prompt with e -> "Error: " ^ Printexc.to_string e
+      try send sub prompt with
+      | Sys.Break as e -> raise e
+      | e -> "Error: " ^ Printexc.to_string e
     end
 
 and run_tool t id name input : Llm.content =
@@ -325,7 +327,9 @@ and run_tool t id name input : Llm.content =
     else if not (approve t name input) then "Error: command not approved by user"
     else
       match Tools.find name with
-      | Some tool -> ( try tool.execute input with e -> "Error: " ^ Printexc.to_string e)
+      | Some tool -> ( try tool.execute input with
+      | Sys.Break as e -> raise e
+      | e -> "Error: " ^ Printexc.to_string e)
       | None -> Printf.sprintf "Error: unknown tool %s" name
   in
   t.fe.tool_result result;

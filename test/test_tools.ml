@@ -197,6 +197,9 @@ let () =
   check "complete slash command" (List.mem "/model" (Complete.candidates "/mo"));
   check "complete slash multi" (List.mem "/session" (Complete.candidates "/se") && List.mem "/sessions" (Complete.candidates "/se"));
   check "complete path token" (List.mem "src/foo.ml" (Complete.candidates "read src/f"));
+  check "menu matches slash prefix" (List.mem_assoc "/session" (Complete.menu "/se") && List.mem_assoc "/sessions" (Complete.menu "/se"));
+  check "menu empty for non-slash" (Complete.menu "hello" = []);
+  check "menu empty after space" (Complete.menu "/model deepseek" = []);
 
   (* --- keymap --- *)
   check "keymap parse ctrl" (Keymap.parse_spec "ctrl+p" = Some ('p', true));

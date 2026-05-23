@@ -312,6 +312,7 @@ let grep =
           let out = Buffer.create 4096 in
           let count = ref 0 in
           let truncated = ref false in
+          let max_size = 10_000_000 in
           (try
              walk root (fun rel ->
                  if !count >= grep_limit then (
@@ -324,22 +325,25 @@ let grep =
                  in
                  if name_ok then begin
                    let full = if Sys.is_directory root then Filename.concat root rel else root in
-                   match read_file_contents full with
-                   | exception _ -> ()
-                   | content ->
-                     if not (looks_binary content) then begin
-                       let lines = String.split_on_char '\n' content in
-                       List.iteri
-                         (fun idx line ->
-                           if !count < grep_limit then (
-                             match Str.search_forward re line 0 with
-                             | _ ->
-                               Buffer.add_string out (Printf.sprintf "%s:%d:%s\n" rel (idx + 1) line);
-                               incr count
-                             | exception Not_found -> ())
-                           else truncated := true)
-                         lines
-                     end
+                   let size = try (Unix.stat full).Unix.st_size with _ -> 0 in
+                   if size > max_size then ()
+                   else
+                     match read_file_contents full with
+                     | exception _ -> ()
+                     | content ->
+                       if not (looks_binary content) then begin
+                         let lines = String.split_on_char '\n' content in
+                         List.iteri
+                           (fun idx line ->
+                             if !count < grep_limit then (
+                               match Str.search_forward re line 0 with
+                               | _ ->
+                                 Buffer.add_string out (Printf.sprintf "%s:%d:%s\n" rel (idx + 1) line);
+                                 incr count
+                               | exception Not_found -> ())
+                             else truncated := true)
+                           lines
+                       end
                  end)
            with Exit -> ());
           if !count = 0 then "No matches."

@@ -50,7 +50,9 @@ let tool_of_json (j : Yojson.Safe.t) : Tools.tool option =
       { Tools.name;
         description;
         parameters;
-        execute = (fun input -> try run_command command (Yojson.Safe.to_string input) with e -> "Error: " ^ Printexc.to_string e) }
+        execute = (fun input -> try run_command command (Yojson.Safe.to_string input) with
+        | Sys.Break as e -> raise e
+        | e -> "Error: " ^ Printexc.to_string e) }
   | _ -> None
 
 (* Load and register manifest tools; returns the names registered. *)
