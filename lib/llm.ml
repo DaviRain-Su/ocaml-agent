@@ -220,18 +220,20 @@ let content_to_json = function
     `Assoc [ ("type", `String "tool_result"); ("id", `String id); ("content", `String content) ]
 
 let content_of_json j =
-  match j |> member "type" |> to_string with
-  | "text" -> Text (j |> member "text" |> to_string)
-  | "thinking" ->
-    Thinking { text = j |> member "text" |> to_string; signature = j |> member "signature" |> to_string }
-  | "tool_use" ->
-    Tool_use
-      { id = j |> member "id" |> to_string;
-        name = j |> member "name" |> to_string;
-        input = j |> member "input" }
-  | "tool_result" ->
-    Tool_result { id = j |> member "id" |> to_string; content = j |> member "content" |> to_string }
-  | other -> failwith ("unknown content type: " ^ other)
+  try
+    match j |> member "type" |> to_string with
+    | "text" -> Text (j |> member "text" |> to_string)
+    | "thinking" ->
+      Thinking { text = j |> member "text" |> to_string; signature = j |> member "signature" |> to_string }
+    | "tool_use" ->
+      Tool_use
+        { id = j |> member "id" |> to_string;
+          name = j |> member "name" |> to_string;
+          input = j |> member "input" }
+    | "tool_result" ->
+      Tool_result { id = j |> member "id" |> to_string; content = j |> member "content" |> to_string }
+    | other -> failwith ("unknown content type: " ^ other)
+  with _ -> Text "[unparseable content block]"
 
 let turn_to_json t =
   `Assoc
@@ -239,8 +241,10 @@ let turn_to_json t =
       ("content", `List (List.map content_to_json t.content)) ]
 
 let turn_of_json j =
-  let role = match j |> member "role" |> to_string with "assistant" -> Assistant | _ -> User in
-  { role; content = j |> member "content" |> to_list |> List.map content_of_json }
+  try
+    let role = match j |> member "role" |> to_string with "assistant" -> Assistant | _ -> User in
+    { role; content = j |> member "content" |> to_list |> List.map content_of_json }
+  with _ -> { role = User; content = [ Text "[unparseable turn]" ] }
 
 (* --- Anthropic protocol --- *)
 
@@ -276,7 +280,7 @@ type builder =
   | BThinking of { text : Buffer.t; sign : Buffer.t }
   | BTool of { id : string; name : string; json : Buffer.t }
 
-let anthropic_complete cfg ~system ~on_text ~tools_enabled turns : content list * usage =
+let anthropic_complete cfg ~system ~on_text ~tools_enabled ?tool_names turns : content list * usage =
   let budget = thinking_budget cfg.thinking in
   (* Extended thinking requires max_tokens strictly greater than the budget. *)
   let max_tokens = if budget > 0 && cfg.max_tokens <= budget then budget + 4096 else cfg.max_tokens in
@@ -286,7 +290,7 @@ let anthropic_complete cfg ~system ~on_text ~tools_enabled turns : content list 
          ("max_tokens", `Int max_tokens);
          ("system", `String system);
          ("stream", `Bool true);
-         ("tools", `List (if tools_enabled then Tools.anthropic_schemas () else []));
+         ("tools", `List (if tools_enabled then Tools.anthropic_schemas ?allowed:tool_names () else []));
          ("messages", `List (anthropic_messages turns)) ]
       @
       if budget > 0 then
@@ -325,44 +329,46 @@ let anthropic_complete cfg ~system ~on_text ~tools_enabled turns : content list 
       blocks := Tool_use { id; name; input } :: !blocks
   in
   let handle data =
-    match Yojson.Safe.from_string data with
-    | exception _ -> ()
-    | j -> (
-      match j |> member "type" |> to_string with
-      | "error" -> raise (Api_error data)
-      | "message_start" -> read_usage (j |> member "message" |> member "usage")
-      | "message_delta" -> read_usage (j |> member "usage")
-      | "content_block_start" ->
-        let idx = j |> member "index" |> to_int in
-        let cb = j |> member "content_block" in
-        (match cb |> member "type" |> to_string with
-         | "text" -> Hashtbl.replace builders idx (BText (Buffer.create 256))
-         | "thinking" ->
-           Hashtbl.replace builders idx (BThinking { text = Buffer.create 256; sign = Buffer.create 64 })
-         | "tool_use" ->
-           Hashtbl.replace builders idx
-             (BTool
-                { id = cb |> member "id" |> to_string;
-                  name = cb |> member "name" |> to_string;
-                  json = Buffer.create 128 })
-         | _ -> ())
-      | "content_block_delta" -> (
-        let idx = j |> member "index" |> to_int in
-        let d = j |> member "delta" in
-        match (d |> member "type" |> to_string, Hashtbl.find_opt builders idx) with
-        | "text_delta", Some (BText b) ->
-          let t = d |> member "text" |> to_string in
-          Buffer.add_string b t;
-          on_text t
-        | "input_json_delta", Some (BTool { json; _ }) ->
-          Buffer.add_string json (d |> member "partial_json" |> to_string)
-        | "thinking_delta", Some (BThinking { text; _ }) ->
-          Buffer.add_string text (d |> member "thinking" |> to_string)
-        | "signature_delta", Some (BThinking { sign; _ }) ->
-          Buffer.add_string sign (d |> member "signature" |> to_string)
+    try
+      match Yojson.Safe.from_string data with
+      | exception _ -> ()
+      | j -> (
+        match j |> member "type" |> to_string with
+        | "error" -> raise (Api_error data)
+        | "message_start" -> read_usage (j |> member "message" |> member "usage")
+        | "message_delta" -> read_usage (j |> member "usage")
+        | "content_block_start" ->
+          let idx = j |> member "index" |> to_int in
+          let cb = j |> member "content_block" in
+          (match cb |> member "type" |> to_string with
+           | "text" -> Hashtbl.replace builders idx (BText (Buffer.create 256))
+           | "thinking" ->
+             Hashtbl.replace builders idx (BThinking { text = Buffer.create 256; sign = Buffer.create 64 })
+           | "tool_use" ->
+             Hashtbl.replace builders idx
+               (BTool
+                  { id = cb |> member "id" |> to_string;
+                    name = cb |> member "name" |> to_string;
+                    json = Buffer.create 128 })
+           | _ -> ())
+        | "content_block_delta" -> (
+          let idx = j |> member "index" |> to_int in
+          let d = j |> member "delta" in
+          match (d |> member "type" |> to_string, Hashtbl.find_opt builders idx) with
+          | "text_delta", Some (BText b) ->
+            let t = d |> member "text" |> to_string in
+            Buffer.add_string b t;
+            on_text t
+          | "input_json_delta", Some (BTool { json; _ }) ->
+            Buffer.add_string json (d |> member "partial_json" |> to_string)
+          | "thinking_delta", Some (BThinking { text; _ }) ->
+            Buffer.add_string text (d |> member "thinking" |> to_string)
+          | "signature_delta", Some (BThinking { sign; _ }) ->
+            Buffer.add_string sign (d |> member "signature" |> to_string)
+          | _ -> ())
+        | "content_block_stop" -> finalize (j |> member "index" |> to_int)
         | _ -> ())
-      | "content_block_stop" -> finalize (j |> member "index" |> to_int)
-      | _ -> ())
+    with _ -> ()
   in
   (try
      Http.post_stream ~url ~headers body ~on_line:(fun line ->
@@ -370,7 +376,9 @@ let anthropic_complete cfg ~system ~on_text ~tools_enabled turns : content list 
          | Some data when data <> "[DONE]" -> handle data
          | Some _ -> ()
          | None -> if String.trim line <> "" then Buffer.add_string err (line ^ "\n"))
-   with Http.Http_error e -> raise (Api_error e));
+   with Http.Http_error e ->
+     let msg = if Buffer.length err > 0 then e ^ "\n" ^ Buffer.contents err else e in
+     raise (Api_error msg));
   if !blocks = [] && Buffer.length err > 0 then raise (Api_error (Buffer.contents err));
   (List.rev !blocks, { input_tokens = !in_tok; output_tokens = !out_tok })
 
@@ -420,7 +428,7 @@ let openai_messages ~system turns =
   in
   sys_msg :: List.concat_map of_turn turns
 
-let openai_complete cfg ~system ~on_text ~tools_enabled turns : content list * usage =
+let openai_complete cfg ~system ~on_text ~tools_enabled ?tool_names turns : content list * usage =
   let body =
     `Assoc
       ([ ("model", `String cfg.model);
@@ -431,7 +439,7 @@ let openai_complete cfg ~system ~on_text ~tools_enabled turns : content list * u
       @ (if cfg.thinking <> "off" then [ ("reasoning_effort", `String cfg.thinking) ] else [])
       @
       if tools_enabled then
-        [ ("tools", `List (Tools.openai_schemas ())); ("tool_choice", `String "auto") ]
+        [ ("tools", `List (Tools.openai_schemas ?allowed:tool_names ())); ("tool_choice", `String "auto") ]
       else [])
   in
   let url = cfg.base_url ^ "/chat/completions" in
@@ -454,39 +462,41 @@ let openai_complete cfg ~system ~on_text ~tools_enabled turns : content list * u
       t
   in
   let handle data =
-    match Yojson.Safe.from_string data with
-    | exception _ -> ()
-    | j -> (
-      match j |> member "error" with
-      | `Null -> (
-        (match j |> member "usage" with
-         | `Null -> ()
-         | u ->
-           (match u |> member "prompt_tokens" with `Int n -> in_tok := n | _ -> ());
-           (match u |> member "completion_tokens" with `Int n -> out_tok := n | _ -> ()));
-        match j |> member "choices" |> to_list with
-        | choice :: _ -> (
-          let d = choice |> member "delta" in
-          (match d |> member "content" with
-           | `String s when s <> "" ->
-             Buffer.add_string text s;
-             on_text s
-           | _ -> ());
-          match d |> member "tool_calls" with
-          | `Null -> ()
-          | calls ->
-            calls |> to_list
-            |> List.iter (fun c ->
-                   let idx = match c |> member "index" with `Int i -> i | _ -> 0 in
-                   let id, name, args = get_tool idx in
-                   (match c |> member "id" with `String s when s <> "" -> id := s | _ -> ());
-                   let fn = c |> member "function" in
-                   (match fn |> member "name" with `String s when s <> "" -> name := s | _ -> ());
-                   match fn |> member "arguments" with
-                   | `String s -> Buffer.add_string args s
-                   | _ -> ()))
-        | [] -> ())
-      | _ -> raise (Api_error data))
+    try
+      match Yojson.Safe.from_string data with
+      | exception _ -> ()
+      | j -> (
+        match j |> member "error" with
+        | `Null -> (
+          (match j |> member "usage" with
+           | `Null -> ()
+           | u ->
+             (match u |> member "prompt_tokens" with `Int n -> in_tok := n | _ -> ());
+             (match u |> member "completion_tokens" with `Int n -> out_tok := n | _ -> ()));
+          match j |> member "choices" |> to_list with
+          | choice :: _ -> (
+            let d = choice |> member "delta" in
+            (match d |> member "content" with
+             | `String s when s <> "" ->
+               Buffer.add_string text s;
+               on_text s
+             | _ -> ());
+            match d |> member "tool_calls" with
+            | `Null -> ()
+            | calls ->
+              calls |> to_list
+              |> List.iter (fun c ->
+                     let idx = match c |> member "index" with `Int i -> i | _ -> 0 in
+                     let id, name, args = get_tool idx in
+                     (match c |> member "id" with `String s when s <> "" -> id := s | _ -> ());
+                     let fn = c |> member "function" in
+                     (match fn |> member "name" with `String s when s <> "" -> name := s | _ -> ());
+                     match fn |> member "arguments" with
+                     | `String s -> Buffer.add_string args s
+                     | _ -> ()))
+          | [] -> ())
+        | _ -> raise (Api_error data))
+    with _ -> ()
   in
   (try
      Http.post_stream ~url ~headers body ~on_line:(fun line ->
@@ -494,7 +504,9 @@ let openai_complete cfg ~system ~on_text ~tools_enabled turns : content list * u
          | Some data when data <> "[DONE]" -> handle data
          | Some _ -> ()
          | None -> if String.trim line <> "" then Buffer.add_string err (line ^ "\n"))
-   with Http.Http_error e -> raise (Api_error e));
+   with Http.Http_error e ->
+     let msg = if Buffer.length err > 0 then e ^ "\n" ^ Buffer.contents err else e in
+     raise (Api_error msg));
   let text_blocks =
     if Buffer.length text > 0 then [ Text (Buffer.contents text) ] else []
   in
@@ -516,7 +528,7 @@ let openai_complete cfg ~system ~on_text ~tools_enabled turns : content list * u
 
 (* --- dispatch --- *)
 
-let complete cfg ~system ?(on_text = fun _ -> ()) ?(tools_enabled = true) turns : content list * usage =
+let complete cfg ~system ?(on_text = fun _ -> ()) ?(tools_enabled = true) ?tool_names turns : content list * usage =
   match cfg.provider with
-  | Anthropic -> anthropic_complete cfg ~system ~on_text ~tools_enabled turns
-  | Openai -> openai_complete cfg ~system ~on_text ~tools_enabled turns
+  | Anthropic -> anthropic_complete cfg ~system ~on_text ~tools_enabled ?tool_names turns
+  | Openai -> openai_complete cfg ~system ~on_text ~tools_enabled ?tool_names turns

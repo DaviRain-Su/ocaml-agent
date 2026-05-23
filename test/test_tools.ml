@@ -239,11 +239,28 @@ let () =
   check "menu empty for non-slash" (Complete.menu "hello" = []);
   check "menu empty after space" (Complete.menu "/model deepseek" = []);
 
+  (* --- @file mentions --- *)
+  let _ = run "write_file" {|{"path":"ment.txt","content":"MENTION_BODY_42"}|} in
+  let expanded = Mentions.expand "please read @ment.txt now" in
+  check "mention expands existing file" (contains0 expanded "MENTION_BODY_42" && contains0 expanded "@ment.txt");
+  check "mention leaves text without files" (Mentions.expand "no files here @nope.xyz" = "no files here @nope.xyz");
+  check "mention strips trailing punctuation" (contains0 (Mentions.expand "see @ment.txt.") "MENTION_BODY_42");
+
   (* --- keymap --- *)
   check "keymap parse ctrl" (Keymap.parse_spec "ctrl+p" = Some ('p', true));
   check "keymap parse plain" (Keymap.parse_spec "s" = Some ('s', false));
   check "keymap action name" (Keymap.action_of_string "quit" = Some Keymap.Quit);
   check "keymap default has picker" (Keymap.lookup Keymap.default ('p', true) = Some Keymap.Model_picker);
+
+  (* --- veldt_init --- *)
+  let veldt_dir = Filename.concat dir "veldt-test" in
+  let r = run "veldt_init" (Printf.sprintf {|{"path":"%s","lang":"lua"}|} veldt_dir) in
+  check "veldt_init succeeds" (Str.string_match (Str.regexp "Initialized Veldt project") r 0);
+  check "veldt_init created bin/main.ml" (Sys.file_exists (Filename.concat veldt_dir "bin/main.ml"));
+  check "veldt_init created lib/lang.ml" (Sys.file_exists (Filename.concat veldt_dir "lib/lang.ml"));
+  check "veldt_init created compile.sh" (Sys.file_exists (Filename.concat veldt_dir "compile.sh"));
+  let main_content = run "read_file" (Printf.sprintf {|{"path":"%s"}|} (Filename.concat veldt_dir "bin/main.ml")) in
+  check "veldt_init stub mentions lua" (contains0 main_content "lua");
 
   (* --- TUI inline styling helpers --- *)
   let seg_text segs = String.concat "" (List.map snd segs) in

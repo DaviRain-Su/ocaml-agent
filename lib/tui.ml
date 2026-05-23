@@ -269,6 +269,8 @@ let make_frontend ui : Agent.frontend =
     tool_call = (fun name prev -> push ui A.(fg cyan) ("\xe2\x9a\x99 " ^ name ^ " " ^ prev); redraw ui);
     tool_result = (fun res -> if String.trim res <> "" then push_result ui res);
     notice = (fun s -> push ui A.(fg yellow) s; redraw ui);
+    message_end = (fun _ _ _ _ -> ());
+    tool_result_end = (fun _ -> ());
     confirm_bash =
       (fun cmd ->
         push ui A.(fg yellow) ("\xe2\x9a\xa0 run command: " ^ cmd);

@@ -92,7 +92,11 @@ let load_turns path : Llm.turn list =
               else
                 match Yojson.Safe.from_string line with
                 | exception _ -> acc
-                | j -> ( match j |> member "_session" with `Null -> Llm.turn_of_json j :: acc | _ -> acc)
+                | j -> (
+                  match j |> member "_session" with
+                  | `Null ->
+                    (try Llm.turn_of_json j :: acc with _ -> acc)
+                  | _ -> acc)
             in
             loop acc
         in
@@ -140,14 +144,19 @@ let append t (turn : Llm.turn) =
 let save_all t (turns : Llm.turn list) =
   close_out_noerr t.oc;
   let oc = open_out t.path in
-  write_header oc t.id t.name t.created t.cwd;
-  List.iter
-    (fun turn ->
-      output_string oc (Yojson.Safe.to_string (Llm.turn_to_json turn));
-      output_char oc '\n')
-    turns;
-  flush oc;
-  t.oc <- oc
+  try
+    write_header oc t.id t.name t.created t.cwd;
+    List.iter
+      (fun turn ->
+        output_string oc (Yojson.Safe.to_string (Llm.turn_to_json turn));
+        output_char oc '\n')
+      turns;
+    flush oc;
+    t.oc <- oc
+  with e ->
+    close_out_noerr oc;
+    (try t.oc <- open_out_gen [ Open_append; Open_creat ] 0o644 t.path with _ -> ());
+    raise e
 
 let set_name t name turns =
   t.name <- name;

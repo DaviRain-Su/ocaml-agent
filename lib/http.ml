@@ -71,36 +71,37 @@ let post_json ~url ~(headers : string list) (body : Yojson.Safe.t) : Yojson.Safe
 
 (* Stream a POST: invoke [on_line] for each line curl emits (server-sent events),
    as it arrives. We deliberately omit --fail so that HTTP error bodies are still
-   delivered to [on_line] for the caller to detect. *)
+   delivered to [on_line] for the caller to detect.
+
+   NOTE: we do NOT retry here because callers accumulate mutable state (text
+   buffers, tool-call tables) while streaming; a retry would append duplicate
+   state. Retry belongs at the non-streaming post_json level or above. *)
 let post_stream ~url ~(headers : string list) ~(on_line : string -> unit) (body : Yojson.Safe.t) : unit =
-  let once () =
-    let tmp = Filename.temp_file "agent_req" ".json" in
-    Fun.protect
-      ~finally:(fun () -> (try Sys.remove tmp with Sys_error _ -> ()))
-      (fun () ->
-        let oc = open_out tmp in
-        Yojson.Safe.to_channel oc body;
-        close_out oc;
-        let header_args =
-          headers
-          |> List.map (fun h -> Printf.sprintf "-H %s" (Filename.quote h))
-          |> String.concat " "
-        in
-        let cmd =
-          Printf.sprintf "curl -sS -N --no-buffer %s %s --data-binary @%s"
-            (Filename.quote url) header_args (Filename.quote tmp)
-        in
-        let ic = Unix.open_process_in cmd in
-        (try
-           while true do
-             on_line (input_line ic)
-           done
-         with End_of_file -> ());
-        let status = Unix.close_process_in ic in
-        match status with
-        | Unix.WEXITED 0 -> ()
-        | Unix.WEXITED c -> raise (Http_error (Printf.sprintf "curl exited %d" c))
-        | Unix.WSIGNALED s | Unix.WSTOPPED s ->
-          raise (Http_error (Printf.sprintf "curl killed by signal %d" s)))
-  in
-  with_retry ~retries:3 ~delay:0.5 once
+  let tmp = Filename.temp_file "agent_req" ".json" in
+  Fun.protect
+    ~finally:(fun () -> (try Sys.remove tmp with Sys_error _ -> ()))
+    (fun () ->
+      let oc = open_out tmp in
+      Yojson.Safe.to_channel oc body;
+      close_out oc;
+      let header_args =
+        headers
+        |> List.map (fun h -> Printf.sprintf "-H %s" (Filename.quote h))
+        |> String.concat " "
+      in
+      let cmd =
+        Printf.sprintf "curl -sS -N --no-buffer %s %s --data-binary @%s"
+          (Filename.quote url) header_args (Filename.quote tmp)
+      in
+      let ic = Unix.open_process_in cmd in
+      (try
+         while true do
+           on_line (input_line ic)
+         done
+       with End_of_file -> ());
+      let status = Unix.close_process_in ic in
+      match status with
+      | Unix.WEXITED 0 -> ()
+      | Unix.WEXITED c -> raise (Http_error (Printf.sprintf "curl exited %d" c))
+      | Unix.WSIGNALED s | Unix.WSTOPPED s ->
+        raise (Http_error (Printf.sprintf "curl killed by signal %d" s)))

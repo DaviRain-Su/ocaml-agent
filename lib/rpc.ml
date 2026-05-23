@@ -24,6 +24,8 @@ let make_frontend () : Agent.frontend =
     tool_call = (fun name prev -> event "tool_call" [ ("name", `String name); ("input", `String prev) ]);
     tool_result = (fun res -> event "tool_result" [ ("content", `String res) ]);
     notice = (fun s -> event "notice" [ ("text", `String s) ]);
+    message_end = (fun _ _ _ _ -> ());
+    tool_result_end = (fun _ -> ());
     confirm_bash =
       (fun cmd ->
         event "bash_denied" [ ("command", `String cmd) ];

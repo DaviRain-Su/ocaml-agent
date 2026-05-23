@@ -17,10 +17,29 @@ let base_prompt =
    - Run builds/tests with run_bash to verify your work when relevant.\n\
    - When the task is done, give a short summary of what you changed. Be concise."
 
+let read_text_file path =
+  let ic = open_in_bin path in
+  Fun.protect
+    ~finally:(fun () -> close_in_noerr ic)
+    (fun () -> really_input_string ic (in_channel_length ic))
+
+let resolve_prompt_input input =
+  if Sys.file_exists input && not (Sys.is_directory input) then
+    try read_text_file input with _ -> input
+  else input
+
+let join_prompt_inputs inputs =
+  inputs |> List.map resolve_prompt_input |> String.concat "\n\n"
+
 (* Read context files from the cwd and fold them, plus cwd/date, into the prompt. *)
 let build_system_prompt cfg =
   let buf = Buffer.create 1024 in
-  Buffer.add_string buf base_prompt;
+  let base =
+    match Sys.getenv_opt "AGENT_SYSTEM_PROMPT" with
+    | Some s when String.trim s <> "" -> resolve_prompt_input s
+    | _ -> base_prompt
+  in
+  Buffer.add_string buf base;
   let provider = match cfg.Llm.provider with Llm.Anthropic -> "Anthropic" | Llm.Openai -> "OpenAI-compatible" in
   Buffer.add_string buf
     (Printf.sprintf
@@ -58,6 +77,9 @@ let build_system_prompt cfg =
   Buffer.add_string buf
     (Printf.sprintf "\n\nCurrent date: %04d-%02d-%02d\nCurrent working directory: %s"
        (tm.Unix.tm_year + 1900) (tm.Unix.tm_mon + 1) tm.Unix.tm_mday (Sys.getcwd ()));
+  (match Sys.getenv_opt "AGENT_APPEND_SYSTEM_PROMPT" with
+   | Some s when String.trim s <> "" -> Buffer.add_string buf ("\n\n" ^ resolve_prompt_input s)
+   | _ -> ());
   Buffer.contents buf
 
 let truthy s =
@@ -92,6 +114,8 @@ type frontend =
     tool_call : string -> string -> unit; (* tool name, input preview *)
     tool_result : string -> unit; (* tool result text *)
     notice : string -> unit; (* status line, e.g. compaction *)
+    message_end : Llm.turn -> Llm.usage -> Llm.config -> string -> unit;
+    tool_result_end : Llm.turn -> unit;
     confirm_bash : string -> approval (* approve a command-capable tool *) }
 
 let stdout_frontend () : frontend =
@@ -103,6 +127,8 @@ let stdout_frontend () : frontend =
     tool_call = (fun name prev -> Printf.printf "%s %s %s\n%!" (cyan "\xe2\x9a\x99") (green name) (dim prev));
     tool_result = (fun res -> if String.trim res <> "" then Printf.printf "%s\n%!" (Render.tool_result res));
     notice = (fun s -> Printf.printf "%s\n%!" (dim s));
+    message_end = (fun _ _ _ _ -> ());
+    tool_result_end = (fun _ -> ());
     confirm_bash =
       (fun command ->
         if not (Unix.isatty Unix.stdin) then begin
@@ -130,6 +156,8 @@ let null_frontend () : frontend =
     tool_call = (fun _ _ -> ());
     tool_result = (fun _ -> ());
     notice = (fun _ -> ());
+    message_end = (fun _ _ _ _ -> ());
+    tool_result_end = (fun _ -> ());
     confirm_bash = (fun _ -> Deny) }
 
 type t =
@@ -139,6 +167,7 @@ type t =
     mutable session : Session.t option;
     mutable auto_approve : bool;
     tools_enabled : bool;
+    allowed_tools : string list option;
     context_window : int;
     compact_threshold : float; (* fraction of the window that triggers compaction *)
     mutable auto_compact : bool;
@@ -150,7 +179,7 @@ type t =
 
 let max_depth = 2
 
-let create ?session ?(initial_turns = []) ?(tools_enabled = true) ?(depth = 0) ?frontend cfg =
+let create ?session ?(initial_turns = []) ?(tools_enabled = true) ?allowed_tools ?(depth = 0) ?frontend cfg =
   (* Default to auto-approving tools (like pi). Set AGENT_AUTO_APPROVE=0 to be
      prompted before run_bash and subprocess extension tools. *)
   let auto_approve =
@@ -165,6 +194,7 @@ let create ?session ?(initial_turns = []) ?(tools_enabled = true) ?(depth = 0) ?
     session;
     auto_approve;
     tools_enabled;
+    allowed_tools = Option.map Tools.canonical_names allowed_tools;
     context_window =
       (match Sys.getenv_opt "AGENT_CONTEXT_WINDOW" with
        | Some s -> ( try int_of_string s with _ -> 128000)
@@ -215,6 +245,11 @@ let set_auto_approve t b = t.auto_approve <- b
 let auto_compact t = t.auto_compact
 let set_auto_compact t b = t.auto_compact <- b
 
+let tool_allowed t name =
+  match t.allowed_tools with
+  | None -> true
+  | Some names -> List.mem (Tools.canonical_name name) names
+
 (* Append a turn to history and persist it if a session is open. *)
 let add t turn =
   t.turns <- t.turns @ [ turn ];
@@ -228,7 +263,7 @@ let approval_text name input =
 (* Command-capable tools are gated. Returns true if the call may proceed. *)
 let approve t name input =
   let requires_approval =
-    match Tools.find name with Some tool -> tool.Tools.requires_approval | None -> false
+    match Tools.find (Tools.canonical_name name) with Some tool -> tool.Tools.requires_approval | None -> false
   in
   if not requires_approval then true
   else if t.auto_approve then true
@@ -285,6 +320,7 @@ let compact t =
   let n = List.length t.turns in
   if n <= keep_recent + 1 then "Nothing to compact."
   else begin
+    let old_turns = t.turns in
     let rec split i acc = function
       | x :: xs when i > 0 -> split (i - 1) (x :: acc) xs
       | rest -> (List.rev acc, rest)
@@ -302,14 +338,18 @@ let compact t =
        facts learned, and any open tasks. Output only the summary."
     in
     let prompt = [ { Llm.role = User; content = [ Llm.Text ("Summarize this conversation:\n\n" ^ transcript) ] } ] in
-    let blocks, _ = Llm.complete t.cfg ~system:sys ~tools_enabled:false prompt in
-    let summary = String.concat "\n" (List.filter_map (function Llm.Text s -> Some s | _ -> None) blocks) in
-    let summary_turn = { Llm.role = User; content = [ Llm.Text ("[Earlier conversation summary]\n" ^ summary) ] } in
-    t.turns <- summary_turn :: recent;
-    t.last_input_tokens <- 0;
-    (* force re-estimate next turn *)
-    Option.iter (fun s -> Session.save_all s t.turns) t.session;
-    Printf.sprintf "Compacted %d older turns into a summary." (List.length older)
+    try
+      let blocks, _ = Llm.complete t.cfg ~system:sys ~tools_enabled:false prompt in
+      let summary = String.concat "\n" (List.filter_map (function Llm.Text s -> Some s | _ -> None) blocks) in
+      let summary_turn = { Llm.role = User; content = [ Llm.Text ("[Earlier conversation summary]\n" ^ summary) ] } in
+      t.turns <- summary_turn :: recent;
+      t.last_input_tokens <- 0;
+      (* force re-estimate next turn *)
+      Option.iter (fun s -> Session.save_all s t.turns) t.session;
+      Printf.sprintf "Compacted %d older turns into a summary." (List.length older)
+    with e ->
+      t.turns <- old_turns;
+      "Compaction failed: " ^ Printexc.to_string e
   end
 
 let should_compact t =
@@ -336,10 +376,11 @@ let rec run_sub_agent t input =
 and run_tool t id name input : Llm.content =
   t.fe.tool_call name (preview_input input);
   let result =
-    if name = "task" then run_sub_agent t input
+    if not (tool_allowed t name) then Printf.sprintf "Error: tool %s is not enabled" name
+    else if Tools.canonical_name name = "task" then run_sub_agent t input
     else if not (approve t name input) then "Error: command not approved by user"
     else
-      match Tools.find name with
+      match Tools.find (Tools.canonical_name name) with
       | Some tool -> ( try tool.execute input with
       | Sys.Break as e -> raise e
       | e -> "Error: " ^ Printexc.to_string e)
@@ -361,12 +402,15 @@ and step t : string =
       streamed := true;
       t.fe.text_delta s
     in
-    let blocks, usage = Llm.complete t.cfg ~system:t.system ~on_text ~tools_enabled:t.tools_enabled t.turns in
+    let blocks, usage =
+      Llm.complete t.cfg ~system:t.system ~on_text ~tools_enabled:t.tools_enabled ?tool_names:t.allowed_tools t.turns
+    in
     if usage.Llm.input_tokens > 0 then t.last_input_tokens <- usage.Llm.input_tokens;
     if usage.Llm.output_tokens > 0 then t.last_output_tokens <- usage.Llm.output_tokens;
     if !streamed then t.fe.text_done ();
     List.iter (function Llm.Thinking { text; _ } -> t.fe.thinking text | _ -> ()) blocks;
-    add t { Llm.role = Assistant; content = blocks };
+    let assistant_turn = { Llm.role = Assistant; content = blocks } in
+    add t assistant_turn;
     let texts = List.filter_map (function Llm.Text s -> Some s | _ -> None) blocks in
     let tool_results =
       List.filter_map
@@ -375,8 +419,11 @@ and step t : string =
           | _ -> None)
         blocks
     in
+    t.fe.message_end assistant_turn usage t.cfg (if tool_results <> [] then "tool_use" else "end");
     if tool_results <> [] then begin
-      add t { Llm.role = User; content = tool_results };
+      let result_turn = { Llm.role = User; content = tool_results } in
+      add t result_turn;
+      t.fe.tool_result_end result_turn;
       loop (rounds + 1)
     end
     else String.concat "\n" texts
@@ -388,5 +435,5 @@ and send t (user_input : string) : string =
     t.fe.notice "Auto-compacting context...";
     ignore (compact t)
   end;
-  add t { Llm.role = User; content = [ Llm.Text user_input ] };
+  add t { Llm.role = User; content = [ Llm.Text (Mentions.expand user_input) ] };
   step t

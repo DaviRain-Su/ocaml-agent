@@ -8,6 +8,9 @@ type t = { name : string; description : string; location : string }
 (* Directories searched for "*.md" skills, relative to the cwd. *)
 let skill_dirs = [ ".ocaml-agent/skills"; ".claude/skills" ]
 
+(* Also check for Veldt scaffold in the project root *)
+let veldt_scaffold_marker = "scaffold/veldt"
+
 let read_file path =
   let ic = open_in_bin path in
   Fun.protect ~finally:(fun () -> close_in_noerr ic) (fun () -> really_input_string ic (in_channel_length ic))

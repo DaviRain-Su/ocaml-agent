@@ -31,7 +31,10 @@ let write_file_contents path content =
     ~finally:(fun () -> close_out_noerr oc)
     (fun () -> output_string oc content)
 
-let str_field obj key = obj |> member key |> to_string
+let str_field obj key =
+  match obj |> member key with
+  | `String s -> s
+  | _ -> failwith ("field " ^ key ^ " must be a string")
 
 let opt_str_field obj key =
   match obj |> member key with `String s -> Some s | _ -> None
@@ -478,6 +481,92 @@ let find =
         if !count = 0 then "No files found."
         else Buffer.contents out ^ if !truncated then Printf.sprintf "\n(truncated at %d files)" find_limit else "") }
 
+(* --- veldt_init: initialize a Veldt scaffold project --- *)
+
+let veldt_scaffold_dir =
+  let exe_dir = Filename.dirname Sys.executable_name in
+  (* Try to find the scaffold relative to the executable, then relative to cwd *)
+  let candidates =
+    [ Filename.concat exe_dir "../scaffold/veldt";
+      Filename.concat exe_dir "../../scaffold/veldt";
+      Filename.concat exe_dir "../../../scaffold/veldt";
+      "scaffold/veldt";
+      Filename.concat (Sys.getcwd ()) "scaffold/veldt" ]
+  in
+  match List.find_opt Sys.file_exists candidates with
+  | Some d -> if Filename.is_relative d then Filename.concat (Sys.getcwd ()) d else d
+  | None -> ""
+
+let copy_dir src dst =
+  let rec go rel =
+    let src_full = if rel = "" then src else Filename.concat src rel in
+    let dst_full = if rel = "" then dst else Filename.concat dst rel in
+    match Sys.is_directory src_full with
+    | true ->
+      if not (Sys.file_exists dst_full) then
+        ignore (Sys.command (Printf.sprintf "mkdir -p %s" (Filename.quote dst_full)));
+      let entries = try Sys.readdir src_full with Sys_error _ -> [||] in
+      Array.iter (fun e -> go (if rel = "" then e else Filename.concat rel e)) entries
+    | false ->
+      let content = read_file_contents src_full in
+      write_file_contents dst_full content
+    | exception Sys_error _ -> ()
+  in
+  if Sys.file_exists src then go ""
+
+let veldt_init =
+  { name = "veldt_init";
+    description =
+      "Initialize a Veldt scaffold project for building programming language \
+       interpreters, compilers, or DSLs in OCaml. Copies the Veldt scaffold \
+       (lexer, parser, value system, environment, etc.) to the target directory. \
+       You then write bin/main.ml to implement the interpreter core.";
+    parameters =
+      params
+        ~props:
+          [ ("path", strprop "Directory to create the project in. Created if it doesn't exist.");
+            ( "lang",
+              strprop "Target language hint (e.g. lua, jq, php, typst). Used to customize the main.ml stub." ) ]
+        ~required:[ "path" ];
+    requires_approval = false;
+    execute =
+      (fun input ->
+        let path = str_field input "path" in
+        let lang_hint = match opt_str_field input "lang" with Some l -> l | None -> "interp" in
+        if veldt_scaffold_dir = "" then
+          "Error: Veldt scaffold not found. Expected at scaffold/veldt/ relative to the executable."
+        else
+          try
+            copy_dir veldt_scaffold_dir path;
+            (* Customize the main.ml stub based on language hint *)
+            let main_ml = Filename.concat path "bin/main.ml" in
+            let stub =
+              Printf.sprintf
+                "(* main.ml — %s interpreter/compiler stub\n\n\
+                 Replace this with your implementation. Use `open Lang` to access:\n\
+                 - Lexer: configurable tokenizer\n\
+                 - Pratt: table-driven parser\n\
+                 - Value: runtime type system\n\
+                 - Env: scoped variable environments\n\
+                 - Interp: error handling infrastructure\n\
+                 *)\n\n\
+                 open Lang\n\n\
+                 let () =\n\
+                 \040\040Printf.eprintf \"Not yet implemented: %s interpreter\\n\";\n\
+                 \040\040exit 1\n"
+                lang_hint lang_hint
+            in
+            write_file_contents main_ml stub;
+            Printf.sprintf "Initialized Veldt project at %s for %s\n\
+                             Scaffold: %d files copied from %s\n\
+                             Write your implementation in: %s/bin/main.ml\n\
+                             Build: cd %s && eval $(opam env) && dune build"
+              path lang_hint
+              (Array.length (Sys.readdir (Filename.concat path "lib")))
+              veldt_scaffold_dir
+              path path
+          with Sys_error e -> "Error: " ^ e) }
+
 (* --- task: spawn a sub-agent (executed by the agent loop, not here) --- *)
 
 let task =
@@ -495,9 +584,25 @@ let task =
 
 (* --- registry (extensible at startup) --- *)
 
-let builtin = [ read_file; write_file; edit_file; list_dir; grep; find; run_bash; task ]
+let builtin = [ read_file; write_file; edit_file; list_dir; grep; find; run_bash; veldt_init; task ]
 let builtin_names = List.map (fun t -> t.name) builtin
 let is_builtin_name name = List.mem name builtin_names
+
+let canonical_name name =
+  match String.lowercase_ascii (String.trim name) with
+  | "read" -> "read_file"
+  | "write" -> "write_file"
+  | "edit" -> "edit_file"
+  | "ls" -> "list_dir"
+  | "bash" -> "run_bash"
+  | "subagent" -> "task"
+  | other -> other
+
+let canonical_names names =
+  names
+  |> List.map canonical_name
+  |> List.filter (fun s -> s <> "")
+  |> List.sort_uniq String.compare
 
 let registry = ref builtin
 
@@ -509,7 +614,12 @@ let register (t : tool) =
     true
   end
 
-let all () = !registry
+let all ?allowed () =
+  match allowed with
+  | None -> !registry
+  | Some names ->
+    let names = canonical_names names in
+    List.filter (fun t -> List.mem t.name names) !registry
 
 (* Anthropic tool schema: {name, description, input_schema}. *)
 let anthropic_schema t =
@@ -528,7 +638,7 @@ let openai_schema t =
             ("description", `String t.description);
             ("parameters", t.parameters) ] ) ]
 
-let anthropic_schemas () = List.map anthropic_schema !registry
-let openai_schemas () = List.map openai_schema !registry
+let anthropic_schemas ?allowed () = List.map anthropic_schema (all ?allowed ())
+let openai_schemas ?allowed () = List.map openai_schema (all ?allowed ())
 
 let find name = List.find_opt (fun t -> t.name = name) !registry

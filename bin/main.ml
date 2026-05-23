@@ -129,6 +129,11 @@ type opts =
     mutable mode : string; (* text | json | rpc *)
     mutable list_models : string option;
     mutable export : string option;
+    mutable no_session : bool;
+    mutable tools : string list option;
+    mutable system_prompt : string option;
+    mutable append_system_prompt : string list;
+    mutable file_args : string list;
     mutable prompt : string list }
 
 let usage =
@@ -137,8 +142,12 @@ let usage =
   \  -m, --model <name>       model to use\n\
   \      --provider <alias>   provider (anthropic, deepseek, kimi, zai, ...)\n\
   \      --thinking <level>   reasoning level (off/low/medium/high)\n\
+  \      --system-prompt <s>  replace the base system prompt (or read file path)\n\
+  \      --append-system-prompt <s>  append text or file contents (repeatable)\n\
   \  -c, --continue           resume the last session (.ocaml-agent/session.jsonl)\n\
   \  -p, --print              one-shot mode; prompt from args or stdin\n\
+  \      --no-session         do not create or resume a session\n\
+  \  -t, --tools <list>       comma-separated tool allowlist (Pi aliases accepted)\n\
   \      --no-tools           disable all tools for this run\n\
   \      --no-tui             use the plain line REPL instead of the full-screen TUI\n\
   \      --mode <text|json|rpc>  output mode; rpc = JSON-RPC over stdin/stdout\n\
@@ -150,15 +159,40 @@ let usage =
 
 (* Parse flags up to the first positional token; the rest is the prompt. *)
 let parse_args argv =
-  let o = { model = None; provider = None; thinking = None; cont = false; print = false; no_tools = false; no_tui = false; mode = "text"; list_models = None; export = None; prompt = [] } in
+  let o =
+    { model = None;
+      provider = None;
+      thinking = None;
+      cont = false;
+      print = false;
+      no_tools = false;
+      no_tui = false;
+      mode = "text";
+      list_models = None;
+      export = None;
+      no_session = false;
+      tools = None;
+      system_prompt = None;
+      append_system_prompt = [];
+      file_args = [];
+      prompt = [] }
+  in
   let rec go = function
     | [] -> ()
     | "--" :: rest -> o.prompt <- rest
     | ("-m" | "--model") :: v :: rest -> o.model <- Some v; go rest
     | "--provider" :: v :: rest -> o.provider <- Some v; go rest
     | "--thinking" :: v :: rest -> o.thinking <- Some v; go rest
+    | "--system-prompt" :: v :: rest -> o.system_prompt <- Some v; go rest
+    | "--append-system-prompt" :: v :: rest ->
+      o.append_system_prompt <- o.append_system_prompt @ [ v ];
+      go rest
     | ("-c" | "--continue") :: rest -> o.cont <- true; go rest
     | ("-p" | "--print") :: rest -> o.print <- true; go rest
+    | "--no-session" :: rest -> o.no_session <- true; go rest
+    | ("--tools" | "-t") :: v :: rest ->
+      o.tools <- Some (String.split_on_char ',' v |> List.map String.trim |> List.filter (fun s -> s <> ""));
+      go rest
     | ("--no-tools" | "-nt") :: rest -> o.no_tools <- true; go rest
     | "--no-tui" :: rest -> o.no_tui <- true; go rest
     | "--mode" :: v :: rest -> o.mode <- v; go rest
@@ -169,6 +203,9 @@ let parse_args argv =
       | p :: tl when String.length p = 0 || p.[0] <> '-' -> o.list_models <- Some p; go tl
       | _ -> o.list_models <- Some ""; go rest)
     | ("-h" | "--help") :: _ -> print_string (usage ^ "\n"); exit 0
+    | arg :: rest when String.length arg > 1 && arg.[0] = '@' ->
+      o.file_args <- o.file_args @ [ String.sub arg 1 (String.length arg - 1) ];
+      go rest
     | arg :: _ as all ->
       if String.length arg > 0 && arg.[0] = '-' then begin
         Printf.eprintf "%s unknown flag %s\n%s\n%!" (red "Error:") arg usage;
@@ -196,10 +233,86 @@ let list_models pat =
       (fun (e : Models.entry) -> Printf.printf "%-12s %-26s ctx %d\n" e.Models.provider e.Models.id e.Models.context_window)
       entries
 
+let emit_json (j : Yojson.Safe.t) =
+  print_string (Yojson.Safe.to_string j);
+  print_char '\n';
+  flush stdout
+
+let pi_content_json = function
+  | Llm.Text s -> `Assoc [ ("type", `String "text"); ("text", `String s) ]
+  | Llm.Thinking { text; signature } ->
+    `Assoc [ ("type", `String "thinking"); ("text", `String text); ("signature", `String signature) ]
+  | Llm.Tool_use { id; name; input } ->
+    `Assoc
+      [ ("type", `String "toolCall");
+        ("id", `String id);
+        ("name", `String name);
+        ("arguments", input) ]
+  | Llm.Tool_result { id; content } ->
+    `Assoc
+      [ ("type", `String "toolResult");
+        ("toolCallId", `String id);
+        ("content", `List [ `Assoc [ ("type", `String "text"); ("text", `String content) ] ]) ]
+
+let pi_message_json ?usage ?cfg ?stop_reason (turn : Llm.turn) =
+  let role = match turn.role with Llm.User -> "user" | Llm.Assistant -> "assistant" in
+  let fields =
+    [ ("role", `String role); ("content", `List (List.map pi_content_json turn.content)) ]
+  in
+  let fields =
+    match usage with
+    | None -> fields
+    | Some u ->
+      fields
+      @
+      [ ( "usage",
+          `Assoc
+            [ ("input", `Int u.Llm.input_tokens);
+              ("output", `Int u.Llm.output_tokens);
+              ("totalTokens", `Int (u.input_tokens + u.output_tokens)) ] ) ]
+  in
+  let fields = match cfg with Some c -> fields @ [ ("model", `String c.Llm.model) ] | None -> fields in
+  let fields = match stop_reason with Some s -> fields @ [ ("stopReason", `String s) ] | None -> fields in
+  `Assoc fields
+
+let json_frontend () : Agent.frontend =
+  { text_delta = (fun s -> emit_json (`Assoc [ ("type", `String "text_delta"); ("text", `String s) ]));
+    text_done = (fun () -> emit_json (`Assoc [ ("type", `String "text_done") ]));
+    thinking = (fun s -> if String.trim s <> "" then emit_json (`Assoc [ ("type", `String "thinking"); ("text", `String s) ]));
+    tool_call =
+      (fun name prev ->
+        emit_json (`Assoc [ ("type", `String "tool_call"); ("name", `String name); ("input", `String prev) ]));
+    tool_result = (fun res -> emit_json (`Assoc [ ("type", `String "tool_result"); ("content", `String res) ]));
+    notice = (fun s -> emit_json (`Assoc [ ("type", `String "notice"); ("text", `String s) ]));
+    message_end =
+      (fun turn usage cfg stop_reason ->
+        emit_json
+          (`Assoc
+            [ ("type", `String "message_end");
+              ("message", pi_message_json ~usage ~cfg ~stop_reason turn) ]));
+    tool_result_end =
+      (fun turn ->
+        emit_json (`Assoc [ ("type", `String "tool_result_end"); ("message", pi_message_json turn) ]));
+    confirm_bash =
+      (fun command ->
+        emit_json (`Assoc [ ("type", `String "bash_denied"); ("command", `String command) ]);
+        Agent.Deny) }
+
+let file_arg_text paths =
+  let missing = List.filter (fun p -> not (Sys.file_exists p) || Sys.is_directory p) paths in
+  match missing with
+  | p :: _ ->
+    Printf.eprintf "%s File not found: %s\n%!" (red "Error:") p;
+    exit 1
+  | [] -> Mentions.expand_file_args paths
+
 let () =
   Random.self_init ();
   let o = parse_args (Array.to_list Sys.argv |> List.tl) in
   Option.iter (fun t -> Unix.putenv "AGENT_THINKING" t) o.thinking;
+  Option.iter (fun s -> Unix.putenv "AGENT_SYSTEM_PROMPT" s) o.system_prompt;
+  if o.append_system_prompt <> [] then
+    Unix.putenv "AGENT_APPEND_SYSTEM_PROMPT" (Agent.join_prompt_inputs o.append_system_prompt);
   (match o.list_models with
    | Some pat -> list_models pat; exit 0
    | None -> ());
@@ -218,12 +331,13 @@ let () =
     Printf.eprintf "%s %s\n%!" (red "Config error:") msg;
     exit 1
   | cfg ->
-    let one_shot_mode = o.print || o.prompt <> [] in
+    let one_shot_mode = o.print || o.prompt <> [] || o.file_args <> [] in
     let session, initial_turns =
       match Sys.getenv_opt "AGENT_SESSION_FILE" with
-      | Some p when String.trim p <> "" -> (Some (Session.open_file p), Session.load_turns p)
+      | Some p when (not o.no_session) && String.trim p <> "" -> (Some (Session.open_file p), Session.load_turns p)
       | _ ->
-        if o.cont then
+        if o.no_session then (None, [])
+        else if o.cont then
           (* Resume the most recent session in the sessions dir. *)
           match Session.list () with
           | i :: _ -> (Some (Session.open_file i.Session.path), Session.load_turns i.Session.path)
@@ -231,29 +345,45 @@ let () =
         else if one_shot_mode then (None, []) (* one-shot is ephemeral by default *)
         else (Some (Session.create_new ()), []) (* interactive runs are persisted + resumable *)
     in
-    let agent = Agent.create ?session ~initial_turns ~tools_enabled:(not o.no_tools) cfg in
+    let allowed_tools = Option.map Tools.canonical_names o.tools in
+    let agent = Agent.create ?session ~initial_turns ~tools_enabled:(not o.no_tools) ?allowed_tools cfg in
     (* --export: dump the (resumed) session and exit. *)
     (match o.export with
      | Some path -> print_string (Commands.export agent path ^ "\n"); exit 0
      | None -> ());
-    let prompt () = if o.prompt = [] then String.trim (read_stdin_all ()) else String.concat " " o.prompt in
+    let prompt () =
+      let parts = ref [] in
+      if not (Unix.isatty Unix.stdin) then (
+        let s = read_stdin_all () in
+        if String.trim s <> "" then parts := !parts @ [ s ]);
+      let files = file_arg_text o.file_args in
+      if files <> "" then parts := !parts @ [ files ];
+      if o.prompt <> [] then parts := !parts @ [ String.concat " " o.prompt ];
+      String.trim (String.concat "\n" !parts)
+    in
     match o.mode with
-    | "rpc" -> Rpc.run agent
+    | "rpc" ->
+      if o.file_args <> [] then begin
+        Printf.eprintf "%s @file arguments are not supported in RPC mode\n%!" (red "Error:");
+        exit 1
+      end;
+      Rpc.run agent
     | "json" ->
-      Agent.set_frontend agent (Agent.null_frontend ());
+      Agent.set_frontend agent (json_frontend ());
       let p = prompt () in
-      let out =
-        if p = "" then `Assoc [ ("error", `String "no prompt") ]
-        else
-          try
-            let text = Agent.send agent p in
-            let used, window, _ = Agent.usage_info agent in
-            `Assoc
-              [ ("text", `String text);
-                ("usage", `Assoc [ ("context_used", `Int used); ("context_window", `Int window) ]) ]
-          with Llm.Api_error e -> `Assoc [ ("error", `String e) ]
-      in
-      print_string (Yojson.Safe.to_string out ^ "\n")
+      if p = "" then (emit_json (`Assoc [ ("type", `String "error"); ("message", `String "no prompt") ]); exit 1)
+      else (
+        try
+          let text = Agent.send agent p in
+          let used, window, _ = Agent.usage_info agent in
+          emit_json
+            (`Assoc
+              [ ("type", `String "turn_done");
+                ("text", `String text);
+                ("usage", `Assoc [ ("context_used", `Int used); ("context_window", `Int window) ]) ])
+        with Llm.Api_error e ->
+          emit_json (`Assoc [ ("type", `String "error"); ("message", `String e) ]);
+          exit 1)
     | _ ->
       if one_shot_mode then (let p = prompt () in if p <> "" then run_turn agent p)
       else if (not o.no_tui) && Unix.isatty Unix.stdin && Unix.isatty Unix.stdout then Tui.run agent
