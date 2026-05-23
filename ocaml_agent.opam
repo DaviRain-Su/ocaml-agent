@@ -1,0 +1,22 @@
+opam-version: "2.0"
+synopsis: "A multi-provider code agent in OCaml (Anthropic / OpenAI-compatible)"
+maintainer: "DaviRain-Su"
+authors: ["DaviRain-Su"]
+homepage: "https://github.com/DaviRain-Su/ocaml-agent"
+bug-reports: "https://github.com/DaviRain-Su/ocaml-agent/issues"
+license: "LicenseRef-Proprietary"
+description: """
+ocaml-agent is a terminal coding agent with Anthropic and OpenAI-compatible
+provider support.
+"""
+depends: [
+  "ocaml" {>= "5.2"}
+  "dune" {>= "3.16"}
+  "yojson"
+  "notty"
+]
+build: [
+  ["dune" "subst"] {dev}
+  ["dune" "build" "-p" name "-j" jobs]
+  ["dune" "exec" "test/test_tools.exe"] {with-test}
+]
