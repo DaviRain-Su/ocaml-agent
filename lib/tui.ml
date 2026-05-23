@@ -111,6 +111,28 @@ let prompt_label = "you> "
 
 let sublist start len l = l |> List.filteri (fun i _ -> i >= start && i < start + len)
 
+let cursor_row_col input cursor =
+  let row = ref 0 and col = ref 0 in
+  String.iteri
+    (fun i ch ->
+      if i < cursor then
+        if ch = '\n' then (
+          incr row;
+          col := 0)
+        else if not (is_cont ch) then incr col)
+    input;
+  (!row, !col)
+
+let input_window ~height ~menu_rows ~cursor_row ~total_rows =
+  let capacity = max 1 (height - 3 - menu_rows) in
+  let rows = min total_rows capacity in
+  let max_start = max 0 (total_rows - rows) in
+  let start =
+    if cursor_row < rows then 0
+    else min max_start (cursor_row - rows + 1)
+  in
+  (start, rows)
+
 let redraw ui =
   Mutex.lock ui.mtx;
   Fun.protect
@@ -126,15 +148,30 @@ let redraw ui =
       if ui.menu_sel < 0 then ui.menu_sel <- 0;
       let in_lines = String.split_on_char '\n' ui.input in
       let in_rows = List.length in_lines in
-      let visible = max 1 (h - 2 - menu_rows - in_rows) in
+      let cursor_row, cursor_col = cursor_row_col ui.input ui.cursor in
+      let input_start, input_rows = input_window ~height:h ~menu_rows ~cursor_row ~total_rows:in_rows in
+      let visible = max 1 (h - 2 - menu_rows - input_rows) in
       let all = List.concat_map (wrap_segs w) ui.lines in
       let total = List.length all in
+      (* maxscroll: how many lines we can scroll up from the bottom.
+         Ensure it's at least 0, and allow scrolling even when total == visible
+         (in which case we still want to see earlier content if it exists). *)
       let maxscroll = max 0 (total - visible) in
+      (* Only clamp scroll if it genuinely exceeds the content; preserve user
+         intent when they have explicitly scrolled. *)
       if ui.scroll > maxscroll then ui.scroll <- maxscroll;
       let start = max 0 (total - visible - ui.scroll) in
       let window = sublist start visible all in
       let line_img segs = match segs with [] -> I.void 1 1 | _ -> I.hcat (List.map (fun (a, s) -> I.string a s) segs) in
-      let body = I.vsnap ~align:`Bottom visible (I.vcat (List.map line_img window)) in
+      (* When scrolling, align from the top so the oldest visible line is at
+         the top of the viewport. When not scrolling, align from the bottom
+         so the newest content appears just above the input area. *)
+      let body =
+        if ui.scroll > 0 then
+          I.vcat (List.map line_img window)
+        else
+          I.vsnap ~align:`Bottom visible (I.vcat (List.map line_img window))
+      in
       let menu_img =
         if menu_rows = 0 then I.void 0 0
         else
@@ -159,19 +196,18 @@ let redraw ui =
         I.vcat
           (List.mapi
              (fun i l ->
-               let pfx = if i = 0 then I.string A.(fg green) prompt_label else I.string A.empty indent in
+               let absolute = input_start + i in
+               let pfx = if absolute = 0 then I.string A.(fg green) prompt_label else I.string A.empty indent in
                I.(pfx <|> string A.empty (safe_line l)))
-             in_lines)
+             (sublist input_start input_rows in_lines))
       in
       Term.image ui.term I.(body <-> status <-> menu_img <-> sep <-> prompt);
-      (* cursor row/col within the (possibly multi-line) input *)
-      let crow = ref 0 and ccol = ref 0 in
-      String.iteri
-        (fun i ch ->
-          if i < ui.cursor then if ch = '\n' then (incr crow; ccol := 0) else if not (is_cont ch) then incr ccol)
-        ui.input;
-      Term.cursor ui.term (Some (String.length prompt_label + !ccol, h - in_rows + !crow))
-      with _ -> ())
+      let cursor_y = h - input_rows + (cursor_row - input_start) in
+      let cursor_x = min (w - 1) (String.length prompt_label + cursor_col) in
+      Term.cursor ui.term (Some (cursor_x, cursor_y))
+      with exn ->
+        (* Don't silently swallow rendering errors; at least log them. *)
+        Printf.eprintf "[tui redraw error] %s\n%!" (Printexc.to_string exn))
 
 (* Styled segments for one streamed assistant line, tracking code-fence state. *)
 let asst_segs ui line =
@@ -235,7 +271,7 @@ let make_frontend ui : Agent.frontend =
     notice = (fun s -> push ui A.(fg yellow) s; redraw ui);
     confirm_bash =
       (fun cmd ->
-        push ui A.(fg yellow) ("\xe2\x9a\xa0 run bash: " ^ cmd);
+        push ui A.(fg yellow) ("\xe2\x9a\xa0 run command: " ^ cmd);
         push ui A.(fg (gray 12)) "approve? [y]es / [N]o / [a]lways";
         redraw ui;
         confirm ui cmd) }
@@ -305,7 +341,7 @@ let model_picker ui =
 let rec settings ui =
   let a = ui.agent in
   let items =
-    [ Printf.sprintf "auto-approve bash : %b" (Agent.auto_approve a);
+    [ Printf.sprintf "auto-approve cmd  : %b" (Agent.auto_approve a);
       Printf.sprintf "auto-compact      : %b" (Agent.auto_compact a);
       Printf.sprintf "thinking level    : %s" (Agent.config a).Llm.thinking;
       "close" ]
@@ -437,7 +473,9 @@ let recall ui dir =
 
 let page ui delta =
   let _, h = Term.size ui.term in
-  let step = max 1 (h - 4) in
+  (* Scroll by a fraction of the screen, not nearly the full height,
+     so users can scroll smoothly even with moderate content. *)
+  let step = max 1 (h / 2) in
   ui.scroll <- max 0 (ui.scroll + (delta * step));
   redraw ui
 
@@ -466,9 +504,13 @@ let kill_word ui =
   ui.cursor <- !i
 
 let run agent =
-  (* Mouse capture is off by default so the terminal's own text selection/copy
-     keeps working; set AGENT_TUI_MOUSE=1 to re-enable wheel scrolling. *)
-  let mouse = match Sys.getenv_opt "AGENT_TUI_MOUSE" with Some ("1" | "true" | "yes") -> true | _ -> false in
+  (* Mouse wheel scrolling is enabled by default for a better UX.
+     Set AGENT_TUI_MOUSE=0 to disable if it interferes with terminal
+     selection/copy. *)
+  let mouse = match Sys.getenv_opt "AGENT_TUI_MOUSE" with
+    | Some ("0" | "false" | "no") -> false
+    | _ -> true
+  in
   let term = Term.create ~mouse () in
   let ui =
     { term; lines = []; input = ""; cursor = 0; history = []; hist_idx = -1; buf = Buffer.create 256;
@@ -479,7 +521,8 @@ let run agent =
   push ui A.(fg green ++ st bold) "OCaml Code Agent";
   push ui A.(fg (gray 12)) (Llm.describe (Agent.config agent));
   push ui A.(fg (gray 12)) "Type your request. /help for commands, Ctrl-P model picker, Ctrl-D to quit.";
-  push ui A.(fg (gray 12)) "Select text with the mouse to copy; PgUp/PgDn to scroll.";
+  push ui A.(fg (gray 12)) "PgUp/PgDn or mouse wheel to scroll; End to jump to latest.";
+  push ui A.(fg (gray 12)) "Set AGENT_TUI_MOUSE=0 if mouse wheel interferes with text selection.";
   push ui A.empty "";
   let km = Keymap.load () in
   redraw ui;

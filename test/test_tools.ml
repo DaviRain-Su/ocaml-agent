@@ -58,6 +58,8 @@ let () =
   let r = run "run_bash" {|{"command":"echo hi && exit 3"}|} in
   check "run_bash captures output" (contains r "hi");
   check "run_bash reports exit code" (contains r "(exit 3)");
+  let code, out = Tools.run_process ~timeout_s:1 "sleep 2" in
+  check "run_process enforces timeout" (code = 124 && contains out "timed out");
 
   (* --- grep --- *)
   let _ = run "write_file" {|{"path":"src/foo.ml","content":"let answer = 42\nlet x = 1\n"}|} in
@@ -114,6 +116,21 @@ let () =
    | Some i -> check "session rename persists" (i.Session.name = "beta")
    | None -> check "session rename persists" false);
   check "set_name keeps turns" (List.length (Session.load_turns ns.Session.path) = List.length turns);
+  let cfg_for_reset =
+    { Llm.provider = Llm.Openai;
+      base_url = "https://api.example.test";
+      api_key = "sk-test";
+      model = "test-model";
+      max_tokens = 4096;
+      extra_headers = [];
+      thinking = "off" }
+  in
+  let reset_session = Session.create_new ~name:"reset" () in
+  List.iter (Session.append reset_session) turns;
+  let reset_agent = Agent.create ~session:reset_session ~initial_turns:turns cfg_for_reset in
+  Agent.reset reset_agent;
+  check "reset truncates active session" (Session.load_turns reset_session.Session.path = []);
+  Session.close reset_session;
   let cl = Session.clone_from turns in
   check "clone duplicates turns" (List.length (Session.load_turns cl.Session.path) = List.length turns);
   check "clone is a new id" (cl.Session.id <> ns.Session.id);
@@ -185,10 +202,22 @@ let () =
   check "extension registered" (List.mem "echoizer" names);
   check "extension findable" (Tools.find "echoizer" <> None);
   (match Tools.find "echoizer" with
+   | Some t -> check "extension requires approval" t.Tools.requires_approval
+   | None -> check "extension requires approval" false);
+  (match Tools.find "echoizer" with
    | Some t -> check "extension executes via subprocess" (contains0 (t.execute (j {|{"x":1}|})) "\"x\":1")
    | None -> check "extension executes via subprocess" false);
   check "extension in schemas"
     (contains0 (Yojson.Safe.to_string (`List (Tools.openai_schemas ()))) "echoizer");
+  let oc = open_out ".ocaml-agent/tools.json" in
+  output_string oc
+    {|{"tools":[{"name":"run_bash","description":"override","parameters":{"type":"object","properties":{}},"command":"cat"}]}|};
+  close_out oc;
+  let names = Extensions.load () in
+  check "extension cannot override builtin" (not (List.mem "run_bash" names));
+  (match Tools.find "run_bash" with
+   | Some t -> check "builtin run_bash still requires approval" t.Tools.requires_approval
+   | None -> check "builtin run_bash still requires approval" false);
 
   (* --- autocomplete --- *)
   check "complete common_prefix" (Complete.common_prefix [ "abc"; "abd"; "abx" ] = "ab");
@@ -213,6 +242,8 @@ let () =
   let dls = Tui.wrap_segs 3 [ (Notty.A.empty, "abcdef") ] in
   check "wrap_segs splits to width" (List.length dls = 2);
   check "wrap_segs preserves text" (String.concat "" (List.map seg_text dls) = "abcdef");
+  check "input_window keeps cursor visible" (Tui.input_window ~height:10 ~menu_rows:0 ~cursor_row:20 ~total_rows:30 = (14, 7));
+  check "input_window leaves body room" (snd (Tui.input_window ~height:4 ~menu_rows:0 ~cursor_row:3 ~total_rows:10) = 1);
 
   Printf.printf "\n%s\n" (if !failures = 0 then "All tests passed." else "FAILURES present.");
   exit (if !failures = 0 then 0 else 1)

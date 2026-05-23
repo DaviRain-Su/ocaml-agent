@@ -48,8 +48,9 @@ test/test_tools.ml Offline tests (tools, sessions, render, skills, models, exten
   older turns are summarized automatically as the context window fills.
 - **Project-context injection** — `AGENTS.md` / `CLAUDE.md` in the cwd, plus the
   working directory, date, and the live provider/model identity, folded into the system prompt.
-- **run_bash approval gate** — shell commands prompt for `[y]es / [N]o / [a]lways`
-  before running (skip with `AGENT_AUTO_APPROVE=1`; denied automatically when there's no TTY).
+- **Tool approval** — `run_bash` and subprocess extension tools prompt for
+  `[y]es / [N]o / [a]lways` before running (skip with `AGENT_AUTO_APPROVE=1`;
+  denied automatically when there's no TTY).
 - **Session persistence** — set `AGENT_SESSION_FILE` (or use `-c`) to append each
   turn as JSONL and resume the conversation on the next run.
 - **Sub-agents** — the `task` tool delegates a self-contained sub-task to a fresh
@@ -59,7 +60,8 @@ test/test_tools.ml Offline tests (tools, sessions, render, skills, models, exten
   a skill's file on demand (prompt-injection model, no separate runtime).
 - **Extensions** — declare custom tools in `.ocaml-agent/tools.json` (or
   `AGENT_TOOLS_FILE`); each runs an external command receiving the tool input as
-  JSON on stdin and returning its output. Registered alongside the built-in tools.
+  JSON on stdin and returning its output. Extension tools cannot replace built-ins
+  and require the same approval path as shell commands.
 - **Interactive commands**: `/model`, `/think`, `/compact`, `/session`, `/sessions`,
   `/resume`, `/name`, `/clone`, `/export`, `/copy`, `/new`, `/help`.
 - **Embeddable**: `--mode rpc` exposes a JSON-RPC (JSONL) interface over stdin/stdout;
@@ -134,6 +136,7 @@ Overrides (all optional):
 | `AGENT_BASE_URL`     | API base URL override (for custom / compatible endpoints)    |
 | `AGENT_MAX_TOKENS`   | Max output tokens (default `4096`)                           |
 | `AGENT_AUTO_APPROVE` | Skip the run_bash approval prompt when truthy                |
+| `AGENT_MAX_TOOL_ROUNDS` | Max tool-use rounds per turn before stopping (default `20`) |
 | `AGENT_SESSION_FILE` | JSONL file to persist to / resume from                       |
 | `AGENT_THINKING`     | Reasoning level: `off` (default), `low`, `medium`, `high`    |
 | `AGENT_CONTEXT_WINDOW` | Context window in tokens for compaction (default `128000`) |
@@ -183,6 +186,8 @@ dune exec test/test_tools.exe   # offline tool tests
 ## Safety note
 
 `run_bash` executes arbitrary shell commands the model chooses, with your
-permissions and no sandbox. By default each command must be approved
-interactively; `AGENT_AUTO_APPROVE=1` removes that gate, so only use it in a
-directory you trust.
+permissions and no sandbox. **Tools auto-run by default** (matching pi), so only
+use the agent in a directory you trust. Set `AGENT_AUTO_APPROVE=0` (or toggle in
+`/settings`) to require interactive `[y]es / [N]o / [a]lways` approval before
+`run_bash` and subprocess extension tools (those declared in
+`.ocaml-agent/tools.json`).
