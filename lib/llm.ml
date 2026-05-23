@@ -90,10 +90,45 @@ let find_known name =
 
 let all_env_keys = List.concat_map (fun k -> k.env_keys) registry
 
+let read_max_tokens () =
+  match getenv "AGENT_MAX_TOKENS" with Some s -> ( try int_of_string s with _ -> 4096) | None -> 4096
+
+(* Canonical provider names paired with whether their key env var is set. *)
+let provider_status () =
+  List.map (fun k -> (List.hd k.names, first_env k.env_keys <> None)) registry
+
+(* Build a config for an explicitly named provider (used by /model switching).
+   Uses the registry's own base URL / default model, reads the key from the
+   provider's env vars (or AGENT_API_KEY), and lets [model] override the model. *)
+let config_for ?model alias : config =
+  match find_known alias with
+  | None ->
+    raise
+      (Config_error
+         (Printf.sprintf "unknown provider %S; known: %s" alias
+            (String.concat ", " (List.map (fun (n, _) -> n) (provider_status ())))))
+  | Some k ->
+    let api_key =
+      match first_env k.env_keys with
+      | Some x -> x
+      | None -> (
+        match getenv "AGENT_API_KEY" with
+        | Some x -> x
+        | None ->
+          raise
+            (Config_error
+               (Printf.sprintf "no API key for %s; set %s" alias (String.concat " or " k.env_keys))))
+    in
+    let model = match model with Some m -> m | None -> k.default_model in
+    { provider = k.protocol;
+      base_url = k.base_url;
+      api_key;
+      model;
+      max_tokens = read_max_tokens ();
+      extra_headers = k.headers }
+
 let config () : config =
-  let max_tokens =
-    match getenv "AGENT_MAX_TOKENS" with Some s -> ( try int_of_string s with _ -> 4096) | None -> 4096
-  in
+  let max_tokens = read_max_tokens () in
   (* Resolve the chosen provider entry (or a generic fallback). *)
   let chosen : [ `Known of known | `Generic of provider ] =
     match getenv "AGENT_PROVIDER" with
@@ -211,14 +246,14 @@ type builder =
   | BText of Buffer.t
   | BTool of { id : string; name : string; json : Buffer.t }
 
-let anthropic_complete cfg ~system ~on_text turns : content list =
+let anthropic_complete cfg ~system ~on_text ~tools_enabled turns : content list =
   let body =
     `Assoc
       [ ("model", `String cfg.model);
         ("max_tokens", `Int cfg.max_tokens);
         ("system", `String system);
         ("stream", `Bool true);
-        ("tools", `List Tools.anthropic_schemas);
+        ("tools", `List (if tools_enabled then Tools.anthropic_schemas else []));
         ("messages", `List (anthropic_messages turns)) ]
   in
   let url = cfg.base_url ^ "/v1/messages" in
@@ -333,15 +368,17 @@ let openai_messages ~system turns =
   in
   sys_msg :: List.concat_map of_turn turns
 
-let openai_complete cfg ~system ~on_text turns : content list =
+let openai_complete cfg ~system ~on_text ~tools_enabled turns : content list =
   let body =
     `Assoc
-      [ ("model", `String cfg.model);
-        ("max_tokens", `Int cfg.max_tokens);
-        ("stream", `Bool true);
-        ("messages", `List (openai_messages ~system turns));
-        ("tools", `List Tools.openai_schemas);
-        ("tool_choice", `String "auto") ]
+      ([ ("model", `String cfg.model);
+         ("max_tokens", `Int cfg.max_tokens);
+         ("stream", `Bool true);
+         ("messages", `List (openai_messages ~system turns)) ]
+      @
+      if tools_enabled then
+        [ ("tools", `List Tools.openai_schemas); ("tool_choice", `String "auto") ]
+      else [])
   in
   let url = cfg.base_url ^ "/chat/completions" in
   let headers =
@@ -419,7 +456,7 @@ let openai_complete cfg ~system ~on_text turns : content list =
 
 (* --- dispatch --- *)
 
-let complete cfg ~system ?(on_text = fun _ -> ()) turns : content list =
+let complete cfg ~system ?(on_text = fun _ -> ()) ?(tools_enabled = true) turns : content list =
   match cfg.provider with
-  | Anthropic -> anthropic_complete cfg ~system ~on_text turns
-  | Openai -> openai_complete cfg ~system ~on_text turns
+  | Anthropic -> anthropic_complete cfg ~system ~on_text ~tools_enabled turns
+  | Openai -> openai_complete cfg ~system ~on_text ~tools_enabled turns

@@ -34,6 +34,17 @@ let () =
   let r = run "edit_file" {|{"path":"sub/a.txt","old_str":"nope","new_str":"x"}|} in
   check "edit_file missing old_str" (Str.string_match (Str.regexp "Error:") r 0);
 
+  let contains0 hay needle =
+    try ignore (Str.search_forward (Str.regexp_string needle) hay 0); true with Not_found -> false
+  in
+  let r = run "edit_file" {|{"path":"sub/a.txt","old_str":"hello","new_str":"hi"}|} in
+  check "edit_file returns diff" (contains0 r "-hello" && contains0 r "+hi");
+  let _ = run "write_file" {|{"path":"multi.txt","content":"a\nb\nc\n"}|} in
+  let r = run "edit_file" {|{"path":"multi.txt","edits":[{"old_str":"a","new_str":"A"},{"old_str":"c","new_str":"C"}]}|} in
+  check "edit_file multi reports 2 changes" (contains0 r "2 changes");
+  let r2 = run "read_file" {|{"path":"multi.txt"}|} in
+  check "edit_file multi applied both" (r2 = "A\nb\nC\n");
+
   let r = run "list_dir" {|{"path":"sub"}|} in
   check "list_dir lists file" (r = "a.txt");
 
@@ -47,6 +58,25 @@ let () =
   let r = run "run_bash" {|{"command":"echo hi && exit 3"}|} in
   check "run_bash captures output" (contains r "hi");
   check "run_bash reports exit code" (contains r "(exit 3)");
+
+  (* --- grep --- *)
+  let _ = run "write_file" {|{"path":"src/foo.ml","content":"let answer = 42\nlet x = 1\n"}|} in
+  let _ = run "write_file" {|{"path":"src/bar.txt","content":"answer here\n"}|} in
+  let r = run "grep" {|{"pattern":"answer"}|} in
+  check "grep finds in .ml" (contains r "src/foo.ml:1:");
+  check "grep finds in .txt" (contains r "src/bar.txt:1:");
+  let r = run "grep" {|{"pattern":"answer","include":"*.ml"}|} in
+  check "grep include filters" (contains r "foo.ml" && not (contains r "bar.txt"));
+  let r = run "grep" {|{"pattern":"zzz_nomatch"}|} in
+  check "grep no match" (r = "No matches.");
+
+  (* --- find --- *)
+  let r = run "find" {|{"pattern":"*.ml"}|} in
+  check "find by basename glob" (contains r "src/foo.ml" && not (contains r "bar.txt"));
+  let r = run "find" {|{"pattern":"src/**/*.txt"}|} in
+  check "find by path glob" (contains r "src/bar.txt");
+  let r = run "find" {|{"pattern":"*.nope"}|} in
+  check "find no match" (r = "No files found.");
 
   (* --- Llm turn <-> JSON round-trip --- *)
   let turns =

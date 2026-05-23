@@ -35,6 +35,61 @@ let str_field obj key = obj |> member key |> to_string
 let opt_str_field obj key =
   match obj |> member key with `String s -> Some s | _ -> None
 
+(* Directories never descended into during recursive search. *)
+let skip_dirs = [ ".git"; "_build"; "node_modules"; ".hg"; ".svn"; "dist"; "target"; ".venv" ]
+
+(* Recursively visit every regular file under [root], calling [f relpath]. The
+   path passed to [f] is relative to [root] (or [root] itself for a file). *)
+let walk root (f : string -> unit) =
+  let rec go rel =
+    let full = if rel = "" then root else Filename.concat root rel in
+    match Sys.is_directory full with
+    | true ->
+      let entries = try Sys.readdir full with Sys_error _ -> [||] in
+      Array.sort compare entries;
+      Array.iter
+        (fun e ->
+          if not (List.mem e skip_dirs) then go (if rel = "" then e else Filename.concat rel e))
+        entries
+    | false -> f rel
+    | exception Sys_error _ -> ()
+  in
+  if Sys.file_exists root then if Sys.is_directory root then go "" else f (Filename.basename root)
+
+(* Convert a glob with star/doublestar/question wildcards to an anchored regex. *)
+let glob_to_regex pat =
+  let b = Buffer.create (String.length pat * 2) in
+  Buffer.add_char b '^';
+  let n = String.length pat in
+  let i = ref 0 in
+  while !i < n do
+    (match pat.[!i] with
+     | '*' ->
+       if !i + 1 < n && pat.[!i + 1] = '*' then
+         if !i + 2 < n && pat.[!i + 2] = '/' then (
+           (* "**/" matches any number of path segments, including none *)
+           Buffer.add_string b "\\(.*/\\)?";
+           i := !i + 2)
+         else (
+           Buffer.add_string b ".*";
+           incr i)
+       else Buffer.add_string b "[^/]*"
+     | '?' -> Buffer.add_string b "[^/]"
+     | '.' -> Buffer.add_string b "\\."
+     | '+' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '\\' | '|' as c ->
+       Buffer.add_char b '\\';
+       Buffer.add_char b c
+     | c -> Buffer.add_char b c);
+    incr i
+  done;
+  Buffer.add_char b '$';
+  Buffer.contents b
+
+let looks_binary s =
+  let n = min (String.length s) 8000 in
+  let rec scan i = if i >= n then false else if s.[i] = '\000' then true else scan (i + 1) in
+  scan 0
+
 (* --- schema builder --- *)
 
 (* Build the JSON Schema object describing a tool's input parameters. *)
@@ -80,46 +135,84 @@ let write_file =
           Printf.sprintf "Wrote %d bytes to %s" (String.length content) path
         with Sys_error e -> "Error: " ^ e) }
 
-(* --- edit_file: replace an exact substring --- *)
+(* --- edit_file: exact substring replacement(s) with a diff --- *)
+
+(* Replace the first occurrence of [old_] with [new_] in [s]; None if absent. *)
+let replace_first s old_ new_ =
+  match Str.search_forward (Str.regexp_string old_) s 0 with
+  | i ->
+    let before = String.sub s 0 i in
+    let after = String.sub s (i + String.length old_) (String.length s - i - String.length old_) in
+    Some (before ^ new_ ^ after)
+  | exception Not_found -> None
+
+(* Prefix every line of [s] with [p] for diff display. *)
+let prefix_lines p s =
+  let parts = String.split_on_char '\n' s in
+  let parts = match List.rev parts with "" :: rest -> List.rev rest | _ -> parts in
+  parts |> List.map (fun l -> p ^ l) |> String.concat "\n"
 
 let edit_file =
   { name = "edit_file";
     description =
-      "Replace the first exact occurrence of old_str with new_str in a file. \
-       old_str must match exactly (including whitespace) and appear exactly once \
-       for a reliable edit.";
+      "Edit a file by exact substring replacement. Provide a single old_str/new_str, \
+       or an `edits` array of {old_str,new_str} applied in order. Each old_str must \
+       match exactly (including whitespace); the first occurrence is replaced. Returns \
+       a diff of the changes.";
     parameters =
       params
         ~props:
           [ ("path", strprop "Path to the file to edit.");
-            ("old_str", strprop "Exact text to find and replace.");
-            ("new_str", strprop "Replacement text.") ]
-        ~required:[ "path"; "old_str"; "new_str" ];
+            ("old_str", strprop "Exact text to find (single-edit form).");
+            ("new_str", strprop "Replacement text (single-edit form).");
+            ( "edits",
+              `Assoc
+                [ ("type", `String "array");
+                  ("description", `String "Multiple edits applied in order.");
+                  ( "items",
+                    `Assoc
+                      [ ("type", `String "object");
+                        ( "properties",
+                          `Assoc
+                            [ ("old_str", strprop "Exact text to find.");
+                              ("new_str", strprop "Replacement text.") ] );
+                        ("required", `List [ `String "old_str"; `String "new_str" ]) ] ) ] ) ]
+        ~required:[ "path" ];
     execute =
       (fun input ->
         let path = str_field input "path" in
-        let old_str = str_field input "old_str" in
-        let new_str = str_field input "new_str" in
-        try
-          let content = read_file_contents path in
-          (* find first occurrence of old_str *)
-          let idx =
-            try Some (Str.search_forward (Str.regexp_string old_str) content 0)
-            with Not_found -> None
-          in
-          match idx with
-          | None -> Printf.sprintf "Error: old_str not found in %s" path
-          | Some i ->
-            let before = String.sub content 0 i in
-            let after =
-              String.sub content
-                (i + String.length old_str)
-                (String.length content - i - String.length old_str)
+        let edits =
+          match input |> member "edits" with
+          | `List l -> List.map (fun e -> (str_field e "old_str", str_field e "new_str")) l
+          | _ -> (
+            match (opt_str_field input "old_str", opt_str_field input "new_str") with
+            | Some o, Some n -> [ (o, n) ]
+            | _ -> [])
+        in
+        if edits = [] then "Error: provide old_str/new_str or a non-empty edits array"
+        else
+          try
+            let content = read_file_contents path in
+            let diff = Buffer.create 256 in
+            let rec apply i s = function
+              | [] -> Ok s
+              | (o, n) :: rest -> (
+                match replace_first s o n with
+                | None -> Error (Printf.sprintf "edit %d: old_str not found in %s" (i + 1) path)
+                | Some s' ->
+                  Buffer.add_string diff (Printf.sprintf "@@ change %d @@\n" (i + 1));
+                  if o <> "" then Buffer.add_string diff (prefix_lines "-" o ^ "\n");
+                  if n <> "" then Buffer.add_string diff (prefix_lines "+" n ^ "\n");
+                  apply (i + 1) s' rest)
             in
-            let updated = before ^ new_str ^ after in
-            write_file_contents path updated;
-            Printf.sprintf "Edited %s" path
-        with Sys_error e -> "Error: " ^ e) }
+            match apply 0 content edits with
+            | Error e -> "Error: " ^ e
+            | Ok updated ->
+              write_file_contents path updated;
+              Printf.sprintf "Edited %s (%d change%s):\n%s" path (List.length edits)
+                (if List.length edits = 1 then "" else "s")
+                (Buffer.contents diff)
+          with Sys_error e -> "Error: " ^ e) }
 
 (* --- list_dir --- *)
 
@@ -176,9 +269,113 @@ let run_bash =
         let out = Buffer.contents buf in
         Printf.sprintf "(exit %d)\n%s" code out) }
 
+(* --- grep: regex search across files --- *)
+
+let grep_limit = 200
+
+let grep =
+  { name = "grep";
+    description =
+      "Search file contents by regular expression, recursively under a path. Returns \
+       matching lines as path:line:text. Skips binary files and common vendor dirs \
+       (.git, _build, node_modules, ...).";
+    parameters =
+      params
+        ~props:
+          [ ("pattern", strprop "Regular expression to search for (OCaml Str syntax).");
+            ("path", strprop "File or directory to search. Defaults to the current directory.");
+            ("include", strprop "Optional filename glob to restrict which files are searched, e.g. \"*.ml\".") ]
+        ~required:[ "pattern" ];
+    execute =
+      (fun input ->
+        let pattern = str_field input "pattern" in
+        let root = match opt_str_field input "path" with Some p -> p | None -> "." in
+        let include_re =
+          match opt_str_field input "include" with
+          | Some g -> Some (Str.regexp (glob_to_regex g))
+          | None -> None
+        in
+        match Str.regexp pattern with
+        | exception _ -> "Error: invalid regex pattern"
+        | re ->
+          let out = Buffer.create 4096 in
+          let count = ref 0 in
+          let truncated = ref false in
+          (try
+             walk root (fun rel ->
+                 if !count >= grep_limit then (
+                   truncated := true;
+                   raise Exit);
+                 let name_ok =
+                   match include_re with
+                   | None -> true
+                   | Some r -> Str.string_match r (Filename.basename rel) 0
+                 in
+                 if name_ok then begin
+                   let full = if Sys.is_directory root then Filename.concat root rel else root in
+                   match read_file_contents full with
+                   | exception _ -> ()
+                   | content ->
+                     if not (looks_binary content) then begin
+                       let lines = String.split_on_char '\n' content in
+                       List.iteri
+                         (fun idx line ->
+                           if !count < grep_limit then (
+                             match Str.search_forward re line 0 with
+                             | _ ->
+                               Buffer.add_string out (Printf.sprintf "%s:%d:%s\n" rel (idx + 1) line);
+                               incr count
+                             | exception Not_found -> ())
+                           else truncated := true)
+                         lines
+                     end
+                 end)
+           with Exit -> ());
+          if !count = 0 then "No matches."
+          else Buffer.contents out ^ if !truncated then Printf.sprintf "\n(truncated at %d matches)" grep_limit else "") }
+
+(* --- find: locate files by glob --- *)
+
+let find_limit = 500
+
+let find =
+  { name = "find";
+    description =
+      "Find files by name using a glob pattern (*, **, ?), recursively under a path. \
+       A pattern without '/' matches the file's basename; otherwise it matches the \
+       path relative to the search root. Skips common vendor dirs.";
+    parameters =
+      params
+        ~props:
+          [ ("pattern", strprop "Glob pattern, e.g. \"*.ml\" or \"lib/**/*.mli\".");
+            ("path", strprop "Directory to search under. Defaults to the current directory.") ]
+        ~required:[ "pattern" ];
+    execute =
+      (fun input ->
+        let pattern = str_field input "pattern" in
+        let root = match opt_str_field input "path" with Some p -> p | None -> "." in
+        let match_basename = not (String.contains pattern '/') in
+        let re = Str.regexp (glob_to_regex pattern) in
+        let out = Buffer.create 2048 in
+        let count = ref 0 in
+        let truncated = ref false in
+        (try
+           walk root (fun rel ->
+               if !count >= find_limit then (
+                 truncated := true;
+                 raise Exit);
+               let candidate = if match_basename then Filename.basename rel else rel in
+               if Str.string_match re candidate 0 && Str.match_end () = String.length candidate then begin
+                 Buffer.add_string out (rel ^ "\n");
+                 incr count
+               end)
+         with Exit -> ());
+        if !count = 0 then "No files found."
+        else Buffer.contents out ^ if !truncated then Printf.sprintf "\n(truncated at %d files)" find_limit else "") }
+
 (* --- registry --- *)
 
-let all = [ read_file; write_file; edit_file; list_dir; run_bash ]
+let all = [ read_file; write_file; edit_file; list_dir; grep; find; run_bash ]
 
 (* Anthropic tool schema: {name, description, input_schema}. *)
 let anthropic_schema t =

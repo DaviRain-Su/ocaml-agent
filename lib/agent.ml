@@ -65,17 +65,29 @@ let truthy s =
   | _ -> false
 
 type t =
-  { cfg : Llm.config;
-    system : string;
+  { mutable cfg : Llm.config;
+    mutable system : string;
     mutable turns : Llm.turn list; (* chronological *)
     session : Session.t option;
-    mutable auto_approve : bool }
+    mutable auto_approve : bool;
+    tools_enabled : bool }
 
-let create ?session ?(initial_turns = []) cfg =
+let create ?session ?(initial_turns = []) ?(tools_enabled = true) cfg =
   let auto_approve =
     match Sys.getenv_opt "AGENT_AUTO_APPROVE" with Some v -> truthy v | None -> false
   in
-  { cfg; system = build_system_prompt cfg; turns = initial_turns; session; auto_approve }
+  { cfg; system = build_system_prompt cfg; turns = initial_turns; session; auto_approve; tools_enabled }
+
+(* Swap the active model/provider; rebuilds the system prompt's identity line. *)
+let set_config t cfg =
+  t.cfg <- cfg;
+  t.system <- build_system_prompt cfg
+
+(* Clear the in-memory conversation (does not truncate the session file). *)
+let reset t = t.turns <- []
+
+let config t = t.cfg
+let turn_count t = List.length t.turns
 
 (* Append a turn to history and persist it if a session is open. *)
 let add t turn =
@@ -138,7 +150,7 @@ let rec step t : string =
     print_string s;
     flush stdout
   in
-  let blocks = Llm.complete t.cfg ~system:t.system ~on_text t.turns in
+  let blocks = Llm.complete t.cfg ~system:t.system ~on_text ~tools_enabled:t.tools_enabled t.turns in
   if !streamed then print_newline ();
   add t { Llm.role = Assistant; content = blocks };
   let texts = List.filter_map (function Llm.Text s -> Some s | _ -> None) blocks in
