@@ -176,5 +176,19 @@ let () =
   check "model list filters" (List.for_all (fun (e : Models.entry) -> contains0 e.Models.id "glm" || contains0 e.Models.provider "zai") (Models.list ~pat:"zai" ()));
   check "model list nonempty" (Models.list () <> []);
 
+  (* --- extensions: custom tool from manifest --- *)
+  let oc = open_out ".ocaml-agent/tools.json" in
+  output_string oc
+    {|{"tools":[{"name":"echoizer","description":"echo back","parameters":{"type":"object","properties":{}},"command":"cat"}]}|};
+  close_out oc;
+  let names = Extensions.load () in
+  check "extension registered" (List.mem "echoizer" names);
+  check "extension findable" (Tools.find "echoizer" <> None);
+  (match Tools.find "echoizer" with
+   | Some t -> check "extension executes via subprocess" (contains0 (t.execute (j {|{"x":1}|})) "\"x\":1")
+   | None -> check "extension executes via subprocess" false);
+  check "extension in schemas"
+    (contains0 (Yojson.Safe.to_string (`List (Tools.openai_schemas ()))) "echoizer");
+
   Printf.printf "\n%s\n" (if !failures = 0 then "All tests passed." else "FAILURES present.");
   exit (if !failures = 0 then 0 else 1)

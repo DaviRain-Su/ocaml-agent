@@ -202,6 +202,10 @@ let () =
   (match o.list_models with
    | Some pat -> list_models pat; exit 0
    | None -> ());
+  (match Extensions.load () with
+   | [] -> ()
+   | names -> if o.mode <> "rpc" && o.mode <> "json" then
+       Printf.eprintf "%s %s\n%!" (dim "Loaded extension tools:") (String.concat ", " names));
   match
     match o.provider with
     | Some p -> Llm.config_for ?model:o.model p

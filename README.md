@@ -15,11 +15,16 @@ bin/main.ml        REPL / one-shot entrypoint
 lib/http.ml        Shared curl-based JSON POST + streaming (SSE) helper
 lib/llm.ml         Config (from env) + normalized types + Anthropic & OpenAI adapters
 lib/tools.ml       Tool schemas + executors (read/write/edit/list/grep/find/bash/task)
-lib/session.ml     JSONL session persistence (save + resume)
 lib/render.ml      Streaming markdown renderer + colorized tool-result previews
 lib/skills.ml      Skill discovery (markdown + frontmatter) and prompt injection
-lib/agent.ml       The agent loop: system prompt, approval, tools, sub-agents, compaction
-test/test_tools.ml Offline smoke tests (tools, turn JSON, session, prompt, render, skills)
+lib/models.ml      Best-effort model catalog (context windows) for --list-models
+lib/extensions.ml  Load custom subprocess-backed tools from a JSON manifest
+lib/commands.ml    Session slash-command implementations (frontend-agnostic)
+lib/session.ml     Session manager: dir, headers, list, resume, clone, export
+lib/tui.ml         Full-screen notty TUI (scrollback + input editor)
+lib/rpc.ml         JSON-RPC (JSONL) driver for --mode rpc
+lib/agent.ml       The agent loop: frontend, approval, tools, sub-agents, compaction
+test/test_tools.ml Offline tests (tools, sessions, render, skills, models, extensions)
 ```
 
 ## Features
@@ -49,6 +54,9 @@ test/test_tools.ml Offline smoke tests (tools, turn JSON, session, prompt, rende
 - **Skills** — markdown files with frontmatter in `.ocaml-agent/skills/` or
   `.claude/skills/` are discovered and listed in the system prompt; the model reads
   a skill's file on demand (prompt-injection model, no separate runtime).
+- **Extensions** — declare custom tools in `.ocaml-agent/tools.json` (or
+  `AGENT_TOOLS_FILE`); each runs an external command receiving the tool input as
+  JSON on stdin and returning its output. Registered alongside the built-in tools.
 - **Interactive commands**: `/model`, `/think`, `/compact`, `/session`, `/sessions`,
   `/resume`, `/name`, `/clone`, `/export`, `/copy`, `/new`, `/help`.
 - **Embeddable**: `--mode rpc` exposes a JSON-RPC (JSONL) interface over stdin/stdout;

@@ -387,9 +387,17 @@ let task =
     (* Intercepted by the agent loop; never actually called. *)
     execute = (fun _ -> "Error: task tool must be handled by the agent") }
 
-(* --- registry --- *)
+(* --- registry (extensible at startup) --- *)
 
-let all = [ read_file; write_file; edit_file; list_dir; grep; find; run_bash; task ]
+let builtin = [ read_file; write_file; edit_file; list_dir; grep; find; run_bash; task ]
+
+let registry = ref builtin
+
+(* Register an extension-provided tool. Replaces any existing tool of the same name. *)
+let register (t : tool) =
+  registry := List.filter (fun x -> x.name <> t.name) !registry @ [ t ]
+
+let all () = !registry
 
 (* Anthropic tool schema: {name, description, input_schema}. *)
 let anthropic_schema t =
@@ -408,7 +416,7 @@ let openai_schema t =
             ("description", `String t.description);
             ("parameters", t.parameters) ] ) ]
 
-let anthropic_schemas = List.map anthropic_schema all
-let openai_schemas = List.map openai_schema all
+let anthropic_schemas () = List.map anthropic_schema !registry
+let openai_schemas () = List.map openai_schema !registry
 
-let find name = List.find_opt (fun t -> t.name = name) all
+let find name = List.find_opt (fun t -> t.name = name) !registry

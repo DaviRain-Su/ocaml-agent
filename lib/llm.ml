@@ -286,7 +286,7 @@ let anthropic_complete cfg ~system ~on_text ~tools_enabled turns : content list 
          ("max_tokens", `Int max_tokens);
          ("system", `String system);
          ("stream", `Bool true);
-         ("tools", `List (if tools_enabled then Tools.anthropic_schemas else []));
+         ("tools", `List (if tools_enabled then Tools.anthropic_schemas () else []));
          ("messages", `List (anthropic_messages turns)) ]
       @
       if budget > 0 then
@@ -431,7 +431,7 @@ let openai_complete cfg ~system ~on_text ~tools_enabled turns : content list * u
       @ (if cfg.thinking <> "off" then [ ("reasoning_effort", `String cfg.thinking) ] else [])
       @
       if tools_enabled then
-        [ ("tools", `List Tools.openai_schemas); ("tool_choice", `String "auto") ]
+        [ ("tools", `List (Tools.openai_schemas ())); ("tool_choice", `String "auto") ]
       else [])
   in
   let url = cfg.base_url ^ "/chat/completions" in
