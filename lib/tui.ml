@@ -9,7 +9,7 @@ open Notty_unix
 
 type ui =
   { term : Term.t;
-    mutable lines : (A.t * string) list; (* scrollback, oldest first *)
+    mutable lines : (A.t * string) list list; (* scrollback (oldest first); each line is a list of styled segments *)
     mutable input : string;
     mutable cursor : int; (* byte index into input *)
     mutable history : string list; (* newest first *)
@@ -35,73 +35,96 @@ let next_cp_start s i = let n = String.length s in let j = ref (i + 1) in while 
 let cp_count s upto = let c = ref 0 in String.iteri (fun i ch -> if i < upto && not (is_cont ch) then incr c) s; !c
 
 (* --- scrollback --- *)
-let push ui attr s =
-  ui.lines <- ui.lines @ [ (attr, s) ];
+let push_segs ui (segs : (A.t * string) list) =
+  ui.lines <- ui.lines @ [ segs ];
   let len = List.length ui.lines in
   if len > max_lines then ui.lines <- List.filteri (fun i _ -> i >= len - max_lines) ui.lines
 
-let wrap_line w s =
-  if w <= 0 || String.length s <= w then [ s ]
+(* Single-segment line; preserves the old push API for plain lines. *)
+let push ui attr s = push_segs ui [ (attr, s) ]
+
+(* Split a UTF-8 string into single-codepoint substrings. *)
+let codepoints s =
+  let n = String.length s in
+  let rec go i acc = if i >= n then List.rev acc else let j = next_cp_start s i in go j (String.sub s i (j - i) :: acc) in
+  go 0 []
+
+(* Parse inline **bold** and `code` into styled segments (markers removed). *)
+let style_inline base s =
+  let segs = ref [] and buf = Buffer.create 16 and bold = ref false and code = ref false in
+  let active () =
+    let a = base in
+    let a = if !bold then A.(a ++ st bold) else a in
+    if !code then A.(a ++ fg cyan) else a
+  in
+  let flush () = if Buffer.length buf > 0 then (segs := (active (), Buffer.contents buf) :: !segs; Buffer.clear buf) in
+  let n = String.length s and i = ref 0 in
+  while !i < n do
+    if !i + 1 < n && s.[!i] = '*' && s.[!i + 1] = '*' then (flush (); bold := not !bold; i := !i + 2)
+    else if s.[!i] = '`' then (flush (); code := not !code; incr i)
+    else (Buffer.add_char buf s.[!i]; incr i)
+  done;
+  flush ();
+  match List.rev !segs with [] -> [ (base, "") ] | l -> l
+
+(* Wrap a styled-segment line to width [w], coalescing runs of the same attr. *)
+let wrap_segs w segs =
+  if w <= 0 then [ segs ]
   else begin
-    let n = String.length s in
-    let rec go i acc =
-      if i >= n then List.rev acc
-      else begin
-        let stop = min n (i + w) in
-        let stop =
-          if stop < n then (
-            let j = ref stop in
-            while !j > i && is_cont s.[!j] do decr j done;
-            if !j <= i then min n (i + w) else !j)
-          else stop
-        in
-        go stop (String.sub s i (stop - i) :: acc)
-      end
-    in
-    go 0 []
+    let out = ref [] and line = ref [] and col = ref 0 in
+    let buf = Buffer.create 32 and cur = ref A.empty in
+    let flush_run () = if Buffer.length buf > 0 then (line := (!cur, Buffer.contents buf) :: !line; Buffer.clear buf) in
+    let newline () = flush_run (); out := List.rev !line :: !out; line := []; col := 0 in
+    List.iter
+      (fun (a, s) ->
+        flush_run ();
+        cur := a;
+        List.iter (fun cp -> if !col >= w then (newline (); cur := a); Buffer.add_string buf cp; incr col) (codepoints s))
+      segs;
+    flush_run ();
+    out := List.rev !line :: !out;
+    List.rev !out
   end
 
 let prompt_label = "you> "
-
-(* All scrollback lines wrapped to width [w] as (attr, text). *)
-let wrapped ui w =
-  List.concat_map (fun (a, s) -> if s = "" then [ (A.empty, "") ] else List.map (fun l -> (a, l)) (wrap_line w s)) ui.lines
 
 let sublist start len l = l |> List.filteri (fun i _ -> i >= start && i < start + len)
 
 let redraw ui =
   Mutex.lock ui.mtx;
-  let w, h = Term.size ui.term in
-  let w = max 1 w and h = max 4 h in
-  let visible = max 1 (h - 3) in
-  let all = wrapped ui w in
-  let total = List.length all in
-  let maxscroll = max 0 (total - visible) in
-  if ui.scroll > maxscroll then ui.scroll <- maxscroll;
-  let start = max 0 (total - visible - ui.scroll) in
-  let window = sublist start visible all in
-  let body = I.vsnap ~align:`Bottom visible (I.vcat (List.map (fun (a, l) -> I.string a l) window)) in
-  let status =
-    if ui.turn_active then
-      I.string A.(fg yellow) (Printf.sprintf "%s thinking… %.0fs" spinner.(ui.spin mod Array.length spinner) (Unix.gettimeofday () -. ui.turn_start))
-    else if ui.scroll > 0 then I.string A.(fg (gray 8)) (Printf.sprintf "-- scrolled %d lines (End to return) --" ui.scroll)
-    else I.void 1 1
-  in
-  let sep = I.char A.(fg (gray 6)) '_' w 1 in
-  let prompt = I.(string A.(fg green) prompt_label <|> string A.empty ui.input) in
-  Term.image ui.term I.(body <-> status <-> sep <-> prompt);
-  Term.cursor ui.term (Some (String.length prompt_label + cp_count ui.input ui.cursor, h - 1));
-  Mutex.unlock ui.mtx
+  Fun.protect
+    ~finally:(fun () -> Mutex.unlock ui.mtx)
+    (fun () ->
+      let w, h = Term.size ui.term in
+      let w = max 1 w and h = max 4 h in
+      let visible = max 1 (h - 3) in
+      let all = List.concat_map (wrap_segs w) ui.lines in
+      let total = List.length all in
+      let maxscroll = max 0 (total - visible) in
+      if ui.scroll > maxscroll then ui.scroll <- maxscroll;
+      let start = max 0 (total - visible - ui.scroll) in
+      let window = sublist start visible all in
+      let line_img segs = match segs with [] -> I.void 1 1 | _ -> I.hcat (List.map (fun (a, s) -> I.string a s) segs) in
+      let body = I.vsnap ~align:`Bottom visible (I.vcat (List.map line_img window)) in
+      let status =
+        if ui.turn_active then
+          I.string A.(fg yellow) (Printf.sprintf "%s thinking… %.0fs" spinner.(ui.spin mod Array.length spinner) (Unix.gettimeofday () -. ui.turn_start))
+        else if ui.scroll > 0 then I.string A.(fg (gray 8)) (Printf.sprintf "-- scrolled %d lines (End to return) --" ui.scroll)
+        else I.void 1 1
+      in
+      let sep = I.char A.(fg (gray 6)) '_' w 1 in
+      let prompt = I.(string A.(fg green) prompt_label <|> string A.empty ui.input) in
+      Term.image ui.term I.(body <-> status <-> sep <-> prompt);
+      Term.cursor ui.term (Some (String.length prompt_label + cp_count ui.input ui.cursor, h - 1)))
 
-(* Line-level markdown styling for streamed assistant text, tracking code-fence
-   state across the message. *)
-let asst_attr ui line =
+(* Styled segments for one streamed assistant line, tracking code-fence state. *)
+let asst_segs ui line =
   let t = String.trim line in
   let fence = String.length t >= 3 && String.sub t 0 3 = "```" in
-  if fence then (ui.asst_in_code <- not ui.asst_in_code; A.(fg (gray 8)))
-  else if ui.asst_in_code then A.(fg cyan)
-  else if String.length t > 0 && t.[0] = '#' then A.(st bold)
-  else A.empty
+  if fence then (ui.asst_in_code <- not ui.asst_in_code; [ (A.(fg (gray 8)), line) ])
+  else if ui.asst_in_code then [ (A.(fg cyan), line) ]
+  else if String.length t > 0 && t.[0] = '#' then [ (A.(st bold), line) ]
+  else style_inline A.empty line
 
 (* --- frontend callbacks --- *)
 let feed_assistant ui s =
@@ -110,7 +133,7 @@ let feed_assistant ui s =
   let parts = String.split_on_char '\n' content in
   let rec loop = function
     | [ last ] -> Buffer.clear ui.buf; Buffer.add_string ui.buf last
-    | line :: rest -> push ui (asst_attr ui line) line; loop rest
+    | line :: rest -> push_segs ui (asst_segs ui line); loop rest
     | [] -> ()
   in
   loop parts;
@@ -118,7 +141,7 @@ let feed_assistant ui s =
 
 let flush_assistant ui =
   let rem = Buffer.contents ui.buf in
-  if rem <> "" then push ui (asst_attr ui rem) rem;
+  if rem <> "" then push_segs ui (asst_segs ui rem);
   Buffer.clear ui.buf;
   ui.asst_in_code <- false;
   redraw ui
@@ -171,20 +194,22 @@ let select ui ~title (items : string list) : int option =
     let sel = ref 0 in
     let render () =
       Mutex.lock ui.mtx;
-      let w, h = Term.size ui.term in
-      let header = I.string A.(fg green ++ st bold) title in
-      let rows =
-        List.mapi
-          (fun i it ->
-            let a = if i = !sel then A.(fg black ++ bg cyan) else A.empty in
-            I.string a (Printf.sprintf " %s %s " (if i = !sel then ">" else " ") it))
-          items
-      in
-      let hint = I.string A.(fg (gray 8)) "↑/↓ select · Enter confirm · Esc cancel" in
-      let img = I.vsnap ~align:`Top (max 4 h) (I.vcat ((header :: rows) @ [ I.void 1 1; hint ])) in
-      Term.image ui.term (I.hsnap ~align:`Left (max 1 w) img);
-      Term.cursor ui.term None;
-      Mutex.unlock ui.mtx
+      Fun.protect
+        ~finally:(fun () -> Mutex.unlock ui.mtx)
+        (fun () ->
+          let w, h = Term.size ui.term in
+          let header = I.string A.(fg green ++ st bold) title in
+          let rows =
+            List.mapi
+              (fun i it ->
+                let a = if i = !sel then A.(fg black ++ bg cyan) else A.empty in
+                I.string a (Printf.sprintf " %s %s " (if i = !sel then ">" else " ") it))
+              items
+          in
+          let hint = I.string A.(fg (gray 8)) "↑/↓ select · Enter confirm · Esc cancel" in
+          let img = I.vsnap ~align:`Top (max 4 h) (I.vcat ((header :: rows) @ [ I.void 1 1; hint ])) in
+          Term.image ui.term (I.hsnap ~align:`Left (max 1 w) img);
+          Term.cursor ui.term None)
     in
     render ();
     let rec loop () =

@@ -198,5 +198,18 @@ let () =
   check "complete slash multi" (List.mem "/session" (Complete.candidates "/se") && List.mem "/sessions" (Complete.candidates "/se"));
   check "complete path token" (List.mem "src/foo.ml" (Complete.candidates "read src/f"));
 
+  (* --- keymap --- *)
+  check "keymap parse ctrl" (Keymap.parse_spec "ctrl+p" = Some ('p', true));
+  check "keymap parse plain" (Keymap.parse_spec "s" = Some ('s', false));
+  check "keymap action name" (Keymap.action_of_string "quit" = Some Keymap.Quit);
+  check "keymap default has picker" (Keymap.lookup Keymap.default ('p', true) = Some Keymap.Model_picker);
+
+  (* --- TUI inline styling helpers --- *)
+  let seg_text segs = String.concat "" (List.map snd segs) in
+  check "style_inline strips markers" (seg_text (Tui.style_inline Notty.A.empty "a **b** `c`") = "a b c");
+  let dls = Tui.wrap_segs 3 [ (Notty.A.empty, "abcdef") ] in
+  check "wrap_segs splits to width" (List.length dls = 2);
+  check "wrap_segs preserves text" (String.concat "" (List.map seg_text dls) = "abcdef");
+
   Printf.printf "\n%s\n" (if !failures = 0 then "All tests passed." else "FAILURES present.");
   exit (if !failures = 0 then 0 else 1)

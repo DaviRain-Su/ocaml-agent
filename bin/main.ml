@@ -197,6 +197,7 @@ let list_models pat =
       entries
 
 let () =
+  Random.self_init ();
   let o = parse_args (Array.to_list Sys.argv |> List.tl) in
   Option.iter (fun t -> Unix.putenv "AGENT_THINKING" t) o.thinking;
   (match o.list_models with

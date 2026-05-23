@@ -141,7 +141,7 @@ type t =
     tools_enabled : bool;
     context_window : int;
     compact_threshold : float; (* fraction of the window that triggers compaction *)
-    auto_compact : bool;
+    mutable auto_compact : bool;
     depth : int; (* sub-agent nesting depth; 0 for the top-level agent *)
     mutable fe : frontend;
     mutable last_input_tokens : int;
@@ -201,6 +201,11 @@ let adopt_session t ?(turns = []) session =
 
 (* Change the reasoning level live. *)
 let set_thinking t level = t.cfg <- { t.cfg with Llm.thinking = level }
+
+let auto_approve t = t.auto_approve
+let set_auto_approve t b = t.auto_approve <- b
+let auto_compact t = t.auto_compact
+let set_auto_compact t b = t.auto_compact <- b
 
 (* Append a turn to history and persist it if a session is open. *)
 let add t turn =

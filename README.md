@@ -33,8 +33,11 @@ test/test_tools.ml Offline tests (tools, sessions, render, skills, models, exten
 - **Tools**: `read_file`, `write_file`, `edit_file` (multi-edit + diff), `list_dir`,
   `grep` (regex search), `find` (glob), `run_bash`.
 - **Full-screen TUI** (notty) — scrollback viewport above a live input editor, with
-  history, slash commands, and a bash-approval modal; streams updates in place.
-  Falls back to the plain line REPL when not a TTY or with `--no-tui`.
+  PgUp/PgDn + mouse-wheel scrolling, input history, Tab autocomplete (commands +
+  paths), inline markdown styling (bold/`code`/code blocks), an animated thinking
+  spinner, a model picker (Ctrl-P), a `/settings` modal, emacs line editing
+  (Ctrl-A/E/U/K/W), configurable keybindings (`.ocaml-agent/keybindings.json`), and a
+  bash-approval modal. Falls back to the plain line REPL when not a TTY or with `--no-tui`.
 - **Streaming output** — assistant text is printed token-by-token as it arrives (SSE),
   with live, line-buffered markdown rendering (headers, bold, inline code, code fences).
 - **Tool-result previews** — colorized, truncated output under each tool call (diff
