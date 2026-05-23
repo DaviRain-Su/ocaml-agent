@@ -105,7 +105,9 @@ let redraw ui =
       let menu_rows = min menu_max (List.length matches) in
       if menu_rows > 0 && ui.menu_sel >= menu_rows then ui.menu_sel <- menu_rows - 1;
       if ui.menu_sel < 0 then ui.menu_sel <- 0;
-      let visible = max 1 (h - 3 - menu_rows) in
+      let in_lines = String.split_on_char '\n' ui.input in
+      let in_rows = List.length in_lines in
+      let visible = max 1 (h - 2 - menu_rows - in_rows) in
       let all = List.concat_map (wrap_segs w) ui.lines in
       let total = List.length all in
       let maxscroll = max 0 (total - visible) in
@@ -133,9 +135,23 @@ let redraw ui =
         else I.void 1 1
       in
       let sep = I.char A.(fg (gray 6)) '_' w 1 in
-      let prompt = I.(string A.(fg green) prompt_label <|> string A.empty ui.input) in
+      let indent = String.make (String.length prompt_label) ' ' in
+      let prompt =
+        I.vcat
+          (List.mapi
+             (fun i l ->
+               let pfx = if i = 0 then I.string A.(fg green) prompt_label else I.string A.empty indent in
+               I.(pfx <|> string A.empty l))
+             in_lines)
+      in
       Term.image ui.term I.(body <-> status <-> menu_img <-> sep <-> prompt);
-      Term.cursor ui.term (Some (String.length prompt_label + cp_count ui.input ui.cursor, h - 1)))
+      (* cursor row/col within the (possibly multi-line) input *)
+      let crow = ref 0 and ccol = ref 0 in
+      String.iteri
+        (fun i ch ->
+          if i < ui.cursor then if ch = '\n' then (incr crow; ccol := 0) else if not (is_cont ch) then incr ccol)
+        ui.input;
+      Term.cursor ui.term (Some (String.length prompt_label + !ccol, h - in_rows + !crow)))
 
 (* Styled segments for one streamed assistant line, tracking code-fence state. *)
 let asst_segs ui line =
@@ -304,6 +320,7 @@ let cmd ui line =
         "/new                   clear the conversation";
         "Tab / type /           live command completion menu";
         "Tab                    complete command / file path";
+        "Alt-Enter / Ctrl-J     insert a newline (multi-line input)";
         "Ctrl-A/E/U/K/W         line edit (home/end/kill-start/kill-end/kill-word)";
         "PgUp/PgDn or wheel     scroll · End jumps to latest · Ctrl-P model picker";
         "/exit                  quit" ];
@@ -369,9 +386,13 @@ let submit ui =
   ui.scroll <- 0;
   if line <> "" then begin
     ui.history <- line :: ui.history;
-    push ui A.(fg green) (prompt_label ^ line);
+    (* echo the (possibly multi-line) input under the prompt *)
+    let indent = String.make (String.length prompt_label) ' ' in
+    List.iteri
+      (fun i l -> push ui A.(fg green) ((if i = 0 then prompt_label else indent) ^ l))
+      (String.split_on_char '\n' line);
     redraw ui;
-    if String.length line > 0 && line.[0] = '/' then cmd ui line else run_turn ui line
+    if line.[0] = '/' then cmd ui line else run_turn ui line
   end
 
 (* --- input editing --- *)
@@ -464,12 +485,14 @@ let run agent =
         | 'u' -> kill_to_start ui; ui.menu_sel <- 0; redraw ui
         | 'k' -> kill_to_end ui; redraw ui
         | 'w' -> kill_word ui; ui.menu_sel <- 0; redraw ui
+        | 'j' -> insert ui "\n"; ui.menu_sel <- 0; redraw ui (* Ctrl-J inserts a newline *)
         | _ -> ())
       else (insert ui (String.make 1 c); ui.menu_sel <- 0; redraw ui)
   in
   while ui.running do
     match Term.event term with
     | `Key (`Tab, _) -> if menu_items () <> [] then (accept_menu (); redraw ui) else complete ui
+    | `Key (`Enter, mods) when List.mem `Meta mods -> insert ui "\n"; ui.menu_sel <- 0; redraw ui
     | `Key (`Enter, _) ->
       if menu_items () <> [] && not (List.mem ui.input Complete.commands) then (accept_menu (); redraw ui)
       else submit ui
