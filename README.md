@@ -48,9 +48,9 @@ test/test_tools.ml Offline tests (tools, sessions, render, skills, models, exten
   older turns are summarized automatically as the context window fills.
 - **Project-context injection** — `AGENTS.md` / `CLAUDE.md` in the cwd, plus the
   working directory, date, and the live provider/model identity, folded into the system prompt.
-- **Tool approval** — `run_bash` and subprocess extension tools prompt for
-  `[y]es / [N]o / [a]lways` before running (skip with `AGENT_AUTO_APPROVE=1`;
-  denied automatically when there's no TTY).
+- **Tool approval** — tools auto-run by default (like pi). Set `AGENT_AUTO_APPROVE=0`
+  (or toggle in `/settings`) to be prompted `[y]es / [N]o / [a]lways` before `run_bash`
+  and subprocess extension tools; with approval on and no TTY, those tools are denied.
 - **Session persistence** — set `AGENT_SESSION_FILE` (or use `-c`) to append each
   turn as JSONL and resume the conversation on the next run.
 - **Sub-agents** — the `task` tool delegates a self-contained sub-task to a fresh
@@ -135,7 +135,7 @@ Overrides (all optional):
 | `AGENT_API_KEY`      | API key (overrides the provider-specific key env)            |
 | `AGENT_BASE_URL`     | API base URL override (for custom / compatible endpoints)    |
 | `AGENT_MAX_TOKENS`   | Max output tokens (default `4096`)                           |
-| `AGENT_AUTO_APPROVE` | Skip command-capable tool approval prompts when truthy       |
+| `AGENT_AUTO_APPROVE` | Auto-run tools without prompting (default on; set `0` to require approval) |
 | `AGENT_MAX_TOOL_ROUNDS` | Max tool-use rounds per turn before stopping (default `20`) |
 | `AGENT_SESSION_FILE` | JSONL file to persist to / resume from                       |
 | `AGENT_THINKING`     | Reasoning level: `off` (default), `low`, `medium`, `high`    |
