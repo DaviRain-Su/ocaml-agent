@@ -1,3 +1,0 @@
-(library
- (name agent_lib)
- (libraries yojson unix str notty notty.unix threads.posix))
