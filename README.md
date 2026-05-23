@@ -135,7 +135,7 @@ Overrides (all optional):
 | `AGENT_API_KEY`      | API key (overrides the provider-specific key env)            |
 | `AGENT_BASE_URL`     | API base URL override (for custom / compatible endpoints)    |
 | `AGENT_MAX_TOKENS`   | Max output tokens (default `4096`)                           |
-| `AGENT_AUTO_APPROVE` | Skip the run_bash approval prompt when truthy                |
+| `AGENT_AUTO_APPROVE` | Skip command-capable tool approval prompts when truthy       |
 | `AGENT_MAX_TOOL_ROUNDS` | Max tool-use rounds per turn before stopping (default `20`) |
 | `AGENT_SESSION_FILE` | JSONL file to persist to / resume from                       |
 | `AGENT_THINKING`     | Reasoning level: `off` (default), `low`, `medium`, `high`    |

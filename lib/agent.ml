@@ -151,8 +151,10 @@ type t =
 let max_depth = 2
 
 let create ?session ?(initial_turns = []) ?(tools_enabled = true) ?(depth = 0) ?frontend cfg =
+  (* Default to auto-approving tools (like pi). Set AGENT_AUTO_APPROVE=0 to be
+     prompted before run_bash and subprocess extension tools. *)
   let auto_approve =
-    match Sys.getenv_opt "AGENT_AUTO_APPROVE" with Some v -> truthy v | None -> false
+    match Sys.getenv_opt "AGENT_AUTO_APPROVE" with Some v -> truthy v | None -> true
   in
   let auto_compact =
     match Sys.getenv_opt "AGENT_AUTO_COMPACT" with Some v -> truthy v | None -> true
