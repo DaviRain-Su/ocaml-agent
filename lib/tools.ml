@@ -41,8 +41,12 @@ let command_timeout_s = 300
 (* Directories never descended into during recursive search. *)
 let skip_dirs = [ ".git"; "_build"; "node_modules"; ".hg"; ".svn"; "dist"; "target"; ".venv" ]
 
+(* Custom exception for flow control when a search limit is reached. *)
+exception Limit_reached
+
 (* Recursively visit every regular file under [root], calling [f relpath]. The
-   path passed to [f] is relative to [root] (or [root] itself for a file). *)
+   path passed to [f] is relative to [root] (or [root] itself for a file).
+   Raises Limit_reached if the caller wants to abort early (e.g. hit a result limit). *)
 let walk root (f : string -> unit) =
   let rec go rel =
     let full = if rel = "" then root else Filename.concat root rel in
@@ -157,13 +161,25 @@ let prefix_lines p s =
   let parts = match List.rev parts with "" :: rest -> List.rev rest | _ -> parts in
   parts |> List.map (fun l -> p ^ l) |> String.concat "\n"
 
+(* Apply edits to an in-memory string first so edit_file is atomic on failure. *)
+let apply_edits content edits =
+  let rec check i s = function
+    | [] -> Ok s
+    | (o, n) :: rest -> (
+      match replace_first s o n with
+      | None -> Error (Printf.sprintf "edit %d: old_str not found in file" (i + 1))
+      | Some s' -> check (i + 1) s' rest)
+  in
+  check 0 content edits
+
 let edit_file =
   { name = "edit_file";
     description =
       "Edit a file by exact substring replacement. Provide a single old_str/new_str, \
        or an `edits` array of {old_str,new_str} applied in order. Each old_str must \
-       match exactly (including whitespace); the first occurrence is replaced. Returns \
-       a diff of the changes.";
+       match exactly (including whitespace); the first occurrence is replaced. All \
+       edits are validated before any are applied; if any edit fails validation, \
+       no changes are made. Returns a diff of the changes.";
     parameters =
       params
         ~props:
@@ -199,21 +215,16 @@ let edit_file =
         else
           try
             let content = read_file_contents path in
-            let diff = Buffer.create 256 in
-            let rec apply i s = function
-              | [] -> Ok s
-              | (o, n) :: rest -> (
-                match replace_first s o n with
-                | None -> Error (Printf.sprintf "edit %d: old_str not found in %s" (i + 1) path)
-                | Some s' ->
-                  Buffer.add_string diff (Printf.sprintf "@@ change %d @@\n" (i + 1));
-                  if o <> "" then Buffer.add_string diff (prefix_lines "-" o ^ "\n");
-                  if n <> "" then Buffer.add_string diff (prefix_lines "+" n ^ "\n");
-                  apply (i + 1) s' rest)
-            in
-            match apply 0 content edits with
+            match apply_edits content edits with
             | Error e -> "Error: " ^ e
             | Ok updated ->
+              let diff = Buffer.create 256 in
+              List.iteri
+                (fun i (o, n) ->
+                  Buffer.add_string diff (Printf.sprintf "@@ change %d @@\n" (i + 1));
+                  if o <> "" then Buffer.add_string diff (prefix_lines "-" o ^ "\n");
+                  if n <> "" then Buffer.add_string diff (prefix_lines "+" n ^ "\n"))
+                edits;
               write_file_contents path updated;
               Printf.sprintf "Edited %s (%d change%s):\n%s" path (List.length edits)
                 (if List.length edits = 1 then "" else "s")
@@ -395,7 +406,7 @@ let grep =
              walk root (fun rel ->
                  if !count >= grep_limit then (
                    truncated := true;
-                   raise Exit);
+                   raise Limit_reached);
                  let name_ok =
                    match include_re with
                    | None -> true
@@ -423,7 +434,7 @@ let grep =
                            lines
                        end
                  end)
-           with Exit -> ());
+           with Limit_reached -> ());
           if !count = 0 then "No matches."
           else Buffer.contents out ^ if !truncated then Printf.sprintf "\n(truncated at %d matches)" grep_limit else "") }
 
@@ -457,13 +468,13 @@ let find =
            walk root (fun rel ->
                if !count >= find_limit then (
                  truncated := true;
-                 raise Exit);
+                 raise Limit_reached);
                let candidate = if match_basename then Filename.basename rel else rel in
                if Str.string_match re candidate 0 && Str.match_end () = String.length candidate then begin
                  Buffer.add_string out (rel ^ "\n");
                  incr count
                end)
-         with Exit -> ());
+         with Limit_reached -> ());
         if !count = 0 then "No files found."
         else Buffer.contents out ^ if !truncated then Printf.sprintf "\n(truncated at %d files)" find_limit else "") }
 

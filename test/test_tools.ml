@@ -33,6 +33,8 @@ let () =
 
   let r = run "edit_file" {|{"path":"sub/a.txt","old_str":"nope","new_str":"x"}|} in
   check "edit_file missing old_str" (Str.string_match (Str.regexp "Error:") r 0);
+  let r2 = run "read_file" {|{"path":"sub/a.txt"}|} in
+  check "edit_file atomic: no partial change on failure" (r2 = "hello\nOCaml\n");
 
   let contains0 hay needle =
     try ignore (Str.search_forward (Str.regexp_string needle) hay 0); true with Not_found -> false
@@ -44,6 +46,13 @@ let () =
   check "edit_file multi reports 2 changes" (contains0 r "2 changes");
   let r2 = run "read_file" {|{"path":"multi.txt"}|} in
   check "edit_file multi applied both" (r2 = "A\nb\nC\n");
+
+  (* Test atomicity: second edit invalid should leave file unchanged *)
+  let _ = run "write_file" {|{"path":"atomic.txt","content":"x\ny\nz\n"}|} in
+  let r = run "edit_file" {|{"path":"atomic.txt","edits":[{"old_str":"x","new_str":"X"},{"old_str":"invalid","new_str":"Y"}]}|} in
+  check "edit_file atomic multi fails" (Str.string_match (Str.regexp "Error:") r 0);
+  let r2 = run "read_file" {|{"path":"atomic.txt"}|} in
+  check "edit_file atomic multi no partial" (r2 = "x\ny\nz\n");
 
   let r = run "list_dir" {|{"path":"sub"}|} in
   check "list_dir lists file" (r = "a.txt");

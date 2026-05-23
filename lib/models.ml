@@ -28,11 +28,19 @@ let context_window id =
 
 (* Catalog entries whose provider or id contains [pat] (case-insensitive). *)
 let list ?(pat = "") () =
-  let p = String.lowercase_ascii pat in
-  let contains hay = p = "" || (
-    let hay = String.lowercase_ascii hay in
-    let nh = String.length hay and np = String.length p in
-    let rec go i = if i + np > nh then false else if String.sub hay i np = p then true else go (i + 1) in
-    go 0)
-  in
-  List.filter (fun e -> contains e.provider || contains e.id) catalog
+  if pat = "" then catalog
+  else
+    let p = String.lowercase_ascii pat in
+    let re = try Some (Str.regexp_string p) with _ -> None in
+    match re with
+    | None -> []
+    | Some re ->
+      let contains hay =
+        match Str.search_forward re (String.lowercase_ascii hay) 0 with
+        | _ -> true
+        | exception Not_found -> false
+      in
+      List.filter
+        (fun e ->
+          contains e.provider || contains e.id)
+        catalog
