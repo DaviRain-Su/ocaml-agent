@@ -168,6 +168,7 @@ let run_tool t id name input : Llm.content =
       | Some tool -> ( try tool.execute input with e -> "Error: " ^ Printexc.to_string e)
       | None -> Printf.sprintf "Error: unknown tool %s" name
   in
+  if String.trim result <> "" then Printf.printf "%s\n%!" (Render.tool_result result);
   Llm.Tool_result { id; content = result }
 
 (* --- context accounting + compaction --- *)
@@ -246,16 +247,16 @@ let should_compact t =
   && List.length t.turns > keep_recent + 1
 
 let rec step t : string =
+  let r = Render.create () in
   let streamed = ref false in
   let on_text s =
     streamed := true;
-    print_string s;
-    flush stdout
+    Render.feed r s
   in
   let blocks, usage = Llm.complete t.cfg ~system:t.system ~on_text ~tools_enabled:t.tools_enabled t.turns in
   if usage.Llm.input_tokens > 0 then t.last_input_tokens <- usage.Llm.input_tokens;
   if usage.Llm.output_tokens > 0 then t.last_output_tokens <- usage.Llm.output_tokens;
-  if !streamed then print_newline ();
+  if !streamed then Render.finish r;
   List.iter
     (function Llm.Thinking { text; _ } when text <> "" -> Printf.printf "%s\n%!" (dim ("\xf0\x9f\x92\xad " ^ text)) | _ -> ())
     blocks;

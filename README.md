@@ -25,7 +25,10 @@ test/test_tools.ml Offline smoke tests (tools, turn JSON, session, system prompt
 - **Multi-provider** via env vars (Anthropic / OpenAI / DeepSeek / Kimi / any compatible endpoint).
 - **Tools**: `read_file`, `write_file`, `edit_file` (multi-edit + diff), `list_dir`,
   `grep` (regex search), `find` (glob), `run_bash`.
-- **Streaming output** — assistant text is printed token-by-token as it arrives (SSE).
+- **Streaming output** — assistant text is printed token-by-token as it arrives (SSE),
+  with live, line-buffered markdown rendering (headers, bold, inline code, code fences).
+- **Tool-result previews** — colorized, truncated output under each tool call (diff
+  coloring for edits).
 - **Reasoning levels** — `off/low/medium/high` mapped to Anthropic thinking budgets
   and OpenAI `reasoning_effort`; thinking output shown dimmed.
 - **Context tracking + auto-compaction** — token usage is read from the API and

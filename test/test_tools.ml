@@ -120,5 +120,18 @@ let () =
   check "system prompt states model identity" (contains prompt "deepseek-chat");
   check "system prompt states provider identity" (contains prompt "OpenAI-compatible");
 
+  (* --- Render --- *)
+  let has hay needle =
+    try ignore (Str.search_forward (Str.regexp_string needle) hay 0); true with Not_found -> false
+  in
+  let styled, _ = Render.render_line ~in_code:false "# Title" in
+  check "render header bold + no hash" (has styled "Title" && not (has styled "#"));
+  let _, in_code = Render.render_line ~in_code:false "```ocaml" in
+  check "render code fence toggles" in_code;
+  check "render inline bold" (has (Render.style_inline "a **b** c") "\027[1m");
+  check "render inline code" (has (Render.style_inline "use `x` here") "\027[36m");
+  let tr = Render.tool_result "-old\n+new\n@@ x" in
+  check "tool_result colors diff" (has tr "\027[31m" && has tr "\027[32m");
+
   Printf.printf "\n%s\n" (if !failures = 0 then "All tests passed." else "FAILURES present.");
   exit (if !failures = 0 then 0 else 1)
