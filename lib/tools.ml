@@ -240,19 +240,28 @@ let list_dir =
 
 (* --- run_bash --- *)
 
+(* Prefix that enforces a 5-minute timeout, if a timeout binary is available. *)
+let timeout_prefix =
+  lazy
+    (if Sys.command "command -v timeout >/dev/null 2>&1" = 0 then "timeout 300 "
+     else if Sys.command "command -v gtimeout >/dev/null 2>&1" = 0 then "gtimeout 300 "
+     else "")
+
 let run_bash =
   { name = "run_bash";
     description =
       "Run a bash command in the current working directory and return its combined \
        stdout and stderr. Use for building, testing, searching, and inspecting the \
-       project.";
+       project. Long-running commands are killed after 5 minutes.";
     parameters =
       params ~props:[ ("command", strprop "The bash command to execute.") ] ~required:[ "command" ];
     execute =
       (fun input ->
         let command = str_field input "command" in
-        (* Redirect stderr into stdout so the model sees everything. *)
-        let ic = Unix.open_process_in (Printf.sprintf "%s 2>&1" command) in
+        (* Wrap with timeout to prevent indefinite hangs — but only if a timeout
+           binary exists (macOS has neither by default; coreutils ships gtimeout). *)
+        let wrapped = Printf.sprintf "%ssh -c %s 2>&1" (Lazy.force timeout_prefix) (Filename.quote command) in
+        let ic = Unix.open_process_in wrapped in
         let buf = Buffer.create 4096 in
         (try
            while true do
@@ -260,13 +269,15 @@ let run_bash =
            done
          with End_of_file -> ());
         let status = Unix.close_process_in ic in
-        let code =
+        let code, out =
           match status with
-          | Unix.WEXITED c -> c
-          | Unix.WSIGNALED s -> 128 + s
-          | Unix.WSTOPPED s -> 128 + s
+          | Unix.WEXITED 124 ->
+            (* timeout exits 124 when the command is killed. *)
+            (124, Buffer.contents buf ^ "\n[Error: command timed out after 5 minutes]")
+          | Unix.WEXITED c -> (c, Buffer.contents buf)
+          | Unix.WSIGNALED s -> (128 + s, Buffer.contents buf)
+          | Unix.WSTOPPED s -> (128 + s, Buffer.contents buf)
         in
-        let out = Buffer.contents buf in
         Printf.sprintf "(exit %d)\n%s" code out) }
 
 (* --- grep: regex search across files --- *)

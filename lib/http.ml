@@ -45,28 +45,30 @@ let post_json ~url ~(headers : string list) (body : Yojson.Safe.t) : Yojson.Safe
    delivered to [on_line] for the caller to detect. *)
 let post_stream ~url ~(headers : string list) ~(on_line : string -> unit) (body : Yojson.Safe.t) : unit =
   let tmp = Filename.temp_file "agent_req" ".json" in
-  let oc = open_out tmp in
-  Yojson.Safe.to_channel oc body;
-  close_out oc;
-  let header_args =
-    headers
-    |> List.map (fun h -> Printf.sprintf "-H %s" (Filename.quote h))
-    |> String.concat " "
-  in
-  let cmd =
-    Printf.sprintf "curl -sS -N --no-buffer %s %s --data-binary @%s"
-      (Filename.quote url) header_args (Filename.quote tmp)
-  in
-  let ic = Unix.open_process_in cmd in
-  (try
-     while true do
-       on_line (input_line ic)
-     done
-   with End_of_file -> ());
-  let status = Unix.close_process_in ic in
-  Sys.remove tmp;
-  match status with
-  | Unix.WEXITED 0 -> ()
-  | Unix.WEXITED c -> raise (Http_error (Printf.sprintf "curl exited %d" c))
-  | Unix.WSIGNALED s | Unix.WSTOPPED s ->
-    raise (Http_error (Printf.sprintf "curl killed by signal %d" s))
+  Fun.protect
+    ~finally:(fun () -> (try Sys.remove tmp with Sys_error _ -> ()))
+    (fun () ->
+      let oc = open_out tmp in
+      Yojson.Safe.to_channel oc body;
+      close_out oc;
+      let header_args =
+        headers
+        |> List.map (fun h -> Printf.sprintf "-H %s" (Filename.quote h))
+        |> String.concat " "
+      in
+      let cmd =
+        Printf.sprintf "curl -sS -N --no-buffer %s %s --data-binary @%s"
+          (Filename.quote url) header_args (Filename.quote tmp)
+      in
+      let ic = Unix.open_process_in cmd in
+      (try
+         while true do
+           on_line (input_line ic)
+         done
+       with End_of_file -> ());
+      let status = Unix.close_process_in ic in
+      match status with
+      | Unix.WEXITED 0 -> ()
+      | Unix.WEXITED c -> raise (Http_error (Printf.sprintf "curl exited %d" c))
+      | Unix.WSIGNALED s | Unix.WSTOPPED s ->
+        raise (Http_error (Printf.sprintf "curl killed by signal %d" s)))

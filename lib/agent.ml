@@ -327,30 +327,33 @@ and run_tool t id name input : Llm.content =
   Llm.Tool_result { id; content = result }
 
 and step t : string =
-  let streamed = ref false in
-  let on_text s =
-    streamed := true;
-    t.fe.text_delta s
+  let rec loop () =
+    let streamed = ref false in
+    let on_text s =
+      streamed := true;
+      t.fe.text_delta s
+    in
+    let blocks, usage = Llm.complete t.cfg ~system:t.system ~on_text ~tools_enabled:t.tools_enabled t.turns in
+    if usage.Llm.input_tokens > 0 then t.last_input_tokens <- usage.Llm.input_tokens;
+    if usage.Llm.output_tokens > 0 then t.last_output_tokens <- usage.Llm.output_tokens;
+    if !streamed then t.fe.text_done ();
+    List.iter (function Llm.Thinking { text; _ } -> t.fe.thinking text | _ -> ()) blocks;
+    add t { Llm.role = Assistant; content = blocks };
+    let texts = List.filter_map (function Llm.Text s -> Some s | _ -> None) blocks in
+    let tool_results =
+      List.filter_map
+        (function
+          | Llm.Tool_use { id; name; input } -> Some (run_tool t id name input)
+          | _ -> None)
+        blocks
+    in
+    if tool_results <> [] then begin
+      add t { Llm.role = User; content = tool_results };
+      loop ()
+    end
+    else String.concat "\n" texts
   in
-  let blocks, usage = Llm.complete t.cfg ~system:t.system ~on_text ~tools_enabled:t.tools_enabled t.turns in
-  if usage.Llm.input_tokens > 0 then t.last_input_tokens <- usage.Llm.input_tokens;
-  if usage.Llm.output_tokens > 0 then t.last_output_tokens <- usage.Llm.output_tokens;
-  if !streamed then t.fe.text_done ();
-  List.iter (function Llm.Thinking { text; _ } -> t.fe.thinking text | _ -> ()) blocks;
-  add t { Llm.role = Assistant; content = blocks };
-  let texts = List.filter_map (function Llm.Text s -> Some s | _ -> None) blocks in
-  let tool_results =
-    List.filter_map
-      (function
-        | Llm.Tool_use { id; name; input } -> Some (run_tool t id name input)
-        | _ -> None)
-      blocks
-  in
-  if tool_results <> [] then begin
-    add t { Llm.role = User; content = tool_results };
-    step t
-  end
-  else String.concat "\n" texts
+  loop ()
 
 and send t (user_input : string) : string =
   if should_compact t then begin
