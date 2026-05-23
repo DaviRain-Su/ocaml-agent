@@ -76,7 +76,8 @@ larger agents. Detection priority (first key found wins):
 |-------------------|---------------------------------|---------------------------------------------------|--------------------------|
 | `anthropic`/`claude` | `ANTHROPIC_API_KEY`          | `https://api.anthropic.com`                       | `claude-opus-4-7`        |
 | `deepseek`        | `DEEPSEEK_API_KEY`              | `https://api.deepseek.com`                        | `deepseek-chat`          |
-| `moonshot`/`kimi` | `MOONSHOT_API_KEY` / `KIMI_API_KEY` | `https://api.moonshot.cn/v1`                 | `kimi-k2-0905-preview`   |
+| `kimi`/`kimi-coding`/`kfc` | `KIMI_API_KEY`         | `https://api.kimi.com/coding` (Anthropic protocol)| `kimi-for-coding`        |
+| `moonshot`        | `MOONSHOT_API_KEY`              | `https://api.moonshot.cn/v1`                      | `kimi-k2-0905-preview`   |
 | `openai`          | `OPENAI_API_KEY`                | `https://api.openai.com/v1`                       | `gpt-4o`                 |
 | `openrouter`      | `OPENROUTER_API_KEY`            | `https://openrouter.ai/api/v1`                    | `openai/gpt-4o`          |
 | `groq`            | `GROQ_API_KEY`                  | `https://api.groq.com/openai/v1`                  | `llama-3.3-70b-versatile`|

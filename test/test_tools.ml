@@ -78,7 +78,8 @@ let () =
       base_url = "https://api.deepseek.com";
       api_key = "sk-test";
       model = "deepseek-chat";
-      max_tokens = 4096 }
+      max_tokens = 4096;
+      extra_headers = [] }
   in
   let prompt = Agent.build_system_prompt cfg in
   check "system prompt injects AGENTS.md" (contains prompt "PROJECT_RULE_XYZ");

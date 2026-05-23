@@ -32,7 +32,8 @@ type config =
     base_url : string;
     api_key : string;
     model : string;
-    max_tokens : int }
+    max_tokens : int;
+    extra_headers : string list }
 
 let getenv k =
   match Sys.getenv_opt k with Some v when String.trim v <> "" -> Some v | _ -> None
@@ -52,39 +53,35 @@ type known =
     protocol : provider;
     base_url : string;
     env_keys : string list;
-    default_model : string }
+    default_model : string;
+    headers : string list (* extra request headers, e.g. a required User-Agent *) }
+
+let mk ?(headers = []) names protocol base_url env_keys default_model =
+  { names; protocol; base_url; env_keys; default_model; headers }
 
 let registry : known list =
-  [ { names = [ "anthropic"; "claude" ]; protocol = Anthropic;
-      base_url = "https://api.anthropic.com"; env_keys = [ "ANTHROPIC_API_KEY" ];
-      default_model = "claude-opus-4-7" };
-    { names = [ "deepseek" ]; protocol = Openai;
-      base_url = "https://api.deepseek.com"; env_keys = [ "DEEPSEEK_API_KEY" ];
-      default_model = "deepseek-chat" };
-    { names = [ "moonshot"; "kimi" ]; protocol = Openai;
-      base_url = "https://api.moonshot.cn/v1"; env_keys = [ "MOONSHOT_API_KEY"; "KIMI_API_KEY" ];
-      default_model = "kimi-k2-0905-preview" };
-    { names = [ "openai" ]; protocol = Openai;
-      base_url = "https://api.openai.com/v1"; env_keys = [ "OPENAI_API_KEY" ];
-      default_model = "gpt-4o" };
-    { names = [ "openrouter" ]; protocol = Openai;
-      base_url = "https://openrouter.ai/api/v1"; env_keys = [ "OPENROUTER_API_KEY" ];
-      default_model = "openai/gpt-4o" };
-    { names = [ "groq" ]; protocol = Openai;
-      base_url = "https://api.groq.com/openai/v1"; env_keys = [ "GROQ_API_KEY" ];
-      default_model = "llama-3.3-70b-versatile" };
-    { names = [ "xai"; "grok" ]; protocol = Openai;
-      base_url = "https://api.x.ai/v1"; env_keys = [ "XAI_API_KEY" ];
-      default_model = "grok-2-latest" };
-    { names = [ "mistral" ]; protocol = Openai;
-      base_url = "https://api.mistral.ai/v1"; env_keys = [ "MISTRAL_API_KEY" ];
-      default_model = "mistral-large-latest" };
-    { names = [ "zai"; "zhipu"; "glm" ]; protocol = Openai;
-      base_url = "https://api.z.ai/api/paas/v4"; env_keys = [ "ZAI_API_KEY"; "ZHIPU_API_KEY" ];
-      default_model = "glm-4.6" };
-    { names = [ "gemini"; "google" ]; protocol = Openai;
-      base_url = "https://generativelanguage.googleapis.com/v1beta/openai";
-      env_keys = [ "GEMINI_API_KEY"; "GOOGLE_API_KEY" ]; default_model = "gemini-2.0-flash" } ]
+  [ mk [ "anthropic"; "claude" ] Anthropic "https://api.anthropic.com" [ "ANTHROPIC_API_KEY" ]
+      "claude-opus-4-7";
+    mk [ "deepseek" ] Openai "https://api.deepseek.com" [ "DEEPSEEK_API_KEY" ] "deepseek-chat";
+    (* Kimi For Coding subscription: dedicated Anthropic-protocol endpoint,
+       keyed by KIMI_API_KEY, requires the Kimi CLI User-Agent. *)
+    mk [ "kimi"; "kimi-coding"; "kfc" ] Anthropic "https://api.kimi.com/coding" [ "KIMI_API_KEY" ]
+      "kimi-for-coding" ~headers:[ "User-Agent: KimiCLI/1.5" ];
+    (* Moonshot general API (different product, different key). *)
+    mk [ "moonshot" ] Openai "https://api.moonshot.cn/v1" [ "MOONSHOT_API_KEY" ]
+      "kimi-k2-0905-preview";
+    mk [ "openai" ] Openai "https://api.openai.com/v1" [ "OPENAI_API_KEY" ] "gpt-4o";
+    mk [ "openrouter" ] Openai "https://openrouter.ai/api/v1" [ "OPENROUTER_API_KEY" ]
+      "openai/gpt-4o";
+    mk [ "groq" ] Openai "https://api.groq.com/openai/v1" [ "GROQ_API_KEY" ]
+      "llama-3.3-70b-versatile";
+    mk [ "xai"; "grok" ] Openai "https://api.x.ai/v1" [ "XAI_API_KEY" ] "grok-2-latest";
+    mk [ "mistral" ] Openai "https://api.mistral.ai/v1" [ "MISTRAL_API_KEY" ]
+      "mistral-large-latest";
+    mk [ "zai"; "zhipu"; "glm" ] Openai "https://api.z.ai/api/paas/v4"
+      [ "ZAI_API_KEY"; "ZHIPU_API_KEY" ] "glm-4.6";
+    mk [ "gemini"; "google" ] Openai "https://generativelanguage.googleapis.com/v1beta/openai"
+      [ "GEMINI_API_KEY"; "GOOGLE_API_KEY" ] "gemini-2.0-flash" ]
 
 let find_known name =
   let n = String.lowercase_ascii name in
@@ -112,11 +109,12 @@ let config () : config =
       | Some k -> `Known k
       | None -> if getenv "AGENT_API_KEY" <> None then `Generic Openai else `Generic Anthropic)
   in
-  let provider, default_base, key_envs, default_model =
+  let provider, default_base, key_envs, default_model, extra_headers =
     match chosen with
-    | `Known k -> (k.protocol, k.base_url, k.env_keys, Some k.default_model)
-    | `Generic Anthropic -> (Anthropic, "https://api.anthropic.com", [ "ANTHROPIC_API_KEY" ], Some "claude-opus-4-7")
-    | `Generic Openai -> (Openai, "https://api.openai.com/v1", [ "OPENAI_API_KEY" ], None)
+    | `Known k -> (k.protocol, k.base_url, k.env_keys, Some k.default_model, k.headers)
+    | `Generic Anthropic ->
+      (Anthropic, "https://api.anthropic.com", [ "ANTHROPIC_API_KEY" ], Some "claude-opus-4-7", [])
+    | `Generic Openai -> (Openai, "https://api.openai.com/v1", [ "OPENAI_API_KEY" ], None, [])
   in
   let base_url = getenv_or "AGENT_BASE_URL" default_base in
   let api_key =
@@ -140,7 +138,7 @@ let config () : config =
       | Some m -> m
       | None -> raise (Config_error "AGENT_MODEL must be set for a generic openai endpoint"))
   in
-  { provider; base_url; api_key; model; max_tokens }
+  { provider; base_url; api_key; model; max_tokens; extra_headers }
 
 let describe cfg =
   let p = match cfg.provider with Anthropic -> "anthropic" | Openai -> "openai" in
@@ -227,6 +225,7 @@ let anthropic_complete cfg ~system ~on_text turns : content list =
     [ "content-type: application/json";
       "x-api-key: " ^ cfg.api_key;
       "anthropic-version: 2023-06-01" ]
+    @ cfg.extra_headers
   in
   (* index -> builder, plus ordered output as blocks complete. *)
   let builders : (int, builder) Hashtbl.t = Hashtbl.create 8 in
@@ -345,7 +344,7 @@ let openai_complete cfg ~system ~on_text turns : content list =
   in
   let url = cfg.base_url ^ "/chat/completions" in
   let headers =
-    [ "content-type: application/json"; "Authorization: Bearer " ^ cfg.api_key ]
+    [ "content-type: application/json"; "Authorization: Bearer " ^ cfg.api_key ] @ cfg.extra_headers
   in
   let text = Buffer.create 256 in
   (* tool calls accumulate by streamed index *)
