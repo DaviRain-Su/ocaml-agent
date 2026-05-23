@@ -71,7 +71,9 @@ let style_inline base s =
   flush ();
   match List.rev !segs with [] -> [ (base, "") ] | l -> l
 
-(* Wrap a styled-segment line to width [w], coalescing runs of the same attr. *)
+(* Wrap a styled-segment line to width [w], coalescing runs of the same attr.
+   Embedded newlines start a new display line; tabs expand to two spaces; other
+   control characters are dropped (notty's I.string rejects control chars). *)
 let wrap_segs w segs =
   if w <= 0 then [ segs ]
   else begin
@@ -79,16 +81,31 @@ let wrap_segs w segs =
     let buf = Buffer.create 32 and cur = ref A.empty in
     let flush_run () = if Buffer.length buf > 0 then (line := (!cur, Buffer.contents buf) :: !line; Buffer.clear buf) in
     let newline () = flush_run (); out := List.rev !line :: !out; line := []; col := 0 in
+    let add_str s n = if !col >= w then (newline (); cur := !cur); Buffer.add_string buf s; col := !col + n in
     List.iter
       (fun (a, s) ->
         flush_run ();
         cur := a;
-        List.iter (fun cp -> if !col >= w then (newline (); cur := a); Buffer.add_string buf cp; incr col) (codepoints s))
+        List.iter
+          (fun cp ->
+            if cp = "\n" then newline ()
+            else if String.length cp = 1 && (Char.code cp.[0] < 0x20 || Char.code cp.[0] = 0x7f) then (
+              if cp.[0] = '\t' then add_str "  " 2)
+            else add_str cp 1)
+          (codepoints s))
       segs;
     flush_run ();
     out := List.rev !line :: !out;
     List.rev !out
   end
+
+(* Strip control chars (tabs -> two spaces) from a single line for safe display. *)
+let safe_line s =
+  let b = Buffer.create (String.length s) in
+  String.iter
+    (fun c -> if c = '\t' then Buffer.add_string b "  " else if Char.code c >= 0x20 && Char.code c <> 0x7f then Buffer.add_char b c)
+    s;
+  Buffer.contents b
 
 let prompt_label = "you> "
 
@@ -99,6 +116,7 @@ let redraw ui =
   Fun.protect
     ~finally:(fun () -> Mutex.unlock ui.mtx)
     (fun () ->
+      try
       let w, h = Term.size ui.term in
       let w = max 1 w and h = max 4 h in
       (* Live slash-command completion menu (clamped). *)
@@ -142,7 +160,7 @@ let redraw ui =
           (List.mapi
              (fun i l ->
                let pfx = if i = 0 then I.string A.(fg green) prompt_label else I.string A.empty indent in
-               I.(pfx <|> string A.empty l))
+               I.(pfx <|> string A.empty (safe_line l)))
              in_lines)
       in
       Term.image ui.term I.(body <-> status <-> menu_img <-> sep <-> prompt);
@@ -152,7 +170,8 @@ let redraw ui =
         (fun i ch ->
           if i < ui.cursor then if ch = '\n' then (incr crow; ccol := 0) else if not (is_cont ch) then incr ccol)
         ui.input;
-      Term.cursor ui.term (Some (String.length prompt_label + !ccol, h - in_rows + !crow)))
+      Term.cursor ui.term (Some (String.length prompt_label + !ccol, h - in_rows + !crow))
+      with _ -> ())
 
 (* Styled segments for one streamed assistant line, tracking code-fence state. *)
 let asst_segs ui line =

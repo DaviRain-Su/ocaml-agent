@@ -92,7 +92,7 @@ type frontend =
     tool_call : string -> string -> unit; (* tool name, input preview *)
     tool_result : string -> unit; (* tool result text *)
     notice : string -> unit; (* status line, e.g. compaction *)
-    confirm_bash : string -> approval (* approve a bash command *) }
+    confirm_bash : string -> approval (* approve a command-capable tool *) }
 
 let stdout_frontend () : frontend =
   let r = ref None in
@@ -106,7 +106,7 @@ let stdout_frontend () : frontend =
     confirm_bash =
       (fun command ->
         if not (Unix.isatty Unix.stdin) then begin
-          Printf.printf "%s run_bash denied (no TTY to approve): %s\n%!" (yellow "\xe2\x9c\x97") command;
+          Printf.printf "%s command denied (no TTY to approve): %s\n%!" (yellow "\xe2\x9c\x97") command;
           Deny
         end
         else begin
@@ -143,6 +143,7 @@ type t =
     compact_threshold : float; (* fraction of the window that triggers compaction *)
     mutable auto_compact : bool;
     depth : int; (* sub-agent nesting depth; 0 for the top-level agent *)
+    max_tool_rounds : int;
     mutable fe : frontend;
     mutable last_input_tokens : int;
     mutable last_output_tokens : int }
@@ -169,6 +170,7 @@ let create ?session ?(initial_turns = []) ?(tools_enabled = true) ?(depth = 0) ?
     compact_threshold = env_float "AGENT_COMPACT_THRESHOLD" 0.75;
     auto_compact;
     depth;
+    max_tool_rounds = max 1 (env_int "AGENT_MAX_TOOL_ROUNDS" 20);
     fe = (match frontend with Some f -> f | None -> stdout_frontend ());
     last_input_tokens = 0;
     last_output_tokens = 0 }
@@ -180,8 +182,12 @@ let set_config t cfg =
   t.cfg <- cfg;
   t.system <- build_system_prompt cfg
 
-(* Clear the in-memory conversation (does not truncate the session file). *)
-let reset t = t.turns <- []
+(* Clear the active conversation and persist that empty state when a session is open. *)
+let reset t =
+  t.turns <- [];
+  t.last_input_tokens <- 0;
+  t.last_output_tokens <- 0;
+  Option.iter (fun s -> Session.save_all s []) t.session
 
 let config t = t.cfg
 let turn_count t = List.length t.turns
@@ -212,15 +218,20 @@ let add t turn =
   t.turns <- t.turns @ [ turn ];
   Option.iter (fun s -> Session.append s turn) t.session
 
-(* Only run_bash is gated. Returns true if the call may proceed. *)
+let approval_text name input =
+  if name = "run_bash" then
+    match input with `Assoc l -> ( match List.assoc_opt "command" l with Some (`String c) -> c | _ -> "") | _ -> ""
+  else Printf.sprintf "%s %s" name (Yojson.Safe.to_string input)
+
+(* Command-capable tools are gated. Returns true if the call may proceed. *)
 let approve t name input =
-  if name <> "run_bash" then true
+  let requires_approval =
+    match Tools.find name with Some tool -> tool.Tools.requires_approval | None -> false
+  in
+  if not requires_approval then true
   else if t.auto_approve then true
   else begin
-    let command =
-      match input with `Assoc l -> ( match List.assoc_opt "command" l with Some (`String c) -> c | _ -> "") | _ -> ""
-    in
-    match t.fe.confirm_bash command with
+    match t.fe.confirm_bash (approval_text name input) with
     | Approve_always ->
       t.auto_approve <- true;
       true
@@ -336,7 +347,13 @@ and run_tool t id name input : Llm.content =
   Llm.Tool_result { id; content = result }
 
 and step t : string =
-  let rec loop () =
+  let limit_message () =
+    Printf.sprintf "Error: stopped after %d tool round%s to avoid an infinite loop."
+      t.max_tool_rounds (if t.max_tool_rounds = 1 then "" else "s")
+  in
+  let rec loop rounds =
+    if rounds >= t.max_tool_rounds then limit_message ()
+    else
     let streamed = ref false in
     let on_text s =
       streamed := true;
@@ -358,11 +375,11 @@ and step t : string =
     in
     if tool_results <> [] then begin
       add t { Llm.role = User; content = tool_results };
-      loop ()
+      loop (rounds + 1)
     end
     else String.concat "\n" texts
   in
-  loop ()
+  loop 0
 
 and send t (user_input : string) : string =
   if should_compact t then begin

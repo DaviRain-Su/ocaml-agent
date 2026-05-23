@@ -10,6 +10,7 @@ type tool =
   { name : string;
     description : string;
     parameters : Yojson.Safe.t; (* JSON Schema object for the tool's input *)
+    requires_approval : bool;
     execute : Yojson.Safe.t -> string }
 
 (* --- helpers --- *)
@@ -34,6 +35,8 @@ let str_field obj key = obj |> member key |> to_string
 
 let opt_str_field obj key =
   match obj |> member key with `String s -> Some s | _ -> None
+
+let command_timeout_s = 300
 
 (* Directories never descended into during recursive search. *)
 let skip_dirs = [ ".git"; "_build"; "node_modules"; ".hg"; ".svn"; "dist"; "target"; ".venv" ]
@@ -107,6 +110,7 @@ let read_file =
   { name = "read_file";
     description = "Read the full contents of a file at the given relative or absolute path.";
     parameters = params ~props:[ ("path", strprop "Path to the file to read.") ] ~required:[ "path" ];
+    requires_approval = false;
     execute =
       (fun input ->
         let path = str_field input "path" in
@@ -126,6 +130,7 @@ let write_file =
           [ ("path", strprop "Path to the file to write.");
             ("content", strprop "The full content to write to the file.") ]
         ~required:[ "path"; "content" ];
+    requires_approval = false;
     execute =
       (fun input ->
         let path = str_field input "path" in
@@ -178,6 +183,7 @@ let edit_file =
                               ("new_str", strprop "Replacement text.") ] );
                         ("required", `List [ `String "old_str"; `String "new_str" ]) ] ) ] ) ]
         ~required:[ "path" ];
+    requires_approval = false;
     execute =
       (fun input ->
         let path = str_field input "path" in
@@ -223,6 +229,7 @@ let list_dir =
       params
         ~props:[ ("path", strprop "Directory path. Defaults to the current directory if omitted.") ]
         ~required:[];
+    requires_approval = false;
     execute =
       (fun input ->
         let path = match opt_str_field input "path" with Some p -> p | None -> "." in
@@ -238,14 +245,102 @@ let list_dir =
           if lines = [] then "(empty)" else String.concat "\n" lines
         with Sys_error e -> "Error: " ^ e) }
 
-(* --- run_bash --- *)
+(* --- subprocess runner --- *)
 
-(* Prefix that enforces a 5-minute timeout, if a timeout binary is available. *)
-let timeout_prefix =
-  lazy
-    (if Sys.command "command -v timeout >/dev/null 2>&1" = 0 then "timeout 300 "
-     else if Sys.command "command -v gtimeout >/dev/null 2>&1" = 0 then "gtimeout 300 "
-     else "")
+let close_noerr fd = try Unix.close fd with Unix.Unix_error _ -> ()
+
+let write_temp_stdin content =
+  let path = Filename.temp_file "agent_stdin" ".json" in
+  let oc = open_out_bin path in
+  Fun.protect
+    ~finally:(fun () -> close_out_noerr oc)
+    (fun () -> output_string oc content);
+  path
+
+let run_process ?stdin_data ?(timeout_s = command_timeout_s) command =
+  let stdin_path = ref None in
+  let stdin_fd =
+    match stdin_data with
+    | None -> Unix.stdin
+    | Some content ->
+      let path = write_temp_stdin content in
+      stdin_path := Some path;
+      Unix.openfile path [ Unix.O_RDONLY ] 0
+  in
+  let rd, wr = Unix.pipe () in
+  let pid =
+    try Unix.create_process "/bin/sh" [| "sh"; "-c"; command |] stdin_fd wr wr
+    with e ->
+      if stdin_fd <> Unix.stdin then close_noerr stdin_fd;
+      close_noerr rd;
+      close_noerr wr;
+      Option.iter (fun p -> try Sys.remove p with Sys_error _ -> ()) !stdin_path;
+      raise e
+  in
+  if stdin_fd <> Unix.stdin then close_noerr stdin_fd;
+  close_noerr wr;
+  Unix.set_nonblock rd;
+  let buf = Buffer.create 4096 in
+  let bytes = Bytes.create 4096 in
+  let rec drain () =
+    match Unix.read rd bytes 0 (Bytes.length bytes) with
+    | 0 -> ()
+    | n ->
+      Buffer.add_subbytes buf bytes 0 n;
+      drain ()
+    | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) -> ()
+    | exception Unix.Unix_error (Unix.EINTR, _, _) -> drain ()
+  in
+  let deadline = Unix.gettimeofday () +. float_of_int timeout_s in
+  let timed_out = ref false in
+  let status = ref None in
+  let rec wait_loop () =
+    drain ();
+    (match Unix.waitpid [ Unix.WNOHANG ] pid with
+     | 0, _ -> ()
+     | _, s -> status := Some s
+     | exception Unix.Unix_error (Unix.EINTR, _, _) -> ());
+    match !status with
+    | Some _ -> ()
+    | None ->
+      let now = Unix.gettimeofday () in
+      if now >= deadline then begin
+        timed_out := true;
+        (try Unix.kill pid Sys.sigkill with Unix.Unix_error _ -> ());
+        (match Unix.waitpid [] pid with
+         | _, s -> status := Some s
+         | exception Unix.Unix_error _ -> status := Some (Unix.WEXITED 124));
+        drain ()
+      end
+      else begin
+        let timeout = min 0.1 (deadline -. now) in
+        ignore (Unix.select [ rd ] [] [] timeout);
+        wait_loop ()
+      end
+  in
+  Fun.protect
+    ~finally:(fun () ->
+      close_noerr rd;
+      Option.iter (fun p -> try Sys.remove p with Sys_error _ -> ()) !stdin_path)
+    (fun () ->
+      wait_loop ();
+      let out =
+        Buffer.contents buf
+        ^
+        if !timed_out then "\n[Error: command timed out after 5 minutes]" else ""
+      in
+      let code =
+        if !timed_out then 124
+        else
+          match !status with
+          | Some (Unix.WEXITED c) -> c
+          | Some (Unix.WSIGNALED s) -> 128 + s
+          | Some (Unix.WSTOPPED s) -> 128 + s
+          | None -> 1
+      in
+      (code, out))
+
+(* --- run_bash --- *)
 
 let run_bash =
   { name = "run_bash";
@@ -255,29 +350,11 @@ let run_bash =
        project. Long-running commands are killed after 5 minutes.";
     parameters =
       params ~props:[ ("command", strprop "The bash command to execute.") ] ~required:[ "command" ];
+    requires_approval = true;
     execute =
       (fun input ->
         let command = str_field input "command" in
-        (* Wrap with timeout to prevent indefinite hangs — but only if a timeout
-           binary exists (macOS has neither by default; coreutils ships gtimeout). *)
-        let wrapped = Printf.sprintf "%ssh -c %s 2>&1" (Lazy.force timeout_prefix) (Filename.quote command) in
-        let ic = Unix.open_process_in wrapped in
-        let buf = Buffer.create 4096 in
-        (try
-           while true do
-             Buffer.add_channel buf ic 4096
-           done
-         with End_of_file -> ());
-        let status = Unix.close_process_in ic in
-        let code, out =
-          match status with
-          | Unix.WEXITED 124 ->
-            (* timeout exits 124 when the command is killed. *)
-            (124, Buffer.contents buf ^ "\n[Error: command timed out after 5 minutes]")
-          | Unix.WEXITED c -> (c, Buffer.contents buf)
-          | Unix.WSIGNALED s -> (128 + s, Buffer.contents buf)
-          | Unix.WSTOPPED s -> (128 + s, Buffer.contents buf)
-        in
+        let code, out = run_process command in
         Printf.sprintf "(exit %d)\n%s" code out) }
 
 (* --- grep: regex search across files --- *)
@@ -297,6 +374,7 @@ let grep =
             ("path", strprop "File or directory to search. Defaults to the current directory.");
             ("include", strprop "Optional filename glob to restrict which files are searched, e.g. \"*.ml\".") ]
         ~required:[ "pattern" ];
+    requires_approval = false;
     execute =
       (fun input ->
         let pattern = str_field input "pattern" in
@@ -365,6 +443,7 @@ let find =
           [ ("pattern", strprop "Glob pattern, e.g. \"*.ml\" or \"lib/**/*.mli\".");
             ("path", strprop "Directory to search under. Defaults to the current directory.") ]
         ~required:[ "pattern" ];
+    requires_approval = false;
     execute =
       (fun input ->
         let pattern = str_field input "pattern" in
@@ -399,18 +478,25 @@ let task =
        multi-step work you want to isolate.";
     parameters =
       params ~props:[ ("prompt", strprop "The full, self-contained task for the sub-agent.") ] ~required:[ "prompt" ];
+    requires_approval = false;
     (* Intercepted by the agent loop; never actually called. *)
     execute = (fun _ -> "Error: task tool must be handled by the agent") }
 
 (* --- registry (extensible at startup) --- *)
 
 let builtin = [ read_file; write_file; edit_file; list_dir; grep; find; run_bash; task ]
+let builtin_names = List.map (fun t -> t.name) builtin
+let is_builtin_name name = List.mem name builtin_names
 
 let registry = ref builtin
 
-(* Register an extension-provided tool. Replaces any existing tool of the same name. *)
+(* Register an extension-provided tool. Built-in names are reserved. *)
 let register (t : tool) =
-  registry := List.filter (fun x -> x.name <> t.name) !registry @ [ t ]
+  if is_builtin_name t.name then false
+  else begin
+    registry := List.filter (fun x -> x.name <> t.name) !registry @ [ t ];
+    true
+  end
 
 let all () = !registry
 

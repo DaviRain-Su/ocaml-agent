@@ -21,21 +21,8 @@ let manifest_path () =
 
 (* Run [command], feeding [input] on stdin, returning combined stdout+stderr. *)
 let run_command command input =
-  let ic, oc = Unix.open_process (command ^ " 2>&1") in
-  output_string oc input;
-  close_out oc;
-  let buf = Buffer.create 1024 in
-  (try
-     while true do
-       Buffer.add_channel buf ic 4096
-     done
-   with End_of_file -> ());
-  let status = Unix.close_process (ic, oc) in
-  let body = Buffer.contents buf in
-  match status with
-  | Unix.WEXITED 0 -> body
-  | Unix.WEXITED c -> Printf.sprintf "(exit %d)\n%s" c body
-  | Unix.WSIGNALED s | Unix.WSTOPPED s -> Printf.sprintf "(killed by signal %d)\n%s" s body
+  let code, body = Tools.run_process ~stdin_data:input command in
+  if code = 0 then body else Printf.sprintf "(exit %d)\n%s" code body
 
 let tool_of_json (j : Yojson.Safe.t) : Tools.tool option =
   match (j |> member "name", j |> member "command") with
@@ -50,6 +37,7 @@ let tool_of_json (j : Yojson.Safe.t) : Tools.tool option =
       { Tools.name;
         description;
         parameters;
+        requires_approval = true;
         execute = (fun input -> try run_command command (Yojson.Safe.to_string input) with
         | Sys.Break as e -> raise e
         | e -> "Error: " ^ Printexc.to_string e) }
@@ -70,6 +58,6 @@ let load () : string list =
       List.filter_map
         (fun j ->
           match tool_of_json j with
-          | Some t -> Tools.register t; Some t.Tools.name
-          | None -> None)
+          | Some t when Tools.register t -> Some t.Tools.name
+          | Some _ | None -> None)
         entries
