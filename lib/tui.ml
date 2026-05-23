@@ -24,6 +24,7 @@ type ui =
     mutable turn_start : float;
     mutable asst_in_code : bool; (* inside a ``` fence while streaming assistant text *)
     mutable menu_sel : int; (* selected row in the live slash-command menu *)
+    mutable pasting : bool; (* inside a bracketed-paste sequence *)
     mtx : Mutex.t }
 
 let menu_max = 8
@@ -446,16 +447,20 @@ let kill_word ui =
   ui.cursor <- !i
 
 let run agent =
-  let term = Term.create () in
+  (* Mouse capture is off by default so the terminal's own text selection/copy
+     keeps working; set AGENT_TUI_MOUSE=1 to re-enable wheel scrolling. *)
+  let mouse = match Sys.getenv_opt "AGENT_TUI_MOUSE" with Some ("1" | "true" | "yes") -> true | _ -> false in
+  let term = Term.create ~mouse () in
   let ui =
     { term; lines = []; input = ""; cursor = 0; history = []; hist_idx = -1; buf = Buffer.create 256;
       agent; running = true; scroll = 0; turn_active = false; quiet = false; spin = 0; turn_start = 0.;
-      asst_in_code = false; menu_sel = 0; mtx = Mutex.create () }
+      asst_in_code = false; menu_sel = 0; pasting = false; mtx = Mutex.create () }
   in
   Agent.set_frontend agent (make_frontend ui);
   push ui A.(fg green ++ st bold) "OCaml Code Agent";
   push ui A.(fg (gray 12)) (Llm.describe (Agent.config agent));
-  push ui A.(fg (gray 12)) "Type your request. /help for commands, Ctrl-P to pick a model, Ctrl-D to quit.";
+  push ui A.(fg (gray 12)) "Type your request. /help for commands, Ctrl-P model picker, Ctrl-D to quit.";
+  push ui A.(fg (gray 12)) "Select text with the mouse to copy; PgUp/PgDn to scroll.";
   push ui A.empty "";
   let km = Keymap.load () in
   redraw ui;
@@ -492,7 +497,9 @@ let run agent =
   while ui.running do
     match Term.event term with
     | `Key (`Tab, _) -> if menu_items () <> [] then (accept_menu (); redraw ui) else complete ui
-    | `Key (`Enter, mods) when List.mem `Meta mods -> insert ui "\n"; ui.menu_sel <- 0; redraw ui
+    | `Paste `Start -> ui.pasting <- true
+    | `Paste `End -> ui.pasting <- false; redraw ui
+    | `Key (`Enter, mods) when ui.pasting || List.mem `Meta mods -> insert ui "\n"; ui.menu_sel <- 0; redraw ui
     | `Key (`Enter, _) ->
       if menu_items () <> [] && not (List.mem ui.input Complete.commands) then (accept_menu (); redraw ui)
       else submit ui
