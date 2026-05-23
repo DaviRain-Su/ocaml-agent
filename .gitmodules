@@ -1,3 +1,6 @@
 [submodule "reference/pi"]
 	path = reference/pi
 	url = https://github.com/earendil-works/pi.git
+[submodule "scaffold/veldt"]
+	path = scaffold/veldt
+	url = https://github.com/hdresearch/veldt.git

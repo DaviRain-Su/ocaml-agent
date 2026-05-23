@@ -18,6 +18,7 @@ lib/tools.ml       Tool schemas + executors (read/write/edit/list/grep/find/bash
 lib/render.ml      Streaming markdown renderer + colorized tool-result previews
 lib/skills.ml      Skill discovery (markdown + frontmatter) and prompt injection
 lib/models.ml      Best-effort model catalog (context windows) for --list-models
+lib/mentions.ml    @file expansion for prompts and CLI file arguments
 lib/extensions.ml  Load custom subprocess-backed tools from a JSON manifest
 lib/commands.ml    Session slash-command implementations (frontend-agnostic)
 lib/session.ml     Session manager: dir, headers, list, resume, clone, export
@@ -48,6 +49,11 @@ test/test_tools.ml Offline tests (tools, sessions, render, skills, models, exten
   older turns are summarized automatically as the context window fills.
 - **Project-context injection** — `AGENTS.md` / `CLAUDE.md` in the cwd, plus the
   working directory, date, and the live provider/model identity, folded into the system prompt.
+- **File references** — pass `@path` on the CLI or mention `@path` in a prompt to
+  include readable file contents as `<file>` blocks.
+- **Pi subagent CLI compatibility** — supports `--no-session`, `--tools/-t`, and
+  file-backed `--append-system-prompt`, which are the flags Pi's subagent
+  extension uses when spawning isolated child agents.
 - **Tool approval** — tools auto-run by default (like pi). Set `AGENT_AUTO_APPROVE=0`
   (or toggle in `/settings`) to be prompted `[y]es / [N]o / [a]lways` before `run_bash`
   and subprocess extension tools; with approval on and no TTY, those tools are denied.
@@ -65,9 +71,10 @@ test/test_tools.ml Offline tests (tools, sessions, render, skills, models, exten
 - **Interactive commands**: `/model`, `/think`, `/compact`, `/session`, `/sessions`,
   `/resume`, `/name`, `/clone`, `/export`, `/copy`, `/new`, `/help`.
 - **Embeddable**: `--mode rpc` exposes a JSON-RPC (JSONL) interface over stdin/stdout;
-  `--mode json` prints a single structured result; `--list-models [pat]`; `--export`.
-- **CLI flags**: `-m/--model`, `--provider`, `--thinking`, `-c`, `-p`, `--no-tools`,
-  `--no-tui`, `--mode`, `--list-models`, `--export`.
+  `--mode json` prints Pi-style JSONL turn/tool events; `--list-models [pat]`; `--export`.
+- **CLI flags**: `-m/--model`, `--provider`, `--thinking`, `--system-prompt`,
+  `--append-system-prompt`, `-c`, `-p`, `--no-session`, `--tools/-t`,
+  `--no-tools`, `--no-tui`, `--mode`, `--list-models`, `--export`.
 
 The only dependencies are `yojson`, `unix`, and `str`. HTTP is done by shelling
 out to `curl`, so there's no TLS/HTTP stack to install.
@@ -94,6 +101,7 @@ provider doesn't touch `agent.ml`.
 | `edit_file`  | Replace the first exact occurrence of a substring   |
 | `list_dir`   | List a directory's entries                          |
 | `run_bash`   | Run a shell command, capturing stdout+stderr+exit   |
+| `task`       | Delegate a prompt to an isolated nested agent       |
 
 ## Build
 
@@ -139,6 +147,8 @@ Overrides (all optional):
 | `AGENT_MAX_TOOL_ROUNDS` | Max tool-use rounds per turn before stopping (default `20`) |
 | `AGENT_SESSION_FILE` | JSONL file to persist to / resume from                       |
 | `AGENT_THINKING`     | Reasoning level: `off` (default), `low`, `medium`, `high`    |
+| `AGENT_SYSTEM_PROMPT` | Replace the default system prompt; if it names a file, that file is read |
+| `AGENT_APPEND_SYSTEM_PROMPT` | Append extra system prompt text; if it names a file, that file is read |
 | `AGENT_CONTEXT_WINDOW` | Context window in tokens for compaction (default `128000`) |
 | `AGENT_AUTO_COMPACT` | Auto-summarize older turns near the limit (default on)       |
 | `AGENT_COMPACT_THRESHOLD` | Fraction of the window that triggers compaction (default `0.75`) |
@@ -172,6 +182,13 @@ dune exec ocaml-agent
 
 # One-shot, then exit:
 dune exec ocaml-agent -- "add a function to lib/foo.ml that reverses a list"
+
+# One-shot with file references:
+dune exec ocaml-agent -- -p @README.md "summarize this project"
+
+# Pi-style isolated child invocation (used by subagent-style wrappers):
+dune exec ocaml-agent -- --mode json -p --no-session --tools read,grep,find,ls \
+  --append-system-prompt reviewer.md "Task: review the current diff"
 ```
 
 In the REPL, type your request at the `you>` prompt. Tool calls are shown as

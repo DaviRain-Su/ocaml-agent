@@ -34,7 +34,7 @@ let spinner = [| "\xe2\xa0\x8b"; "\xe2\xa0\x99"; "\xe2\xa0\xb9"; "\xe2\xa0\xb8";
 
 (* --- UTF-8 cursor helpers --- *)
 let is_cont c = Char.code c land 0xC0 = 0x80
-let prev_cp_start s i = let j = ref (i - 1) in while !j > 0 && is_cont s.[!j] do decr j done; !j
+let prev_cp_start s i = let j = ref (i - 1) in while !j > 0 && is_cont s.[!j] do decr j done; max 0 !j
 let next_cp_start s i = let n = String.length s in let j = ref (i + 1) in while !j < n && is_cont s.[!j] do incr j done; !j
 let cp_count s upto = let c = ref 0 in String.iteri (fun i ch -> if i < upto && not (is_cont ch) then incr c) s; !c
 
@@ -250,17 +250,19 @@ let push_result ui res =
 
 let rec confirm ui cmd =
   ui.quiet <- true;
-  let r =
-    match Term.event ui.term with
-    | `Key (`ASCII ('y' | 'Y'), _) -> Agent.Approve_once
-    | `Key (`ASCII ('a' | 'A'), _) -> Agent.Approve_always
-    | `Key (`ASCII ('n' | 'N'), _) | `Key (`Enter, _) | `Key (`Escape, _) -> Agent.Deny
-    | `Key (`ASCII 'c', [ `Ctrl ]) -> Agent.Deny
-    | `Resize _ -> redraw ui; confirm ui cmd
-    | _ -> confirm ui cmd
-  in
-  ui.quiet <- false;
-  r
+  try
+    let r =
+      match Term.event ui.term with
+      | `Key (`ASCII ('y' | 'Y'), _) -> Agent.Approve_once
+      | `Key (`ASCII ('a' | 'A'), _) -> Agent.Approve_always
+      | `Key (`ASCII ('n' | 'N'), _) | `Key (`Enter, _) | `Key (`Escape, _) -> Agent.Deny
+      | `Key (`ASCII 'c', [ `Ctrl ]) -> Agent.Deny
+      | `Resize _ -> redraw ui; confirm ui cmd
+      | _ -> confirm ui cmd
+    in
+    ui.quiet <- false;
+    r
+  with e -> ui.quiet <- false; raise e
 
 let make_frontend ui : Agent.frontend =
   { text_delta = (fun s -> feed_assistant ui s);
@@ -284,41 +286,43 @@ let select ui ~title (items : string list) : int option =
   if items = [] then None
   else begin
     ui.quiet <- true;
-    let n = List.length items in
-    let sel = ref 0 in
-    let render () =
-      Mutex.lock ui.mtx;
-      Fun.protect
-        ~finally:(fun () -> Mutex.unlock ui.mtx)
-        (fun () ->
-          let w, h = Term.size ui.term in
-          let header = I.string A.(fg green ++ st bold) title in
-          let rows =
-            List.mapi
-              (fun i it ->
-                let a = if i = !sel then A.(fg black ++ bg cyan) else A.empty in
-                I.string a (Printf.sprintf " %s %s " (if i = !sel then ">" else " ") it))
-              items
-          in
-          let hint = I.string A.(fg (gray 8)) "↑/↓ select · Enter confirm · Esc cancel" in
-          let img = I.vsnap ~align:`Top (max 4 h) (I.vcat ((header :: rows) @ [ I.void 1 1; hint ])) in
-          Term.image ui.term (I.hsnap ~align:`Left (max 1 w) img);
-          Term.cursor ui.term None)
-    in
-    render ();
-    let rec loop () =
-      match Term.event ui.term with
-      | `Key (`Arrow `Up, _) -> sel := (if !sel = 0 then n - 1 else !sel - 1); render (); loop ()
-      | `Key (`Arrow `Down, _) -> sel := (!sel + 1) mod n; render (); loop ()
-      | `Key (`Enter, _) -> Some !sel
-      | `Key (`Escape, _) | `Key (`ASCII 'c', [ `Ctrl ]) -> None
-      | `Resize _ -> render (); loop ()
-      | _ -> loop ()
-    in
-    let r = loop () in
-    ui.quiet <- false;
-    redraw ui;
-    r
+    try
+      let n = List.length items in
+      let sel = ref 0 in
+      let render () =
+        Mutex.lock ui.mtx;
+        Fun.protect
+          ~finally:(fun () -> Mutex.unlock ui.mtx)
+          (fun () ->
+            let w, h = Term.size ui.term in
+            let header = I.string A.(fg green ++ st bold) title in
+            let rows =
+              List.mapi
+                (fun i it ->
+                  let a = if i = !sel then A.(fg black ++ bg cyan) else A.empty in
+                  I.string a (Printf.sprintf " %s %s " (if i = !sel then ">" else " ") it))
+                items
+            in
+            let hint = I.string A.(fg (gray 8)) "↑/↓ select · Enter confirm · Esc cancel" in
+            let img = I.vsnap ~align:`Top (max 4 h) (I.vcat ((header :: rows) @ [ I.void 1 1; hint ])) in
+            Term.image ui.term (I.hsnap ~align:`Left (max 1 w) img);
+            Term.cursor ui.term None)
+      in
+      render ();
+      let rec loop () =
+        match Term.event ui.term with
+        | `Key (`Arrow `Up, _) -> sel := (if !sel = 0 then n - 1 else !sel - 1); render (); loop ()
+        | `Key (`Arrow `Down, _) -> sel := (!sel + 1) mod n; render (); loop ()
+        | `Key (`Enter, _) -> Some !sel
+        | `Key (`Escape, _) | `Key (`ASCII 'c', [ `Ctrl ]) -> None
+        | `Resize _ -> render (); loop ()
+        | _ -> loop ()
+      in
+      let r = loop () in
+      ui.quiet <- false;
+      redraw ui;
+      r
+    with e -> ui.quiet <- false; redraw ui; raise e
   end
 
 (* Pick a model from the catalog, limited to providers whose key is present. *)
@@ -558,35 +562,37 @@ let run agent =
         | _ -> ())
       else (insert ui (String.make 1 c); ui.menu_sel <- 0; redraw ui)
   in
-  while ui.running do
-    match Term.event term with
-    | `Key (`Tab, _) -> if menu_items () <> [] then (accept_menu (); redraw ui) else complete ui
-    | `Paste `Start -> ui.pasting <- true
-    | `Paste `End -> ui.pasting <- false; redraw ui
-    | `Key (`Enter, mods) when ui.pasting || List.mem `Meta mods -> insert ui "\n"; ui.menu_sel <- 0; redraw ui
-    | `Key (`Enter, _) ->
-      if menu_items () <> [] && not (List.mem ui.input Complete.commands) then (accept_menu (); redraw ui)
-      else submit ui
-    | `Key (`Backspace, _) -> backspace ui; ui.menu_sel <- 0; redraw ui
-    | `Key (`Escape, _) -> ui.input <- ""; ui.cursor <- 0; ui.menu_sel <- 0; redraw ui
-    | `Key (`Page `Up, _) -> page ui 1
-    | `Key (`Page `Down, _) -> page ui (-1)
-    | `Key (`Home, _) -> ui.cursor <- 0; redraw ui
-    | `Key (`End, _) -> ui.scroll <- 0; ui.cursor <- String.length ui.input; redraw ui
-    | `Key (`Arrow `Left, _) -> if ui.cursor > 0 then ui.cursor <- prev_cp_start ui.input ui.cursor; redraw ui
-    | `Key (`Arrow `Right, _) -> if ui.cursor < String.length ui.input then ui.cursor <- next_cp_start ui.input ui.cursor; redraw ui
-    | `Key (`Arrow `Up, _) ->
-      if menu_items () <> [] then (ui.menu_sel <- max 0 (ui.menu_sel - 1); redraw ui) else (recall ui 1; redraw ui)
-    | `Key (`Arrow `Down, _) ->
-      let n = List.length (menu_items ()) in
-      if n > 0 then (ui.menu_sel <- min (n - 1) (ui.menu_sel + 1); redraw ui) else (recall ui (-1); redraw ui)
-    | `Mouse (`Press (`Scroll `Up), _, _) -> page ui 1
-    | `Mouse (`Press (`Scroll `Down), _, _) -> page ui (-1)
-    | `Key (`ASCII c, mods) -> on_ascii c mods
-    | `Key (`Uchar u, mods) when not (List.mem `Ctrl mods) ->
-      let b = Buffer.create 4 in Buffer.add_utf_8_uchar b u; insert ui (Buffer.contents b); ui.menu_sel <- 0; redraw ui
-    | `Resize _ -> redraw ui
-    | `End -> ui.running <- false
-    | _ -> ()
-  done;
-  Term.release term
+  Fun.protect
+    ~finally:(fun () -> try Term.release term with _ -> ())
+    (fun () ->
+      while ui.running do
+        match Term.event term with
+        | `Key (`Tab, _) -> if menu_items () <> [] then (accept_menu (); redraw ui) else complete ui
+        | `Paste `Start -> ui.pasting <- true
+        | `Paste `End -> ui.pasting <- false; redraw ui
+        | `Key (`Enter, mods) when ui.pasting || List.mem `Meta mods -> insert ui "\n"; ui.menu_sel <- 0; redraw ui
+        | `Key (`Enter, _) ->
+          if menu_items () <> [] && not (List.mem ui.input Complete.commands) then (accept_menu (); redraw ui)
+          else submit ui
+        | `Key (`Backspace, _) -> backspace ui; ui.menu_sel <- 0; redraw ui
+        | `Key (`Escape, _) -> ui.input <- ""; ui.cursor <- 0; ui.menu_sel <- 0; redraw ui
+        | `Key (`Page `Up, _) -> page ui 1
+        | `Key (`Page `Down, _) -> page ui (-1)
+        | `Key (`Home, _) -> ui.cursor <- 0; redraw ui
+        | `Key (`End, _) -> ui.scroll <- 0; ui.cursor <- String.length ui.input; redraw ui
+        | `Key (`Arrow `Left, _) -> if ui.cursor > 0 then ui.cursor <- prev_cp_start ui.input ui.cursor; redraw ui
+        | `Key (`Arrow `Right, _) -> if ui.cursor < String.length ui.input then ui.cursor <- next_cp_start ui.input ui.cursor; redraw ui
+        | `Key (`Arrow `Up, _) ->
+          if menu_items () <> [] then (ui.menu_sel <- max 0 (ui.menu_sel - 1); redraw ui) else (recall ui 1; redraw ui)
+        | `Key (`Arrow `Down, _) ->
+          let n = List.length (menu_items ()) in
+          if n > 0 then (ui.menu_sel <- min (n - 1) (ui.menu_sel + 1); redraw ui) else (recall ui (-1); redraw ui)
+        | `Mouse (`Press (`Scroll `Up), _, _) -> page ui 1
+        | `Mouse (`Press (`Scroll `Down), _, _) -> page ui (-1)
+        | `Key (`ASCII c, mods) -> on_ascii c mods
+        | `Key (`Uchar u, mods) when not (List.mem `Ctrl mods) ->
+          let b = Buffer.create 4 in Buffer.add_utf_8_uchar b u; insert ui (Buffer.contents b); ui.menu_sel <- 0; redraw ui
+        | `Resize _ -> redraw ui
+        | `End -> ui.running <- false
+        | _ -> ()
+      done)

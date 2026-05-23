@@ -485,13 +485,15 @@ let find =
 
 let veldt_scaffold_dir =
   let exe_dir = Filename.dirname Sys.executable_name in
-  (* Try to find the scaffold relative to the executable, then relative to cwd *)
+  (* Try to find the scaffold relative to the executable, then relative to cwd.
+     The Veldt submodule is at scaffold/veldt/ and its OCaml scaffold is at
+     scaffold/veldt/scaffold/ocaml/ *)
   let candidates =
-    [ Filename.concat exe_dir "../scaffold/veldt";
-      Filename.concat exe_dir "../../scaffold/veldt";
-      Filename.concat exe_dir "../../../scaffold/veldt";
-      "scaffold/veldt";
-      Filename.concat (Sys.getcwd ()) "scaffold/veldt" ]
+    [ Filename.concat exe_dir "../scaffold/veldt/scaffold/ocaml";
+      Filename.concat exe_dir "../../scaffold/veldt/scaffold/ocaml";
+      Filename.concat exe_dir "../../../scaffold/veldt/scaffold/ocaml";
+      "scaffold/veldt/scaffold/ocaml";
+      Filename.concat (Sys.getcwd ()) "scaffold/veldt/scaffold/ocaml" ]
   in
   match List.find_opt Sys.file_exists candidates with
   | Some d -> if Filename.is_relative d then Filename.concat (Sys.getcwd ()) d else d
@@ -586,7 +588,6 @@ let task =
 
 let builtin = [ read_file; write_file; edit_file; list_dir; grep; find; run_bash; veldt_init; task ]
 let builtin_names = List.map (fun t -> t.name) builtin
-let is_builtin_name name = List.mem name builtin_names
 
 let canonical_name name =
   match String.lowercase_ascii (String.trim name) with
@@ -603,6 +604,8 @@ let canonical_names names =
   |> List.map canonical_name
   |> List.filter (fun s -> s <> "")
   |> List.sort_uniq String.compare
+
+let is_builtin_name name = List.mem (canonical_name name) builtin_names
 
 let registry = ref builtin
 
@@ -641,4 +644,6 @@ let openai_schema t =
 let anthropic_schemas ?allowed () = List.map anthropic_schema (all ?allowed ())
 let openai_schemas ?allowed () = List.map openai_schema (all ?allowed ())
 
-let find name = List.find_opt (fun t -> t.name = name) !registry
+let find name =
+  let name = canonical_name name in
+  List.find_opt (fun t -> t.name = name) !registry

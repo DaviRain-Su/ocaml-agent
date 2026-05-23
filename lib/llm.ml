@@ -284,14 +284,15 @@ let anthropic_complete cfg ~system ~on_text ~tools_enabled ?tool_names turns : c
   let budget = thinking_budget cfg.thinking in
   (* Extended thinking requires max_tokens strictly greater than the budget. *)
   let max_tokens = if budget > 0 && cfg.max_tokens <= budget then budget + 4096 else cfg.max_tokens in
+  let tool_schemas = if tools_enabled then Tools.anthropic_schemas ?allowed:tool_names () else [] in
   let body =
     `Assoc
       ([ ("model", `String cfg.model);
          ("max_tokens", `Int max_tokens);
          ("system", `String system);
          ("stream", `Bool true);
-         ("tools", `List (if tools_enabled then Tools.anthropic_schemas ?allowed:tool_names () else []));
          ("messages", `List (anthropic_messages turns)) ]
+      @ (if tool_schemas = [] then [] else [ ("tools", `List tool_schemas) ])
       @
       if budget > 0 then
         [ ("thinking", `Assoc [ ("type", `String "enabled"); ("budget_tokens", `Int budget) ]) ]
@@ -429,6 +430,7 @@ let openai_messages ~system turns =
   sys_msg :: List.concat_map of_turn turns
 
 let openai_complete cfg ~system ~on_text ~tools_enabled ?tool_names turns : content list * usage =
+  let tool_schemas = if tools_enabled then Tools.openai_schemas ?allowed:tool_names () else [] in
   let body =
     `Assoc
       ([ ("model", `String cfg.model);
@@ -438,8 +440,8 @@ let openai_complete cfg ~system ~on_text ~tools_enabled ?tool_names turns : cont
          ("messages", `List (openai_messages ~system turns)) ]
       @ (if cfg.thinking <> "off" then [ ("reasoning_effort", `String cfg.thinking) ] else [])
       @
-      if tools_enabled then
-        [ ("tools", `List (Tools.openai_schemas ?allowed:tool_names ())); ("tool_choice", `String "auto") ]
+      if tool_schemas <> [] then
+        [ ("tools", `List tool_schemas); ("tool_choice", `String "auto") ]
       else [])
   in
   let url = cfg.base_url ^ "/chat/completions" in

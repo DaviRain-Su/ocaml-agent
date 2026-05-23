@@ -163,6 +163,22 @@ let () =
   check "system prompt includes date" (contains prompt "Current date:");
   check "system prompt states model identity" (contains prompt "deepseek-v4-pro");
   check "system prompt states provider identity" (contains prompt "OpenAI-compatible");
+  let _ = run "write_file" {|{"path":"base_prompt.md","content":"CUSTOM_BASE_PROMPT"}|} in
+  let _ = run "write_file" {|{"path":"append_prompt.md","content":"APPENDED_PROMPT"}|} in
+  Unix.putenv "AGENT_SYSTEM_PROMPT" "base_prompt.md";
+  Unix.putenv "AGENT_APPEND_SYSTEM_PROMPT" (Agent.join_prompt_inputs [ "append_prompt.md"; "INLINE_APPEND" ]);
+  let custom_prompt = Agent.build_system_prompt cfg in
+  check "system prompt can be replaced from file" (contains custom_prompt "CUSTOM_BASE_PROMPT");
+  check "system prompt append reads files and text"
+    (contains custom_prompt "APPENDED_PROMPT" && contains custom_prompt "INLINE_APPEND");
+  Unix.putenv "AGENT_SYSTEM_PROMPT" "";
+  Unix.putenv "AGENT_APPEND_SYSTEM_PROMPT" "";
+
+  (* --- @file mentions / CLI file args --- *)
+  let _ = run "write_file" {|{"path":"mention.txt","content":"MENTION_BODY"}|} in
+  let expanded = Mentions.expand "Review @mention.txt." in
+  check "mentions expand file references" (contains expanded "<file name=\"mention.txt\">" && contains expanded "MENTION_BODY");
+  check "file args expand as file blocks" (contains (Mentions.expand_file_args [ "mention.txt" ]) "MENTION_BODY");
 
   (* --- Render --- *)
   let has hay needle =
@@ -195,6 +211,10 @@ let () =
 
   (* --- task tool registered --- *)
   check "task tool present" (Tools.find "task" <> None);
+  check "Pi tool aliases resolve" (Tools.find "bash" <> None && Tools.canonical_name "ls" = "list_dir");
+  let readonly_schema = Yojson.Safe.to_string (`List (Tools.openai_schemas ~allowed:[ "read"; "grep"; "ls" ] ())) in
+  check "tool schemas honor Pi allowlist aliases"
+    (contains0 readonly_schema "read_file" && contains0 readonly_schema "list_dir" && not (contains0 readonly_schema "write_file"));
 
   (* --- model catalog --- *)
   check "model context window lookup" (Models.context_window "deepseek-v4-pro" = Some 1000000);
