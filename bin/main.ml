@@ -113,6 +113,7 @@ type opts =
     mutable cont : bool;
     mutable print : bool;
     mutable no_tools : bool;
+    mutable no_tui : bool;
     mutable prompt : string list }
 
 let usage =
@@ -124,13 +125,14 @@ let usage =
   \  -c, --continue           resume the last session (.ocaml-agent/session.jsonl)\n\
   \  -p, --print              one-shot mode; prompt from args or stdin\n\
   \      --no-tools           disable all tools for this run\n\
+  \      --no-tui             use the plain line REPL instead of the full-screen TUI\n\
   \  -h, --help               show this help\n\n\
    With no prompt and a TTY, starts an interactive REPL.\n\
    Configuration is otherwise via AGENT_* / *_API_KEY env vars (see README)."
 
 (* Parse flags up to the first positional token; the rest is the prompt. *)
 let parse_args argv =
-  let o = { model = None; provider = None; thinking = None; cont = false; print = false; no_tools = false; prompt = [] } in
+  let o = { model = None; provider = None; thinking = None; cont = false; print = false; no_tools = false; no_tui = false; prompt = [] } in
   let rec go = function
     | [] -> ()
     | "--" :: rest -> o.prompt <- rest
@@ -140,6 +142,7 @@ let parse_args argv =
     | ("-c" | "--continue") :: rest -> o.cont <- true; go rest
     | ("-p" | "--print") :: rest -> o.print <- true; go rest
     | ("--no-tools" | "-nt") :: rest -> o.no_tools <- true; go rest
+    | "--no-tui" :: rest -> o.no_tui <- true; go rest
     | ("-h" | "--help") :: _ -> print_string (usage ^ "\n"); exit 0
     | arg :: _ as all ->
       if String.length arg > 0 && arg.[0] = '-' then begin
@@ -190,4 +193,5 @@ let () =
       if prompt <> "" then run_turn agent prompt
     in
     if o.print || o.prompt <> [] then one_shot ()
+    else if (not o.no_tui) && Unix.isatty Unix.stdin && Unix.isatty Unix.stdout then Tui.run agent
     else interactive agent cfg (List.length initial_turns)

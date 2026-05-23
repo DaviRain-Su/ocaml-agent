@@ -27,6 +27,9 @@ test/test_tools.ml Offline smoke tests (tools, turn JSON, session, prompt, rende
 - **Multi-provider** via env vars (Anthropic / OpenAI / DeepSeek / Kimi / any compatible endpoint).
 - **Tools**: `read_file`, `write_file`, `edit_file` (multi-edit + diff), `list_dir`,
   `grep` (regex search), `find` (glob), `run_bash`.
+- **Full-screen TUI** (notty) — scrollback viewport above a live input editor, with
+  history, slash commands, and a bash-approval modal; streams updates in place.
+  Falls back to the plain line REPL when not a TTY or with `--no-tui`.
 - **Streaming output** — assistant text is printed token-by-token as it arrives (SSE),
   with live, line-buffered markdown rendering (headers, bold, inline code, code fences).
 - **Tool-result previews** — colorized, truncated output under each tool call (diff

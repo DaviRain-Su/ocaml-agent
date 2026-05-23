@@ -71,6 +71,57 @@ let env_int name default =
 let env_float name default =
   match Sys.getenv_opt name with Some s -> ( try float_of_string s with _ -> default) | None -> default
 
+(* ANSI colors (used by the plain stdout frontend). *)
+let dim s = "\027[2m" ^ s ^ "\027[0m"
+let cyan s = "\027[36m" ^ s ^ "\027[0m"
+let green s = "\027[32m" ^ s ^ "\027[0m"
+let yellow s = "\027[33m" ^ s ^ "\027[0m"
+
+let preview_input input =
+  let s = Yojson.Safe.to_string input in
+  if String.length s > 120 then String.sub s 0 117 ^ "..." else s
+
+type approval = Approve_once | Approve_always | Deny
+
+(* The agent emits all user-visible output through a frontend, so the plain REPL
+   and a full TUI can render the same events differently. *)
+type frontend =
+  { text_delta : string -> unit; (* streamed assistant text chunk *)
+    text_done : unit -> unit; (* end of a streamed assistant message *)
+    thinking : string -> unit; (* a completed thinking block *)
+    tool_call : string -> string -> unit; (* tool name, input preview *)
+    tool_result : string -> unit; (* tool result text *)
+    notice : string -> unit; (* status line, e.g. compaction *)
+    confirm_bash : string -> approval (* approve a bash command *) }
+
+let stdout_frontend () : frontend =
+  let r = ref None in
+  let cur () = match !r with Some x -> x | None -> let x = Render.create () in r := Some x; x in
+  { text_delta = (fun s -> Render.feed (cur ()) s);
+    text_done = (fun () -> (match !r with Some x -> Render.finish x | None -> ()); r := None);
+    thinking = (fun s -> if String.trim s <> "" then Printf.printf "%s\n%!" (dim ("\xf0\x9f\x92\xad " ^ s)));
+    tool_call = (fun name prev -> Printf.printf "%s %s %s\n%!" (cyan "\xe2\x9a\x99") (green name) (dim prev));
+    tool_result = (fun res -> if String.trim res <> "" then Printf.printf "%s\n%!" (Render.tool_result res));
+    notice = (fun s -> Printf.printf "%s\n%!" (dim s));
+    confirm_bash =
+      (fun command ->
+        if not (Unix.isatty Unix.stdin) then begin
+          Printf.printf "%s run_bash denied (no TTY to approve): %s\n%!" (yellow "\xe2\x9c\x97") command;
+          Deny
+        end
+        else begin
+          Printf.printf "%s run %s\n  %s\n%s " (yellow "\xe2\x9a\xa0") (green "bash") command
+            (dim "approve? [y]es / [N]o / [a]lways:");
+          flush stdout;
+          match In_channel.input_line stdin with
+          | None -> Deny
+          | Some ans -> (
+            match String.lowercase_ascii (String.trim ans) with
+            | "a" | "always" -> Approve_always
+            | "y" | "yes" -> Approve_once
+            | _ -> Deny)
+        end) }
+
 type t =
   { mutable cfg : Llm.config;
     mutable system : string;
@@ -82,12 +133,13 @@ type t =
     compact_threshold : float; (* fraction of the window that triggers compaction *)
     auto_compact : bool;
     depth : int; (* sub-agent nesting depth; 0 for the top-level agent *)
+    mutable fe : frontend;
     mutable last_input_tokens : int;
     mutable last_output_tokens : int }
 
 let max_depth = 2
 
-let create ?session ?(initial_turns = []) ?(tools_enabled = true) ?(depth = 0) cfg =
+let create ?session ?(initial_turns = []) ?(tools_enabled = true) ?(depth = 0) ?frontend cfg =
   let auto_approve =
     match Sys.getenv_opt "AGENT_AUTO_APPROVE" with Some v -> truthy v | None -> false
   in
@@ -104,8 +156,11 @@ let create ?session ?(initial_turns = []) ?(tools_enabled = true) ?(depth = 0) c
     compact_threshold = env_float "AGENT_COMPACT_THRESHOLD" 0.75;
     auto_compact;
     depth;
+    fe = (match frontend with Some f -> f | None -> stdout_frontend ());
     last_input_tokens = 0;
     last_output_tokens = 0 }
+
+let set_frontend t fe = t.fe <- fe
 
 (* Swap the active model/provider; rebuilds the system prompt's identity line. *)
 let set_config t cfg =
@@ -126,16 +181,6 @@ let add t turn =
   t.turns <- t.turns @ [ turn ];
   Option.iter (fun s -> Session.append s turn) t.session
 
-(* ANSI colors. *)
-let dim s = "\027[2m" ^ s ^ "\027[0m"
-let cyan s = "\027[36m" ^ s ^ "\027[0m"
-let green s = "\027[32m" ^ s ^ "\027[0m"
-let yellow s = "\027[33m" ^ s ^ "\027[0m"
-
-let preview_input input =
-  let s = Yojson.Safe.to_string input in
-  if String.length s > 120 then String.sub s 0 117 ^ "..." else s
-
 (* Only run_bash is gated. Returns true if the call may proceed. *)
 let approve t name input =
   if name <> "run_bash" then true
@@ -144,24 +189,12 @@ let approve t name input =
     let command =
       match input with `Assoc l -> ( match List.assoc_opt "command" l with Some (`String c) -> c | _ -> "") | _ -> ""
     in
-    if not (Unix.isatty Unix.stdin) then begin
-      Printf.printf "%s run_bash denied (no TTY to approve): %s\n%!" (yellow "✗") command;
-      false
-    end
-    else begin
-      Printf.printf "%s run %s\n  %s\n%s "
-        (yellow "⚠") (green "bash") command (dim "approve? [y]es / [N]o / [a]lways:");
-      flush stdout;
-      match In_channel.input_line stdin with
-      | None -> false
-      | Some ans -> (
-        match String.lowercase_ascii (String.trim ans) with
-        | "a" | "always" ->
-          t.auto_approve <- true;
-          true
-        | "y" | "yes" -> true
-        | _ -> false)
-    end
+    match t.fe.confirm_bash command with
+    | Approve_always ->
+      t.auto_approve <- true;
+      true
+    | Approve_once -> true
+    | Deny -> false
   end
 
 (* --- context accounting + compaction --- *)
@@ -254,7 +287,7 @@ let rec run_sub_agent t input =
     end
 
 and run_tool t id name input : Llm.content =
-  Printf.printf "%s %s %s\n%!" (cyan "⚙") (green name) (dim (preview_input input));
+  t.fe.tool_call name (preview_input input);
   let result =
     if name = "task" then run_sub_agent t input
     else if not (approve t name input) then "Error: command not approved by user"
@@ -263,23 +296,20 @@ and run_tool t id name input : Llm.content =
       | Some tool -> ( try tool.execute input with e -> "Error: " ^ Printexc.to_string e)
       | None -> Printf.sprintf "Error: unknown tool %s" name
   in
-  if String.trim result <> "" then Printf.printf "%s\n%!" (Render.tool_result result);
+  t.fe.tool_result result;
   Llm.Tool_result { id; content = result }
 
 and step t : string =
-  let r = Render.create () in
   let streamed = ref false in
   let on_text s =
     streamed := true;
-    Render.feed r s
+    t.fe.text_delta s
   in
   let blocks, usage = Llm.complete t.cfg ~system:t.system ~on_text ~tools_enabled:t.tools_enabled t.turns in
   if usage.Llm.input_tokens > 0 then t.last_input_tokens <- usage.Llm.input_tokens;
   if usage.Llm.output_tokens > 0 then t.last_output_tokens <- usage.Llm.output_tokens;
-  if !streamed then Render.finish r;
-  List.iter
-    (function Llm.Thinking { text; _ } when text <> "" -> Printf.printf "%s\n%!" (dim ("\xf0\x9f\x92\xad " ^ text)) | _ -> ())
-    blocks;
+  if !streamed then t.fe.text_done ();
+  List.iter (function Llm.Thinking { text; _ } -> t.fe.thinking text | _ -> ()) blocks;
   add t { Llm.role = Assistant; content = blocks };
   let texts = List.filter_map (function Llm.Text s -> Some s | _ -> None) blocks in
   let tool_results =
@@ -297,7 +327,7 @@ and step t : string =
 
 and send t (user_input : string) : string =
   if should_compact t then begin
-    Printf.printf "%s\n%!" (dim "Auto-compacting context...");
+    t.fe.notice "Auto-compacting context...";
     ignore (compact t)
   end;
   add t { Llm.role = User; content = [ Llm.Text user_input ] };
