@@ -83,7 +83,7 @@ larger agents. Detection priority (first key found wins):
 | `groq`            | `GROQ_API_KEY`                  | `https://api.groq.com/openai/v1`                  | `llama-3.3-70b-versatile`|
 | `xai`/`grok`      | `XAI_API_KEY`                   | `https://api.x.ai/v1`                             | `grok-2-latest`          |
 | `mistral`         | `MISTRAL_API_KEY`               | `https://api.mistral.ai/v1`                       | `mistral-large-latest`   |
-| `zai`/`zhipu`/`glm`| `ZAI_API_KEY` / `ZHIPU_API_KEY`| `https://api.z.ai/api/paas/v4`                   | `glm-4.6`                |
+| `zai`/`zhipu`/`glm`| `ZAI_API_KEY` / `ZHIPU_API_KEY`| `https://api.z.ai/api/coding/paas/v4`            | `glm-4.6`                |
 | `gemini`/`google` | `GEMINI_API_KEY` / `GOOGLE_API_KEY` | `https://generativelanguage.googleapis.com/v1beta/openai` | `gemini-2.0-flash` |
 
 Model defaults are best-effort and may drift — override with `AGENT_MODEL`.

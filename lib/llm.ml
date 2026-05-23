@@ -78,7 +78,8 @@ let registry : known list =
     mk [ "xai"; "grok" ] Openai "https://api.x.ai/v1" [ "XAI_API_KEY" ] "grok-2-latest";
     mk [ "mistral" ] Openai "https://api.mistral.ai/v1" [ "MISTRAL_API_KEY" ]
       "mistral-large-latest";
-    mk [ "zai"; "zhipu"; "glm" ] Openai "https://api.z.ai/api/paas/v4"
+    (* Z.AI GLM Coding Plan: coding-specific OpenAI-compatible endpoint. *)
+    mk [ "zai"; "zhipu"; "glm" ] Openai "https://api.z.ai/api/coding/paas/v4"
       [ "ZAI_API_KEY"; "ZHIPU_API_KEY" ] "glm-4.6";
     mk [ "gemini"; "google" ] Openai "https://generativelanguage.googleapis.com/v1beta/openai"
       [ "GEMINI_API_KEY"; "GOOGLE_API_KEY" ] "gemini-2.0-flash" ]
