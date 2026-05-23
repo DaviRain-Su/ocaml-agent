@@ -1,0 +1,3 @@
+(library
+ (name agent_lib)
+ (libraries yojson unix str))

@@ -1,0 +1,5 @@
+(executable
+ (name main)
+ (public_name ocaml-agent)
+ (package ocaml_agent)
+ (libraries agent_lib))
