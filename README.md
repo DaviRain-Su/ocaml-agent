@@ -49,8 +49,12 @@ test/test_tools.ml Offline smoke tests (tools, turn JSON, session, prompt, rende
 - **Skills** — markdown files with frontmatter in `.ocaml-agent/skills/` or
   `.claude/skills/` are discovered and listed in the system prompt; the model reads
   a skill's file on demand (prompt-injection model, no separate runtime).
-- **Interactive commands**: `/model`, `/think`, `/compact`, `/session`, `/new`, `/help`.
-- **CLI flags**: `-m/--model`, `--provider`, `--thinking`, `-c`, `-p`, `--no-tools`.
+- **Interactive commands**: `/model`, `/think`, `/compact`, `/session`, `/sessions`,
+  `/resume`, `/name`, `/clone`, `/export`, `/copy`, `/new`, `/help`.
+- **Embeddable**: `--mode rpc` exposes a JSON-RPC (JSONL) interface over stdin/stdout;
+  `--mode json` prints a single structured result; `--list-models [pat]`; `--export`.
+- **CLI flags**: `-m/--model`, `--provider`, `--thinking`, `-c`, `-p`, `--no-tools`,
+  `--no-tui`, `--mode`, `--list-models`, `--export`.
 
 The only dependencies are `yojson`, `unix`, and `str`. HTTP is done by shelling
 out to `curl`, so there's no TLS/HTTP stack to install.

@@ -122,6 +122,16 @@ let stdout_frontend () : frontend =
             | _ -> Deny)
         end) }
 
+(* A frontend that produces no output (used by --mode json). *)
+let null_frontend () : frontend =
+  { text_delta = (fun _ -> ());
+    text_done = (fun () -> ());
+    thinking = (fun _ -> ());
+    tool_call = (fun _ _ -> ());
+    tool_result = (fun _ -> ());
+    notice = (fun _ -> ());
+    confirm_bash = (fun _ -> Deny) }
+
 type t =
   { mutable cfg : Llm.config;
     mutable system : string;
@@ -152,7 +162,10 @@ let create ?session ?(initial_turns = []) ?(tools_enabled = true) ?(depth = 0) ?
     session;
     auto_approve;
     tools_enabled;
-    context_window = env_int "AGENT_CONTEXT_WINDOW" 128000;
+    context_window =
+      (match Sys.getenv_opt "AGENT_CONTEXT_WINDOW" with
+       | Some s -> ( try int_of_string s with _ -> 128000)
+       | None -> Option.value (Models.context_window cfg.model) ~default:128000);
     compact_threshold = env_float "AGENT_COMPACT_THRESHOLD" 0.75;
     auto_compact;
     depth;

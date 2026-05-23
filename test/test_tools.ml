@@ -170,5 +170,11 @@ let () =
   (* --- task tool registered --- *)
   check "task tool present" (Tools.find "task" <> None);
 
+  (* --- model catalog --- *)
+  check "model context window lookup" (Models.context_window "deepseek-chat" = Some 128000);
+  check "model unknown -> None" (Models.context_window "no-such-model" = None);
+  check "model list filters" (List.for_all (fun (e : Models.entry) -> contains0 e.Models.id "glm" || contains0 e.Models.provider "zai") (Models.list ~pat:"zai" ()));
+  check "model list nonempty" (Models.list () <> []);
+
   Printf.printf "\n%s\n" (if !failures = 0 then "All tests passed." else "FAILURES present.");
   exit (if !failures = 0 then 0 else 1)

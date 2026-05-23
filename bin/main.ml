@@ -126,6 +126,9 @@ type opts =
     mutable print : bool;
     mutable no_tools : bool;
     mutable no_tui : bool;
+    mutable mode : string; (* text | json | rpc *)
+    mutable list_models : string option;
+    mutable export : string option;
     mutable prompt : string list }
 
 let usage =
@@ -138,13 +141,16 @@ let usage =
   \  -p, --print              one-shot mode; prompt from args or stdin\n\
   \      --no-tools           disable all tools for this run\n\
   \      --no-tui             use the plain line REPL instead of the full-screen TUI\n\
+  \      --mode <text|json|rpc>  output mode; rpc = JSON-RPC over stdin/stdout\n\
+  \      --list-models [pat]  list known models and exit\n\
+  \      --export <file>      export the (resumed) session to .html/.jsonl and exit\n\
   \  -h, --help               show this help\n\n\
    With no prompt and a TTY, starts an interactive REPL.\n\
    Configuration is otherwise via AGENT_* / *_API_KEY env vars (see README)."
 
 (* Parse flags up to the first positional token; the rest is the prompt. *)
 let parse_args argv =
-  let o = { model = None; provider = None; thinking = None; cont = false; print = false; no_tools = false; no_tui = false; prompt = [] } in
+  let o = { model = None; provider = None; thinking = None; cont = false; print = false; no_tools = false; no_tui = false; mode = "text"; list_models = None; export = None; prompt = [] } in
   let rec go = function
     | [] -> ()
     | "--" :: rest -> o.prompt <- rest
@@ -155,6 +161,13 @@ let parse_args argv =
     | ("-p" | "--print") :: rest -> o.print <- true; go rest
     | ("--no-tools" | "-nt") :: rest -> o.no_tools <- true; go rest
     | "--no-tui" :: rest -> o.no_tui <- true; go rest
+    | "--mode" :: v :: rest -> o.mode <- v; go rest
+    | "--rpc" :: rest -> o.mode <- "rpc"; go rest
+    | "--export" :: v :: rest -> o.export <- Some v; go rest
+    | "--list-models" :: rest -> (
+      match rest with
+      | p :: tl when String.length p = 0 || p.[0] <> '-' -> o.list_models <- Some p; go tl
+      | _ -> o.list_models <- Some ""; go rest)
     | ("-h" | "--help") :: _ -> print_string (usage ^ "\n"); exit 0
     | arg :: _ as all ->
       if String.length arg > 0 && arg.[0] = '-' then begin
@@ -175,9 +188,20 @@ let read_stdin_all () =
    with End_of_file -> ());
   Buffer.contents b
 
+let list_models pat =
+  let entries = Models.list ~pat () in
+  if entries = [] then print_string "(no matching models)\n"
+  else
+    List.iter
+      (fun (e : Models.entry) -> Printf.printf "%-12s %-26s ctx %d\n" e.Models.provider e.Models.id e.Models.context_window)
+      entries
+
 let () =
   let o = parse_args (Array.to_list Sys.argv |> List.tl) in
   Option.iter (fun t -> Unix.putenv "AGENT_THINKING" t) o.thinking;
+  (match o.list_models with
+   | Some pat -> list_models pat; exit 0
+   | None -> ());
   match
     match o.provider with
     | Some p -> Llm.config_for ?model:o.model p
@@ -203,10 +227,29 @@ let () =
         else (Some (Session.create_new ()), []) (* interactive runs are persisted + resumable *)
     in
     let agent = Agent.create ?session ~initial_turns ~tools_enabled:(not o.no_tools) cfg in
-    let one_shot () =
-      let prompt = if o.prompt = [] then String.trim (read_stdin_all ()) else String.concat " " o.prompt in
-      if prompt <> "" then run_turn agent prompt
-    in
-    if one_shot_mode then one_shot ()
-    else if (not o.no_tui) && Unix.isatty Unix.stdin && Unix.isatty Unix.stdout then Tui.run agent
-    else interactive agent cfg (List.length initial_turns)
+    (* --export: dump the (resumed) session and exit. *)
+    (match o.export with
+     | Some path -> print_string (Commands.export agent path ^ "\n"); exit 0
+     | None -> ());
+    let prompt () = if o.prompt = [] then String.trim (read_stdin_all ()) else String.concat " " o.prompt in
+    match o.mode with
+    | "rpc" -> Rpc.run agent
+    | "json" ->
+      Agent.set_frontend agent (Agent.null_frontend ());
+      let p = prompt () in
+      let out =
+        if p = "" then `Assoc [ ("error", `String "no prompt") ]
+        else
+          try
+            let text = Agent.send agent p in
+            let used, window, _ = Agent.usage_info agent in
+            `Assoc
+              [ ("text", `String text);
+                ("usage", `Assoc [ ("context_used", `Int used); ("context_window", `Int window) ]) ]
+          with Llm.Api_error e -> `Assoc [ ("error", `String e) ]
+      in
+      print_string (Yojson.Safe.to_string out ^ "\n")
+    | _ ->
+      if one_shot_mode then (let p = prompt () in if p <> "" then run_turn agent p)
+      else if (not o.no_tui) && Unix.isatty Unix.stdin && Unix.isatty Unix.stdout then Tui.run agent
+      else interactive agent cfg (List.length initial_turns)
