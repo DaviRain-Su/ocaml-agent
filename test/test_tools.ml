@@ -190,5 +190,13 @@ let () =
   check "extension in schemas"
     (contains0 (Yojson.Safe.to_string (`List (Tools.openai_schemas ()))) "echoizer");
 
+  (* --- autocomplete --- *)
+  check "complete common_prefix" (Complete.common_prefix [ "abc"; "abd"; "abx" ] = "ab");
+  check "complete token slash whole" (Complete.token_of "/mo" = (0, "/mo"));
+  check "complete token last word" (Complete.token_of "read foo" = (5, "foo"));
+  check "complete slash command" (List.mem "/model" (Complete.candidates "/mo"));
+  check "complete slash multi" (List.mem "/session" (Complete.candidates "/se") && List.mem "/sessions" (Complete.candidates "/se"));
+  check "complete path token" (List.mem "src/foo.ml" (Complete.candidates "read src/f"));
+
   Printf.printf "\n%s\n" (if !failures = 0 then "All tests passed." else "FAILURES present.");
   exit (if !failures = 0 then 0 else 1)

@@ -22,6 +22,7 @@ type ui =
     mutable quiet : bool; (* suppress spinner redraws (e.g. during a modal) *)
     mutable spin : int;
     mutable turn_start : float;
+    mutable asst_in_code : bool; (* inside a ``` fence while streaming assistant text *)
     mtx : Mutex.t }
 
 let max_lines = 5000
@@ -92,6 +93,16 @@ let redraw ui =
   Term.cursor ui.term (Some (String.length prompt_label + cp_count ui.input ui.cursor, h - 1));
   Mutex.unlock ui.mtx
 
+(* Line-level markdown styling for streamed assistant text, tracking code-fence
+   state across the message. *)
+let asst_attr ui line =
+  let t = String.trim line in
+  let fence = String.length t >= 3 && String.sub t 0 3 = "```" in
+  if fence then (ui.asst_in_code <- not ui.asst_in_code; A.(fg (gray 8)))
+  else if ui.asst_in_code then A.(fg cyan)
+  else if String.length t > 0 && t.[0] = '#' then A.(st bold)
+  else A.empty
+
 (* --- frontend callbacks --- *)
 let feed_assistant ui s =
   Buffer.add_string ui.buf s;
@@ -99,7 +110,7 @@ let feed_assistant ui s =
   let parts = String.split_on_char '\n' content in
   let rec loop = function
     | [ last ] -> Buffer.clear ui.buf; Buffer.add_string ui.buf last
-    | line :: rest -> push ui A.empty line; loop rest
+    | line :: rest -> push ui (asst_attr ui line) line; loop rest
     | [] -> ()
   in
   loop parts;
@@ -107,8 +118,9 @@ let feed_assistant ui s =
 
 let flush_assistant ui =
   let rem = Buffer.contents ui.buf in
-  if rem <> "" then push ui A.empty rem;
+  if rem <> "" then push ui (asst_attr ui rem) rem;
   Buffer.clear ui.buf;
+  ui.asst_in_code <- false;
   redraw ui
 
 let push_result ui res =
@@ -226,6 +238,8 @@ let cmd ui line =
         "/export <file>         export (.html or .jsonl)";
         "/copy                  copy last reply to clipboard";
         "/new                   clear the conversation";
+        "Tab                    complete command / file path";
+        "Ctrl-A/E/U/K/W         line edit (home/end/kill-start/kill-end/kill-word)";
         "PgUp/PgDn or wheel     scroll · End jumps to latest · Ctrl-P model picker";
         "/exit                  quit" ];
     redraw ui
@@ -320,12 +334,36 @@ let page ui delta =
   ui.scroll <- max 0 (ui.scroll + (delta * step));
   redraw ui
 
+(* Tab completion of the current token (slash command or file path). *)
+let complete ui =
+  let start, _ = Complete.token_of ui.input in
+  match Complete.candidates ui.input with
+  | [] -> ()
+  | cands ->
+    let repl = match cands with [ one ] -> one | _ -> Complete.common_prefix cands in
+    if repl <> "" then (ui.input <- String.sub ui.input 0 start ^ repl; ui.cursor <- String.length ui.input);
+    (match cands with _ :: _ :: _ -> push ui A.(fg (gray 10)) (String.concat "   " cands) | _ -> ());
+    redraw ui
+
+let kill_to_start ui =
+  ui.input <- String.sub ui.input ui.cursor (String.length ui.input - ui.cursor);
+  ui.cursor <- 0
+
+let kill_to_end ui = ui.input <- String.sub ui.input 0 ui.cursor
+
+let kill_word ui =
+  let i = ref ui.cursor in
+  while !i > 0 && ui.input.[!i - 1] = ' ' do decr i done;
+  while !i > 0 && ui.input.[!i - 1] <> ' ' do decr i done;
+  ui.input <- String.sub ui.input 0 !i ^ String.sub ui.input ui.cursor (String.length ui.input - ui.cursor);
+  ui.cursor <- !i
+
 let run agent =
   let term = Term.create () in
   let ui =
     { term; lines = []; input = ""; cursor = 0; history = []; hist_idx = -1; buf = Buffer.create 256;
       agent; running = true; scroll = 0; turn_active = false; quiet = false; spin = 0; turn_start = 0.;
-      mtx = Mutex.create () }
+      asst_in_code = false; mtx = Mutex.create () }
   in
   Agent.set_frontend agent (make_frontend ui);
   push ui A.(fg green ++ st bold) "OCaml Code Agent";
@@ -337,6 +375,12 @@ let run agent =
     match Term.event term with
     | `Key (`ASCII 'c', [ `Ctrl ]) | `Key (`ASCII 'd', [ `Ctrl ]) -> ui.running <- false
     | `Key (`ASCII 'p', [ `Ctrl ]) -> model_picker ui
+    | `Key (`Tab, _) -> complete ui
+    | `Key (`ASCII 'a', [ `Ctrl ]) -> ui.cursor <- 0; redraw ui
+    | `Key (`ASCII 'e', [ `Ctrl ]) -> ui.cursor <- String.length ui.input; redraw ui
+    | `Key (`ASCII 'u', [ `Ctrl ]) -> kill_to_start ui; redraw ui
+    | `Key (`ASCII 'k', [ `Ctrl ]) -> kill_to_end ui; redraw ui
+    | `Key (`ASCII 'w', [ `Ctrl ]) -> kill_word ui; redraw ui
     | `Key (`Enter, _) -> submit ui
     | `Key (`Backspace, _) -> backspace ui; redraw ui
     | `Key (`Escape, _) -> ui.input <- ""; ui.cursor <- 0; redraw ui
