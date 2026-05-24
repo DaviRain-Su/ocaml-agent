@@ -733,31 +733,10 @@ let register_ocaml_sdk_response path json =
   register_ocaml_sdk_providers path json;
   register_ocaml_sdk_tools path json
 
-let optional_string name = function
-  | Some value when String.trim value <> "" -> [ (name, `String value) ]
-  | _ -> []
-
-let session_payload ?current_session_file ?current_session_id ?current_session_name ?target_session_file
-    ?source_session_file ?previous_session_file ?session_file ?session_id ?session_name ?entry_id ?position
-    event_type reason =
-  `Assoc
-    ([ ("type", `String event_type); ("reason", `String reason); ("cwd", `String (Sys.getcwd ())) ]
-    @ optional_string "currentSessionFile" current_session_file
-    @ optional_string "currentSessionId" current_session_id
-    @ optional_string "currentSessionName" current_session_name
-    @ optional_string "targetSessionFile" target_session_file
-    @ optional_string "sourceSessionFile" source_session_file
-    @ optional_string "previousSessionFile" previous_session_file
-    @ optional_string "sessionFile" session_file
-    @ optional_string "sessionId" session_id
-    @ optional_string "sessionName" session_name
-    @ optional_string "entryId" entry_id
-    @ optional_string "position" position)
-
 let emit_session_start_for_path ?previous_session_file ?session_file ?session_id ?session_name ?(reason = "startup")
     runtime path =
   let payload =
-    session_payload ?previous_session_file ?session_file ?session_id ?session_name "session_start" reason
+    Extension_event_json.session_payload ?previous_session_file ?session_file ?session_id ?session_name "session_start" reason
   in
   match
     run_extension_bridge runtime path
@@ -785,17 +764,6 @@ let emit_session_start ?previous_session_file ?session_file ?session_id ?session
              @ emit_session_start_for_path ?previous_session_file ?session_file ?session_id ?session_name ~reason runtime path);
   !registered
 
-let json_string_list field json =
-  match json |> member field with
-  | `List xs -> List.filter_map (function `String s when String.trim s <> "" -> Some s | _ -> None) xs
-  | `String s when String.trim s <> "" -> [ s ]
-  | _ -> []
-
-let resource_result json =
-  match json |> member "result" with
-  | `Assoc _ as result -> result
-  | _ -> json
-
 let emit_resources_discover ~reason () =
   discovered_skill_paths := [];
   discovered_prompt_paths := [];
@@ -820,10 +788,10 @@ let emit_resources_discover ~reason () =
            with
            | Error _ -> ()
            | Ok json ->
-             let result = resource_result json in
-             discovered_skill_paths := !discovered_skill_paths @ json_string_list "skillPaths" result;
-             discovered_prompt_paths := !discovered_prompt_paths @ json_string_list "promptPaths" result;
-             discovered_theme_paths := !discovered_theme_paths @ json_string_list "themePaths" result);
+             let result = Extension_event_json.resource_result json in
+             discovered_skill_paths := !discovered_skill_paths @ Extension_event_json.json_string_list "skillPaths" result;
+             discovered_prompt_paths := !discovered_prompt_paths @ Extension_event_json.json_string_list "promptPaths" result;
+             discovered_theme_paths := !discovered_theme_paths @ Extension_event_json.json_string_list "themePaths" result);
   discovered_skill_paths := Config_paths.uniq !discovered_skill_paths;
   discovered_prompt_paths := Config_paths.uniq !discovered_prompt_paths;
   discovered_theme_paths := Config_paths.uniq !discovered_theme_paths
@@ -1320,30 +1288,6 @@ let emit_before_provider_request payload =
            | Error _ -> ());
   !current
 
-let headers_json headers =
-  `Assoc (headers |> List.map (fun (name, value) -> (name, `String value)))
-
-let turn_of_agent_message_json json =
-  match json with
-  | `Assoc fields -> (
-    match List.assoc_opt "role" fields, List.assoc_opt "content" fields with
-    | Some _, Some (`List _) -> Llm.turn_of_json json
-    | Some _, Some (`String text) ->
-      let role =
-        match json |> member "role" with
-        | `String "assistant" -> Llm.Assistant
-        | _ -> Llm.User
-      in
-      { Llm.role; content = [ Llm.Text text ] }
-    | _, Some (`String text) -> { Llm.role = Llm.User; content = [ Llm.Text text ] }
-    | _ -> Llm.turn_of_json json)
-  | _ -> Llm.turn_of_json json
-
-let turns_from_json = function
-  | `List messages -> List.map turn_of_agent_message_json messages
-  | `Assoc _ as message -> [ turn_of_agent_message_json message ]
-  | _ -> []
-
 let emit_notification event payload =
   all_event_targets ()
   |> List.rev
@@ -1355,7 +1299,7 @@ let emit_after_provider_response ~status ~headers =
     (`Assoc
       [ ("type", `String "after_provider_response");
         ("status", `Int status);
-        ("headers", headers_json headers) ])
+        ("headers", Extension_event_json.headers_json headers) ])
 
 type session_before_result =
   | Session_continue
@@ -1430,13 +1374,13 @@ let session_before event payload =
 let emit_session_before_switch ?current_session_file ?current_session_id ?current_session_name ?target_session_file
     ~reason () =
   session_before "session_before_switch"
-    (session_payload ?current_session_file ?current_session_id ?current_session_name ?target_session_file
+    (Extension_event_json.session_payload ?current_session_file ?current_session_id ?current_session_name ?target_session_file
        "session_before_switch" reason)
 
 let emit_session_before_fork ?current_session_file ?current_session_id ?current_session_name ?source_session_file
     ?entry_id ?position ~reason () =
   session_before "session_before_fork"
-    (session_payload ?current_session_file ?current_session_id ?current_session_name ?source_session_file ?entry_id
+    (Extension_event_json.session_payload ?current_session_file ?current_session_id ?current_session_name ?source_session_file ?entry_id
        ?position "session_before_fork" reason)
 
 let emit_session_before_compact ?session_file ?session_id ?session_name ~turn_count () =
@@ -1446,9 +1390,9 @@ let emit_session_before_compact ?session_file ?session_id ?session_name ~turn_co
          ("reason", `String "compact");
          ("cwd", `String (Sys.getcwd ()));
          ("turnCount", `Int turn_count) ]
-      @ optional_string "sessionFile" session_file
-      @ optional_string "sessionId" session_id
-      @ optional_string "sessionName" session_name))
+      @ Extension_event_json.optional_string "sessionFile" session_file
+      @ Extension_event_json.optional_string "sessionId" session_id
+      @ Extension_event_json.optional_string "sessionName" session_name))
 
 let emit_session_before_tree ~target_id ?old_leaf_id ?common_ancestor_id ?label ?custom_instructions
     ?replace_instructions ~user_wants_summary ~entries_to_summarize () =
@@ -1459,8 +1403,8 @@ let emit_session_before_tree ~target_id ?old_leaf_id ?common_ancestor_id ?label 
          ("commonAncestorId", (match common_ancestor_id with Some id -> `String id | None -> `Null));
          ("entriesToSummarize", `List entries_to_summarize);
          ("userWantsSummary", `Bool user_wants_summary) ]
-      @ optional_string "label" label
-      @ optional_string "customInstructions" custom_instructions
+      @ Extension_event_json.optional_string "label" label
+      @ Extension_event_json.optional_string "customInstructions" custom_instructions
       @
       match replace_instructions with
       | Some replace -> [ ("replaceInstructions", `Bool replace) ]
@@ -1551,7 +1495,7 @@ let emit_session_tree ?old_leaf_id ?new_leaf_id ?summary_entry ?from_extension (
 
 let emit_session_shutdown ?session_file ?session_id ?session_name ~reason () =
   emit_notification "session_shutdown"
-    (session_payload ?session_file ?session_id ?session_name "session_shutdown" reason)
+    (Extension_event_json.session_payload ?session_file ?session_id ?session_name "session_shutdown" reason)
 
 let emit_session_compact ?session_file ?session_id ?session_name ~before_turn_count ~after_turn_count () =
   emit_notification "session_compact"
@@ -1561,36 +1505,9 @@ let emit_session_compact ?session_file ?session_id ?session_name ~before_turn_co
          ("cwd", `String (Sys.getcwd ()));
          ("beforeTurnCount", `Int before_turn_count);
          ("afterTurnCount", `Int after_turn_count) ]
-      @ optional_string "sessionFile" session_file
-      @ optional_string "sessionId" session_id
-      @ optional_string "sessionName" session_name))
-
-let provider_name = function Llm.Anthropic -> "anthropic" | Llm.Openai -> "openai"
-
-let inferred_model_provider (cfg : Llm.config) =
-  let matches (known : Llm.known) =
-    known.protocol = cfg.provider && known.base_url = cfg.base_url && known.runtime = cfg.runtime
-    && (known.default_model = cfg.model || cfg.runtime <> None || cfg.base_url <> "")
-  in
-  match List.find_opt matches (Llm.registry ()) with
-  | Some { names = n :: _; _ } -> n
-  | Some _ | None -> provider_name cfg.provider
-
-let model_payload ?provider (cfg : Llm.config) =
-  let provider = Option.value provider ~default:(inferred_model_provider cfg) in
-  `Assoc
-    ([ ("provider", `String provider);
-       ("id", `String cfg.model);
-       ("model", `String cfg.model);
-       ("name", `String cfg.model);
-       ("wireProtocol", `String (provider_name cfg.provider)) ]
-    @
-    match Models.context_window cfg.model with
-    | Some window -> [ ("contextWindow", `Int window) ]
-    | None -> [])
-
-let same_model (left : Llm.config) (right : Llm.config) =
-  inferred_model_provider left = inferred_model_provider right && left.model = right.model
+      @ Extension_event_json.optional_string "sessionFile" session_file
+      @ Extension_event_json.optional_string "sessionId" session_id
+      @ Extension_event_json.optional_string "sessionName" session_name))
 
 let emit_thinking_level_select ~previous_level level =
   if previous_level <> level then
@@ -1602,16 +1519,16 @@ let emit_thinking_level_select ~previous_level level =
 
 let emit_model_select ?(source = "set") ~(previous_model : Llm.config option) (cfg : Llm.config) =
   match previous_model with
-  | Some previous when same_model previous cfg -> ()
+  | Some previous when Extension_event_json.same_model previous cfg -> ()
   | previous_model ->
     emit_notification "model_select"
       (`Assoc
         ([ ("type", `String "model_select");
-           ("model", model_payload cfg);
+           ("model", Extension_event_json.model_payload cfg);
            ("source", `String source) ]
         @
         match previous_model with
-        | Some previous -> [ ("previousModel", model_payload previous) ]
+        | Some previous -> [ ("previousModel", Extension_event_json.model_payload previous) ]
         | None -> []))
 
 let emit_context messages =
@@ -1628,7 +1545,7 @@ let emit_context messages =
                match json |> member "result" with
                | `Assoc _ as result -> (
                  match result |> member "messages" with
-                 | `List _ as messages -> turns_from_json messages
+                 | `List _ as messages -> Extension_event_json.turns_from_json messages
                  | _ -> [])
                | _ -> []
              in
@@ -1638,7 +1555,7 @@ let emit_context messages =
                  match json |> member "event" with
                  | `Assoc _ as event -> (
                    match event |> member "messages" with
-                   | `List _ as messages -> turns_from_json messages
+                   | `List _ as messages -> Extension_event_json.turns_from_json messages
                    | _ -> [])
                  | _ -> []
              in
@@ -1677,10 +1594,10 @@ let emit_before_agent_start ~prompt ~system_prompt =
                | _ -> `Assoc []
              in
              (match result |> member "message" with
-              | `Assoc _ as message -> injected := !injected @ turns_from_json message
+              | `Assoc _ as message -> injected := !injected @ Extension_event_json.turns_from_json message
               | _ -> ());
              (match result |> member "messages" with
-              | `List _ as messages -> injected := !injected @ turns_from_json messages
+              | `List _ as messages -> injected := !injected @ Extension_event_json.turns_from_json messages
               | _ -> ());
              match result |> member "systemPrompt" with
              | `String s -> current_system_prompt := s
