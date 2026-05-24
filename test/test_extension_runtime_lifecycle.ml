@@ -39,6 +39,9 @@ export default function(pi) {
   pi.on("session_before_switch", async (event) => {
     fs.appendFileSync("runtime-events.log", `before:${event.reason}:${path.basename(event.targetSessionFile || "")}\n`);
   });
+  pi.on("session_before_fork", async (event) => {
+    fs.appendFileSync("runtime-events.log", `beforefork:${event.position}:${event.entryId || ""}\n`);
+  });
   pi.on("session_shutdown", async (event) => {
     fs.appendFileSync("runtime-events.log", `shutdown:${event.reason}:${path.basename(event.targetSessionFile || "")}\n`);
   });
@@ -93,6 +96,104 @@ export default function(pi) {
       ].join(":");
     },
   });
+  pi.registerCommand("runtimeforkparity", {
+    description: "Probe AgentSessionRuntime fork replacement behavior",
+    handler: async () => {
+      const agentDir = path.resolve("runtime-fork-agent");
+      const runtimeResult = await createAgentSessionRuntime({ cwd: process.cwd(), agentDir });
+      let rebindCount = 0;
+      let invalidated = 0;
+      runtimeResult.runtime.setRebindSession(async (session) => {
+        rebindCount++;
+        await session.bindExtensions();
+      });
+      runtimeResult.runtime.setBeforeSessionInvalidate(() => {
+        invalidated++;
+      });
+      await runtimeResult.runtime.newSession({
+        setup: async (manager) => {
+          manager.appendMessage({ role: "user", content: [{ type: "text", text: "fork text" }] });
+          manager.appendMessage({ role: "assistant", content: [{ type: "text", text: "fork answer" }] });
+        },
+      });
+      const beforeFile = runtimeResult.runtime.session.sessionFile || "";
+      const userEntry = runtimeResult.runtime.session.sessionManager.getEntries().find((entry) => entry.type === "message" && entry.message.role === "user");
+      const forkResult = await runtimeResult.runtime.fork(userEntry.id, {
+        position: "before",
+        withSession: async (next) => {
+          await next.sendMessage({ customType: "fork-note", content: "body", display: true }, { triggerTurn: false });
+        },
+      });
+      const afterFile = runtimeResult.runtime.session.sessionFile || "";
+      const stats = runtimeResult.runtime.session.getSessionStats();
+      const header = runtimeResult.runtime.session.sessionManager.getHeader();
+      await runtimeResult.runtime.dispose();
+      const log = fs.existsSync("runtime-events.log") ? fs.readFileSync("runtime-events.log", "utf8") : "";
+      return [
+        forkResult.cancelled === false,
+        forkResult.selectedText,
+        beforeFile !== afterFile,
+        fs.existsSync(afterFile),
+        path.resolve(header.parentSession || "") === path.resolve(beforeFile),
+        stats.totalMessages,
+        stats.userMessages,
+        rebindCount >= 2,
+        invalidated >= 2,
+        log.includes("beforefork:before:"),
+        log.includes("shutdown:fork:"),
+        log.includes("start:fork:"),
+      ].join(":");
+    },
+  });
+}
+|};
+  write_file ".pi/extensions/session-manager-sdk.ts"
+    {|const fs = require("node:fs");
+const path = require("node:path");
+const { SessionManager } = require("@earendil-works/pi-coding-agent");
+
+export default function(pi) {
+  pi.registerCommand("sessionmanagerparity", {
+    description: "Probe SessionManager static constructors and persistence",
+    handler: async () => {
+      const dir = path.resolve("sdk-static-sessions");
+      const forkDir = path.resolve("sdk-fork-sessions");
+      const forkCwd = path.resolve("fork-cwd");
+      fs.mkdirSync(forkCwd, { recursive: true });
+
+      const created = SessionManager.create(process.cwd(), dir);
+      const createdFile = created.getSessionFile();
+      const root = created.appendMessage({ role: "user", content: [{ type: "text", text: "static hello" }] });
+      created.appendLabelChange(root.id, "root-label");
+
+      const opened = SessionManager.open(createdFile, dir);
+      const continued = SessionManager.continueRecent(process.cwd(), dir);
+      const memory = SessionManager.inMemory(process.cwd());
+      memory.appendMessage({ role: "user", content: "memory hello" });
+      const forked = SessionManager.forkFrom(createdFile, forkCwd, forkDir);
+      const listed = await SessionManager.list(process.cwd(), dir);
+
+      return [
+        created instanceof SessionManager,
+        opened instanceof SessionManager,
+        continued instanceof SessionManager,
+        memory instanceof SessionManager,
+        forked instanceof SessionManager,
+        fs.existsSync(createdFile),
+        path.basename(createdFile).endsWith(".jsonl"),
+        opened.buildSessionContext().messages.length,
+        opened.getLabel(root.id),
+        continued.getSessionId() === created.getSessionId(),
+        memory.getSessionFile() === undefined,
+        memory.getEntries().length,
+        fs.existsSync(forked.getSessionFile()),
+        forked.getCwd() === forkCwd,
+        path.resolve(forked.getHeader().parentSession || "") === path.resolve(createdFile),
+        forked.getEntries().length === opened.getEntries().length,
+        listed.some((session) => session.id === created.getSessionId() && session.messageCount === 1),
+      ].join(":");
+    },
+  });
 }
 |};
   ignore (Extensions.load ());
@@ -114,6 +215,34 @@ export default function(pi) {
        && List.for_all
             (fun index -> List.nth parts index = "true")
             [ 0; 4; 9; 10; 12; 13; 14; 15; 16; 17; 18 ]
+     | None -> false);
+  check "TypeScript AgentSessionRuntime fork replaces session like Pi"
+    ((not node_available)
+     ||
+     match Extensions.execute_command "/runtimeforkparity" with
+     | Some output ->
+       let parts = String.split_on_char ':' output in
+       List.length parts = 12
+       && List.nth parts 1 = "fork text"
+       && List.nth parts 5 = "1"
+       && List.nth parts 6 = "0"
+       && List.for_all
+            (fun index -> List.nth parts index = "true")
+            [ 0; 2; 3; 4; 7; 8; 9; 10; 11 ]
+     | None -> false);
+  check "TypeScript SessionManager static constructors match Pi SDK behavior"
+    ((not node_available)
+     ||
+     match Extensions.execute_command "/sessionmanagerparity" with
+     | Some output ->
+       let parts = String.split_on_char ':' output in
+       List.length parts = 17
+       && List.nth parts 7 = "1"
+       && List.nth parts 8 = "root-label"
+       && List.nth parts 11 = "1"
+       && List.for_all
+            (fun index -> List.nth parts index = "true")
+            [ 0; 1; 2; 3; 4; 5; 6; 9; 10; 12; 13; 14; 15; 16 ]
      | None -> false);
 
   if !failures > 0 then exit 1

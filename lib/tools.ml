@@ -23,7 +23,7 @@ let read_file_contents path =
     ~finally:(fun () -> close_in_noerr ic)
     (fun () ->
        let total = in_channel_length ic in
-       let len = min max_read_file_bytes total in
+       let len = max 0 (min max_read_file_bytes total) in
        really_input_string ic len)
 
 let write_file_contents path content =

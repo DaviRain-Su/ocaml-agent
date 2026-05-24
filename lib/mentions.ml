@@ -16,9 +16,10 @@ let read_file path =
   Fun.protect
     ~finally:(fun () -> close_in_noerr ic)
     (fun () ->
-      let len = min max_bytes (in_channel_length ic) in
+      let total = in_channel_length ic in
+      let len = max 0 (min max_bytes total) in
       let s = really_input_string ic len in
-      if in_channel_length ic > max_bytes then s ^ "\n... (truncated)" else s)
+      if total > max_bytes then s ^ "\n... (truncated)" else s)
 
 (* Strip trailing punctuation that commonly follows a path in prose. *)
 let trim_path p =
@@ -121,7 +122,7 @@ let image_of_file path mime_type =
       ~finally:(fun () -> close_in_noerr ic)
       (fun () ->
         let len = in_channel_length ic in
-        if len > max_image_bytes then failwith (Printf.sprintf "Image too large: %d bytes" len);
+        if len < 0 || len > max_image_bytes then failwith (Printf.sprintf "Image too large: %d bytes" len);
         really_input_string ic len)
   in
   { mime_type; data = base64_encode data }

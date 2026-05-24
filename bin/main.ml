@@ -28,16 +28,16 @@ let banner cfg resumed =
   flush stdout
 
 let run_turn agent input =
-  match Agent.send agent input with
-  | _ -> ()
-  | exception Llm.Api_error msg -> Printf.eprintf "%s %s\n%!" (red "API error:") msg
-  | exception e -> Printf.eprintf "%s %s\n%!" (red "Error:") (Printexc.to_string e)
+  try ignore (Agent.send agent input) with
+  | Llm.Api_error msg -> Printf.eprintf "%s %s\n%!" (red "API error:") msg
+  | Sys.Break as e -> raise e
+  | e -> Printf.eprintf "%s %s\n%!" (red "Error:") (Printexc.to_string e)
 
 let run_turn_content agent content =
-  match Agent.send_content agent content with
-  | _ -> ()
-  | exception Llm.Api_error msg -> Printf.eprintf "%s %s\n%!" (red "API error:") msg
-  | exception e -> Printf.eprintf "%s %s\n%!" (red "Error:") (Printexc.to_string e)
+  try ignore (Agent.send_content agent content) with
+  | Llm.Api_error msg -> Printf.eprintf "%s %s\n%!" (red "API error:") msg
+  | Sys.Break as e -> raise e
+  | e -> Printf.eprintf "%s %s\n%!" (red "Error:") (Printexc.to_string e)
 
 let extension_theme_json (theme : Themes.t) =
   `Assoc

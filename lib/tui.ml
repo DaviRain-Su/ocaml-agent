@@ -986,8 +986,10 @@ let kill_word ui =
 
 let run agent =
   (* Mouse reporting is OFF by default so the terminal's native click-drag text
-     selection (copy) and paste keep working. Set AGENT_TUI_MOUSE=1 to enable
-     mouse-wheel scrolling, at the cost of terminal selection/copy. *)
+     selection (copy) works in any terminal without a bypass modifier. Scroll
+     the scrollback with Shift+Up/Down or PgUp/PgDn. Set AGENT_TUI_MOUSE=1 to
+     enable mouse-wheel scrolling, but then selecting text requires holding a
+     terminal-specific modifier while dragging (and some terminals offer none). *)
   let mouse = match Sys.getenv_opt "AGENT_TUI_MOUSE" with
     | Some ("1" | "true" | "yes" | "on") -> true
     | _ -> false
@@ -1004,8 +1006,8 @@ let run agent =
   push ui A.(tfg "accent" ++ st bold) "OCaml Code Agent";
   push ui (tfg "muted") (Llm.describe (Agent.config agent));
   push ui (tfg "muted") "Type your request. /help for commands, Ctrl-P model picker, Ctrl-D to quit.";
-  push ui (tfg "muted") "Shift+Up/Down or PgUp/PgDn to scroll; End to jump to latest.";
-  push ui (tfg "muted") "Set AGENT_TUI_MOUSE=1 for mouse-wheel scrolling (disables terminal copy/paste selection).";
+  push ui (tfg "muted") "Scroll history: Shift+Up/Down or PgUp/PgDn; End jumps to latest. Drag to select/copy.";
+  push ui (tfg "muted") "/copy copies the last reply. AGENT_TUI_MOUSE=1 enables wheel scroll (needs modifier to select).";
   push ui A.empty "";
   let km = Keymap.load () in
   redraw ui;

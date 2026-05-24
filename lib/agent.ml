@@ -17,11 +17,13 @@ let base_prompt =
    - Run builds/tests with bash to verify your work when relevant.\n\
    - When the task is done, give a short summary of what you changed. Be concise."
 
+let max_prompt_file_bytes = 1024 * 1024
+
 let read_text_file path =
   let ic = open_in_bin path in
   Fun.protect
     ~finally:(fun () -> close_in_noerr ic)
-    (fun () -> really_input_string ic (in_channel_length ic))
+    (fun () -> really_input_string ic (min max_prompt_file_bytes (in_channel_length ic)))
 
 let resolve_prompt_input input =
   if Sys.file_exists input && not (Sys.is_directory input) then
@@ -68,7 +70,7 @@ let build_system_prompt cfg =
                 ~finally:(fun () -> close_in_noerr ic)
                 (fun () ->
                   let total = in_channel_length ic in
-                  let len = min max_context_file_bytes total in
+                  let len = max 0 (min max_context_file_bytes total) in
                   let s = really_input_string ic len in
                   if total > max_context_file_bytes then s ^ "\n... (truncated)" else s)
             in

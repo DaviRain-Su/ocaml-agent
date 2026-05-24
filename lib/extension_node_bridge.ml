@@ -693,6 +693,19 @@ function defaultSessionsDir() {
   return expandBridgeTilde(process.env.AGENT_SESSION_DIR || process.env.PI_CODING_AGENT_SESSION_DIR || path.join(getAgentDir(), "sessions"));
 }
 
+function defaultSessionDirForCwd(cwd = process.cwd(), agentDir = getAgentDir()) {
+  const resolvedCwd = path.resolve(cwd || process.cwd());
+  const safePath = `--${resolvedCwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
+  const dir = path.join(expandBridgeTilde(agentDir || getAgentDir()), "sessions", safePath);
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function sdkSessionFilePath(sessionDir, sessionId, timestamp = new Date().toISOString()) {
+  const fileTimestamp = timestamp.replace(/[:.]/g, "-");
+  return path.join(sessionDir, `${fileTimestamp}_${sessionId}.jsonl`);
+}
+
 function readJsonLines(filePath) {
   try {
     return fs.readFileSync(filePath, "utf8")
@@ -788,9 +801,108 @@ function listSessionsFromDir(sessionDir) {
     .sort((a, b) => b.modified.getTime() - a.modified.getTime());
 }
 
+function findMostRecentSessionFile(sessionDir) {
+  const sessions = listSessionsFromDir(sessionDir);
+  return sessions.length > 0 ? sessions[0].file : undefined;
+}
+
+function sdkSessionHeader(session) {
+  return {
+    type: "session",
+    version: CURRENT_SESSION_VERSION,
+    id: session.id || sdkNewEntryId("session"),
+    timestamp: session.timestamp || new Date().toISOString(),
+    cwd: session.cwd || process.cwd(),
+    parentSession: session.parentSession,
+    name: session.name || undefined,
+  };
+}
+
+function persistSdkSession(session) {
+  if (!session || session.persist === false || typeof session.path !== "string" || !session.path) return;
+  ensureParentDir(session.path);
+  const rows = [sdkSessionHeader(session), ...(Array.isArray(session.entries) ? session.entries : [])];
+  fs.writeFileSync(session.path, `${rows.map((entry) => JSON.stringify(entry)).join("\n")}\n`, "utf8");
+}
+
 class SessionManager {
+  constructor(session = undefined) {
+    const source = session && session._session ? session._session : session;
+    Object.assign(this, createSdkSessionManagerFromSession(source || {
+      id: sdkNewEntryId("session"),
+      cwd: process.cwd(),
+      sessionDir: "",
+      entries: [],
+      leafId: null,
+      path: undefined,
+    }));
+  }
+
+  static create(cwd = process.cwd(), sessionDir = undefined) {
+    const id = sdkNewEntryId("session");
+    const timestamp = new Date().toISOString();
+    const dir = sessionDir ? expandBridgeTilde(sessionDir) : defaultSessionDirForCwd(cwd);
+    return new SessionManager({
+      id,
+      timestamp,
+      cwd: path.resolve(cwd || process.cwd()),
+      sessionDir: dir,
+      entries: [],
+      leafId: null,
+      path: sdkSessionFilePath(dir, id, timestamp),
+    });
+  }
+
+  static open(filePath, sessionDir = undefined, cwdOverride = undefined) {
+    const resolvedPath = path.resolve(String(filePath || ""));
+    return new SessionManager(createSdkSessionManagerFromJsonl(resolvedPath, sessionDir ? expandBridgeTilde(sessionDir) : path.dirname(resolvedPath), cwdOverride)._session);
+  }
+
+  static continueRecent(cwd = process.cwd(), sessionDir = undefined) {
+    const dir = sessionDir ? expandBridgeTilde(sessionDir) : defaultSessionDirForCwd(cwd);
+    const mostRecent = findMostRecentSessionFile(dir);
+    return mostRecent ? SessionManager.open(mostRecent, dir) : SessionManager.create(cwd, dir);
+  }
+
+  static inMemory(cwd = process.cwd()) {
+    return new SessionManager({
+      id: sdkNewEntryId("session"),
+      cwd: path.resolve(cwd || process.cwd()),
+      sessionDir: "",
+      entries: [],
+      leafId: null,
+      path: undefined,
+      persist: false,
+    });
+  }
+
+  static forkFrom(sourcePath, targetCwd, sessionDir = undefined) {
+    const resolvedSourcePath = path.resolve(String(sourcePath || ""));
+    const rows = readJsonLines(resolvedSourcePath);
+    if (rows.length === 0) throw new Error(`Cannot fork: source session file is empty or invalid: ${resolvedSourcePath}`);
+    const sourceHeader = rows.find((entry) => entry && entry.type === "session");
+    if (!sourceHeader) throw new Error(`Cannot fork: source session has no header: ${resolvedSourcePath}`);
+    const cwd = path.resolve(targetCwd || process.cwd());
+    const dir = sessionDir ? expandBridgeTilde(sessionDir) : defaultSessionDirForCwd(cwd);
+    fs.mkdirSync(dir, { recursive: true });
+    const id = sdkNewEntryId("session");
+    const timestamp = new Date().toISOString();
+    const filePath = sdkSessionFilePath(dir, id, timestamp);
+    const header = {
+      type: "session",
+      version: CURRENT_SESSION_VERSION,
+      id,
+      timestamp,
+      cwd,
+      parentSession: resolvedSourcePath,
+    };
+    const body = rows.filter((entry) => entry && entry.type !== "session");
+    fs.writeFileSync(filePath, `${[header, ...body].map((entry) => JSON.stringify(entry)).join("\n")}\n`, "utf8");
+    return SessionManager.open(filePath, dir, cwd);
+  }
+
   static async list(_cwd = process.cwd(), sessionDir = undefined, onProgress = undefined) {
-    const dir = sessionDir ? expandBridgeTilde(sessionDir) : defaultSessionsDir();
+    const dir = sessionDir ? expandBridgeTilde(sessionDir) : defaultSessionDirForCwd(_cwd);
     const sessions = listSessionsFromDir(dir);
     if (typeof onProgress === "function") onProgress(sessions.length, sessions.length);
     return sessions;
@@ -3214,6 +3326,7 @@ function createSdkSessionManagerFromSession(session) {
     };
     session.entries.push(full);
     if (sdkEntryMovesLeaf(full)) session.leafId = full.id;
+    persistSdkSession(session);
     return full;
   };
   const manager = createSessionManager({ session });
@@ -3245,27 +3358,54 @@ function createSdkSessionManagerFromSession(session) {
     appendCustomMessageEntry: (customType, content, display = true, details = undefined) => append({ type: "custom_message", customType, content, display, details }),
     appendLabelChange: (targetId, label) => append({ type: "label", targetId, label }),
     appendCompaction: (summary, firstKeptEntryId, tokensBefore, details = undefined, fromHook = false) => append({ type: "compaction", summary, firstKeptEntryId, tokensBefore, details, fromHook }),
-    branch: (targetId) => { session.leafId = targetId || null; },
+    branch: (targetId) => {
+      if (targetId && !manager.getEntry(targetId)) throw new Error(`Entry ${targetId} not found`);
+      session.leafId = targetId || null;
+    },
+    createBranchedSession: (leafId) => {
+      const branch = manager.getBranch(leafId);
+      if (branch.length === 0) throw new Error(`Entry ${leafId} not found`);
+      const pathEntries = branch.filter((entry) => entry && entry.type !== "label");
+      const pathIds = new Set(pathEntries.map((entry) => entry.id).filter(Boolean));
+      const labelEntries = session.entries.filter((entry) => entry && entry.type === "label" && pathIds.has(entry.targetId));
+      const previousSessionFile = session.path;
+      const id = sdkNewEntryId("session");
+      const timestamp = new Date().toISOString();
+      session.id = id;
+      session.timestamp = timestamp;
+      session.entries = [...pathEntries, ...labelEntries].map((entry) => ({ ...entry }));
+      session.leafId = inferSdkLeafId(session.entries);
+      session.parentSession = previousSessionFile;
+      session.path = session.persist === false || !session.sessionDir ? undefined : sdkSessionFilePath(session.sessionDir, id, timestamp);
+      persistSdkSession(session);
+      return session.path;
+    },
     newSession: (options = {}) => {
+      const timestamp = new Date().toISOString();
       session.id = options.id || sdkNewEntryId("session");
+      session.timestamp = timestamp;
       session.entries = [];
       session.leafId = null;
-      session.path = undefined;
       session.parentSession = options.parentSession;
+      session.path = session.persist === false || !session.sessionDir ? undefined : sdkSessionFilePath(session.sessionDir, session.id, timestamp);
+      return session.path;
     },
     _session: session,
   };
 }
 
 function createSdkSessionManager(cwd = process.cwd(), sessionDir = path.join(getAgentDir(), "sessions", "--sdk--")) {
+  const id = sdkNewEntryId("session");
+  const timestamp = new Date().toISOString();
   return createSdkSessionManagerFromSession({
-    id: sdkNewEntryId("session"),
+    id,
+    timestamp,
     cwd: path.resolve(cwd || process.cwd()),
     sessionDir,
     name: undefined,
     entries: [],
     leafId: null,
-    path: undefined,
+    path: sessionDir ? sdkSessionFilePath(sessionDir, id, timestamp) : undefined,
   });
 }
 
@@ -3796,7 +3936,7 @@ class AgentSessionRuntime {
       });
     }
   }
-  async applyResult(result) {
+  async applyResult(result, options = {}) {
     await this.emitShutdown(result.shutdownReason || "resume", result.session && result.session.sessionFile);
     if (this.beforeSessionInvalidate) this.beforeSessionInvalidate();
     if (this._session && typeof this._session.dispose === "function") this._session.dispose();
@@ -3804,14 +3944,13 @@ class AgentSessionRuntime {
     this._services = result.services || this._services;
     this._diagnostics = result.diagnostics || [];
     this._modelFallbackMessage = result.modelFallbackMessage;
-    if (this.rebindSession) await this.rebindSession(this._session);
+    if (options.rebind !== false && this.rebindSession) await this.rebindSession(this._session);
   }
   async newSession(options = {}) {
     const before = await this.emitBeforeSwitch("new");
     if (before.cancelled) return before;
     const sessionManager = createSdkSessionManager(this.cwd, this._services.sessionManager.getSessionDir?.());
     if (options.parentSession && sessionManager.newSession) sessionManager.newSession({ parentSession: options.parentSession });
-    if (options.setup) await options.setup(sessionManager);
     const previousSessionFile = this.session.sessionFile;
     await this.applyResult({
       ...(await this.createRuntime({
@@ -3821,7 +3960,14 @@ class AgentSessionRuntime {
         sessionStartEvent: { type: "session_start", reason: "new", previousSessionFile },
       })),
       shutdownReason: "new",
-    });
+    }, { rebind: false });
+    if (options.setup) {
+      await options.setup(this.session.sessionManager);
+      if (this.session.sessionManager.buildSessionContext) {
+        this.session.agent.state.messages = this.session.sessionManager.buildSessionContext().messages;
+      }
+    }
+    if (this.rebindSession) await this.rebindSession(this._session);
     if (options.withSession) await options.withSession(this.session.createReplacedSessionContext());
     return { cancelled: false };
   }
@@ -3845,11 +3991,53 @@ class AgentSessionRuntime {
     return { cancelled: false };
   }
   async fork(entryId, options = {}) {
-    const before = await this.emitBeforeFork(entryId, { position: options.position || "before" });
+    const position = options.position || "before";
+    const before = await this.emitBeforeFork(entryId, { position });
     if (before.cancelled) return before;
-    if (this.session.navigateTree) await this.session.navigateTree(entryId);
+    const selectedEntry = this.session.sessionManager.getEntry ? this.session.sessionManager.getEntry(entryId) : undefined;
+    if (!selectedEntry) throw new Error("Invalid entry ID for forking");
+    let targetLeafId = null;
+    let selectedText = undefined;
+    if (position === "at") {
+      targetLeafId = selectedEntry.id;
+    } else {
+      if (selectedEntry.type !== "message" || !selectedEntry.message || selectedEntry.message.role !== "user") {
+        throw new Error("Invalid entry ID for forking");
+      }
+      targetLeafId = selectedEntry.parentId || null;
+      selectedText = sdkMessageText(selectedEntry.message.content);
+    }
+    const previousSessionFile = this.session.sessionFile;
+    const sessionDir = this.session.sessionManager.getSessionDir ? this.session.sessionManager.getSessionDir() : path.join(this.services.agentDir || getAgentDir(), "sessions");
+    let sessionManager;
+    if (this.session.sessionManager.isPersisted && this.session.sessionManager.isPersisted()) {
+      const currentSessionFile = this.session.sessionFile;
+      if (!currentSessionFile) throw new Error("Persisted session is missing a session file");
+      if (!targetLeafId) {
+        sessionManager = SessionManager.create(this.cwd, sessionDir);
+        sessionManager.newSession({ parentSession: currentSessionFile });
+      } else {
+        sessionManager = SessionManager.open(currentSessionFile, sessionDir);
+        const forkedSessionPath = sessionManager.createBranchedSession(targetLeafId);
+        if (!forkedSessionPath) throw new Error("Failed to create forked session");
+      }
+    } else {
+      sessionManager = this.session.sessionManager;
+      if (!targetLeafId) sessionManager.newSession({ parentSession: this.session.sessionFile });
+      else if (sessionManager.createBranchedSession) sessionManager.createBranchedSession(targetLeafId);
+      else if (this.session.navigateTree) await this.session.navigateTree(targetLeafId);
+    }
+    await this.applyResult({
+      ...(await this.createRuntime({
+        cwd: sessionManager.getCwd ? sessionManager.getCwd() : this.cwd,
+        agentDir: this.services.agentDir,
+        sessionManager,
+        sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
+      })),
+      shutdownReason: "fork",
+    });
     if (options.withSession) await options.withSession(this.session.createReplacedSessionContext());
-    return { cancelled: false };
+    return { cancelled: false, selectedText };
   }
   async navigateTree(entryId, options = {}) {
     await this.session.navigateTree(entryId);
@@ -3913,9 +4101,15 @@ class InteractiveMode {
 }
 
 async function runPrintMode(runtimeHost, options = {}) {
-  const message = options.prompt || options.message || options.input;
-  if (message && runtimeHost && runtimeHost.session && typeof runtimeHost.session.prompt === "function") {
-    await runtimeHost.session.prompt(message, { images: options.images || [] });
+  const initialMessage = options.initialMessage || options.message || options.input;
+  const messages = Array.isArray(options.messages) ? options.messages : [];
+  if (initialMessage && runtimeHost && runtimeHost.session && typeof runtimeHost.session.prompt === "function") {
+    await runtimeHost.session.prompt(initialMessage, { images: options.initialImages || options.images || [] });
+  }
+  for (const message of messages) {
+    if (message && runtimeHost && runtimeHost.session && typeof runtimeHost.session.prompt === "function") {
+      await runtimeHost.session.prompt(message);
+    }
   }
   return 0;
 }
@@ -3928,7 +4122,10 @@ async function main(options = {}) {
   const result = await createAgentSessionRuntime(options);
   const mode = options.mode || (options.print || options.prompt ? "print" : "interactive");
   if (mode === "print") {
-    return runPrintMode(result.runtime, options);
+    return runPrintMode(result.runtime, {
+      ...options,
+      initialMessage: options.initialMessage || options.prompt || options.message || options.input,
+    });
   }
   if (mode === "rpc") {
     return runRpcMode(result.runtime);
@@ -5409,8 +5606,8 @@ function bridgeFooterData(statuses) {
 
 function createSessionManager(registry) {
   const session = registry && registry.session && typeof registry.session === "object" ? registry.session : {};
-  const entries = Array.isArray(session.entries) ? session.entries : [];
-  const entryById = () => new Map(entries.filter((entry) => typeof entry.id === "string").map((entry) => [entry.id, entry]));
+  const entries = () => Array.isArray(session.entries) ? session.entries : [];
+  const entryById = () => new Map(entries().filter((entry) => typeof entry.id === "string").map((entry) => [entry.id, entry]));
   const leafIdAfterEntry = (current, entry) => {
     if (!entry || typeof entry !== "object") return current;
     if (entry.type === "leaf") {
@@ -5430,7 +5627,7 @@ function createSessionManager(registry) {
   };
   const labelById = () => {
     const labels = new Map();
-    for (const entry of entries) {
+    for (const entry of entries()) {
       if (entry && entry.type === "label" && typeof entry.targetId === "string") {
         if (entry.label === undefined || entry.label === null || entry.label === "") labels.delete(entry.targetId);
         else labels.set(entry.targetId, String(entry.label));
@@ -5443,7 +5640,7 @@ function createSessionManager(registry) {
       return typeof session.leafId === "string" && session.leafId ? session.leafId : null;
     }
     let current = null;
-    for (const entry of entries) current = leafIdAfterEntry(current, entry);
+    for (const entry of entries()) current = leafIdAfterEntry(current, entry);
     return current;
   };
   const sessionFile = () => typeof session.path === "string" ? session.path : undefined;
@@ -5456,10 +5653,13 @@ function createSessionManager(registry) {
     if (!session.id && !session.path && !session.name) return null;
     return {
       type: "session",
+      version: CURRENT_SESSION_VERSION,
       id: session.id || session.path || "session",
       sessionId: session.id || undefined,
       name: session.name || undefined,
       cwd: session.cwd || process.cwd(),
+      timestamp: session.timestamp || undefined,
+      parentSession: session.parentSession || undefined,
       sessionFile: sessionFile(),
     };
   };
@@ -5478,17 +5678,17 @@ function createSessionManager(registry) {
   };
   const getChildren = (parentId) => {
     const id = String(parentId || "");
-    return entries.filter((entry) => entry && entry.parentId === id);
+    return entries().filter((entry) => entry && entry.parentId === id);
   };
   const getTree = () => {
     const labels = labelById();
     const nodes = new Map();
     const roots = [];
-    for (const entry of entries) {
+    for (const entry of entries()) {
       if (typeof entry.id !== "string") continue;
       nodes.set(entry.id, { entry, children: [], label: labels.get(entry.id) });
     }
-    for (const entry of entries) {
+    for (const entry of entries()) {
       if (typeof entry.id !== "string") continue;
       const node = nodes.get(entry.id);
       const parent = typeof entry.parentId === "string" ? nodes.get(entry.parentId) : null;
@@ -5512,7 +5712,7 @@ function createSessionManager(registry) {
     getBranch,
     getChildren,
     getHeader: header,
-    getEntries: () => entries.slice(),
+    getEntries: () => entries().slice(),
     getTree,
     getSessionName: () => session.name || undefined,
   };
