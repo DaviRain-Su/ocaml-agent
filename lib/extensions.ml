@@ -132,11 +132,6 @@ let effective_tool_names base =
 let effective_thinking base =
   match !active_thinking_level with Some level -> level | None -> base
 
-let truthy s =
-  match String.lowercase_ascii (String.trim s) with
-  | "1" | "true" | "yes" | "y" | "all" -> true
-  | _ -> false
-
 let bridge_json_result body json =
   match json |> member "ok" with
   | `Bool true -> Ok json
@@ -662,7 +657,7 @@ let register_providers_for runtime_kind path json =
              let has_runtime =
                match provider |> member "hasRuntime" with
                | `Bool b -> b
-               | `String s -> truthy s
+               | `String s -> Extension_event_json.truthy s
                | _ -> false
              in
              let base_url =
