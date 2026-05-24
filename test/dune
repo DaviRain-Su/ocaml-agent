@@ -19,6 +19,10 @@
  (name test_search_tools)
  (libraries agent_lib))
 
+(test
+ (name test_context_render)
+ (libraries agent_lib))
+
 (executable
  (name ocaml_sdk_extension)
  (libraries agent_lib str))
