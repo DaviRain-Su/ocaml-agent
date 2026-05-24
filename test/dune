@@ -57,6 +57,10 @@
  (name test_extension_provider_ui)
  (libraries agent_lib))
 
+(test
+ (name test_extension_io_hooks)
+ (libraries agent_lib))
+
 (executable
  (name ocaml_sdk_extension)
  (libraries agent_lib str))
