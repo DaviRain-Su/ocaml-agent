@@ -40,6 +40,10 @@
  (name test_extension_direct)
  (libraries agent_lib))
 
+(test
+ (name test_extension_rpc_commands)
+ (libraries agent_lib))
+
 (executable
  (name ocaml_sdk_extension)
  (libraries agent_lib str))
