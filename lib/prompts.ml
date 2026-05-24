@@ -18,7 +18,7 @@ let read_file path =
     ~finally:(fun () -> close_in_noerr ic)
     (fun () ->
        let total = in_channel_length ic in
-       let len = min max_file_bytes total in
+       let len = max 0 (min max_file_bytes total) in
        let s = really_input_string ic len in
        if total > max_file_bytes then s ^ "\n... (truncated)" else s)
 
@@ -66,7 +66,7 @@ let parse path =
     Some { name; description; argument_hint; body; location = path }
 
 let templates_from_dir dir =
-  if (try Sys.is_directory dir with _ -> false) then
+  if (try Sys.is_directory dir with Sys.Break as e -> raise e | _ -> false) then
     Sys.readdir dir |> Array.to_list
     |> List.filter (fun f -> Filename.check_suffix f ".md")
     |> List.sort compare
@@ -74,7 +74,7 @@ let templates_from_dir dir =
   else []
 
 let templates_from_path path =
-  if (try Sys.is_directory path with _ -> false) then templates_from_dir path
+  if (try Sys.is_directory path with Sys.Break as e -> raise e | _ -> false) then templates_from_dir path
   else if Sys.file_exists path && Filename.check_suffix path ".md" then (match parse path with Some t -> [ t ] | None -> [])
   else []
 

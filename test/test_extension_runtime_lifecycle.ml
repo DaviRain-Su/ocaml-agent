@@ -164,14 +164,25 @@ export default function(pi) {
       const created = SessionManager.create(process.cwd(), dir);
       const createdFile = created.getSessionFile();
       const root = created.appendMessage({ role: "user", content: [{ type: "text", text: "static hello" }] });
-      created.appendLabelChange(root.id, "root-label");
+      const label = created.appendLabelChange(root, "root-label");
+      const sessionInfo = created.appendSessionInfo("static session");
 
       const opened = SessionManager.open(createdFile, dir);
       const continued = SessionManager.continueRecent(process.cwd(), dir);
       const memory = SessionManager.inMemory(process.cwd());
-      memory.appendMessage({ role: "user", content: "memory hello" });
+      const memoryRoot = memory.appendMessage({ role: "user", content: "memory hello" });
+      const memoryAssistant = memory.appendMessage({ role: "assistant", content: "memory answer" });
+      memory.branch(memoryRoot);
+      const memoryBranch = memory.appendMessage({ role: "user", content: "memory branch" });
+      const summary = memory.branchWithSummary(memoryRoot, "memory summary", { ok: true }, true);
+      memory.resetLeaf();
+      const resetRoot = memory.appendCustomEntry("reset", { ok: true });
+      const switched = SessionManager.inMemory(process.cwd());
+      switched.setSessionFile(createdFile);
       const forked = SessionManager.forkFrom(createdFile, forkCwd, forkDir);
       const listed = await SessionManager.list(process.cwd(), dir);
+      const returnedIds = [root, label, sessionInfo, memoryRoot, memoryAssistant, memoryBranch, summary, resetRoot]
+        .every((id) => typeof id === "string" && id.length > 0);
 
       return [
         created instanceof SessionManager,
@@ -182,7 +193,7 @@ export default function(pi) {
         fs.existsSync(createdFile),
         path.basename(createdFile).endsWith(".jsonl"),
         opened.buildSessionContext().messages.length,
-        opened.getLabel(root.id),
+        opened.getLabel(root),
         continued.getSessionId() === created.getSessionId(),
         memory.getSessionFile() === undefined,
         memory.getEntries().length,
@@ -191,6 +202,14 @@ export default function(pi) {
         path.resolve(forked.getHeader().parentSession || "") === path.resolve(createdFile),
         forked.getEntries().length === opened.getEntries().length,
         listed.some((session) => session.id === created.getSessionId() && session.messageCount === 1),
+        returnedIds,
+        opened.getSessionName() === "static session",
+        opened.getEntry(root).id === root,
+        memory.getLeafId() === resetRoot,
+        memory.getBranch(summary).some((entry) => entry.type === "branch_summary" && entry.summary === "memory summary"),
+        switched.getSessionId() === created.getSessionId(),
+        switched.isPersisted() === false,
+        typeof created._persist === "function",
       ].join(":");
     },
   });
@@ -236,13 +255,13 @@ export default function(pi) {
      match Extensions.execute_command "/sessionmanagerparity" with
      | Some output ->
        let parts = String.split_on_char ':' output in
-       List.length parts = 17
+       List.length parts = 25
        && List.nth parts 7 = "1"
        && List.nth parts 8 = "root-label"
-       && List.nth parts 11 = "1"
+       && List.nth parts 11 = "5"
        && List.for_all
             (fun index -> List.nth parts index = "true")
-            [ 0; 1; 2; 3; 4; 5; 6; 9; 10; 12; 13; 14; 15; 16 ]
+            [ 0; 1; 2; 3; 4; 5; 6; 9; 10; 12; 13; 14; 15; 16; 17; 18; 19; 20; 21; 22; 23; 24 ]
      | None -> false);
 
   if !failures > 0 then exit 1

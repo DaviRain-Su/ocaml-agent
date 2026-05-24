@@ -95,6 +95,91 @@ export default function(pi) {
   });
 }
 |};
+  write_file ".pi/extensions/auth-storage.ts"
+    {|const { AuthStorage, ModelRegistry } = require("@earendil-works/pi-coding-agent");
+
+const oauthConfig = {
+  name: "OAuth Probe",
+  api: "openai",
+  baseUrl: "https://oauth.invalid/v1",
+  defaultModel: "oauth-small",
+  models: [{ id: "oauth-small", name: "OAuth Small", api: "openai", contextWindow: 123 }],
+  oauth: {
+    name: "OAuth Login",
+    async login(callbacks) {
+      callbacks.openUrl?.("https://oauth.invalid/login");
+      const code = callbacks.readCode ? await callbacks.readCode() : "missing";
+      return { access: `login-${code}`, refresh: "refresh-token", expires: Date.now() - 1000 };
+    },
+    async refreshToken(credentials) {
+      return { access: `${credentials.access}-refreshed`, refresh: credentials.refresh, expires: Date.now() + 60000 };
+    },
+    getApiKey(credentials) {
+      return `Bearer ${credentials.access}`;
+    },
+    modifyModels(models, credentials) {
+      return models.map((model) => model.provider === "oauthprobe" ? { ...model, baseUrl: `https://${credentials.access}.invalid/v1` } : model);
+    },
+  },
+};
+
+export default function(pi) {
+  pi.registerCommand("authprobe", {
+    description: "Probe AuthStorage OAuth provider parity",
+    handler: async () => {
+      const storage = AuthStorage.inMemory();
+      const registry = ModelRegistry.inMemory(storage);
+      registry.registerProvider("oauthprobe", oauthConfig);
+      let opened = "";
+      await storage.login("oauthprobe", {
+        openUrl(url) { opened = url; },
+        readCode: async () => "code",
+      });
+      const before = storage.get("oauthprobe");
+      const key = await storage.getApiKey("oauthprobe");
+      const after = storage.get("oauthprobe");
+      registry.refresh();
+      const model = registry.find("oauthprobe", "oauth-small");
+      const auth = await registry.getApiKeyAndHeaders(model);
+      const usingOAuth = registry.isUsingOAuth(model);
+      const commandStorage = AuthStorage.inMemory({ storedcmd: { type: "api_key", key: "!printf stored-secret" } });
+      const commandRegistry = ModelRegistry.inMemory(commandStorage);
+      commandRegistry.registerProvider("cmdai", {
+        name: "Command AI",
+        api: "openai",
+        baseUrl: "https://cmd.invalid/v1",
+        apiKey: "!printf provider-secret",
+        authHeader: true,
+        headers: { "X-Command": "!printf header-secret", "X-Literal": "literal-header" },
+        defaultModel: "cmd-small",
+        models: [{ id: "cmd-small", name: "Command Small", api: "openai", contextWindow: 321 }],
+      });
+      const commandModel = commandRegistry.find("cmdai", "cmd-small");
+      const commandAuth = await commandRegistry.getApiKeyAndHeaders(commandModel);
+      const storedCommandKey = await commandStorage.getApiKey("storedcmd");
+      storage.logout("oauthprobe");
+      return [
+        storage.getOAuthProviders().some((provider) => provider.id === "oauthprobe"),
+        opened,
+        before.access,
+        key,
+        after.access,
+        registry.getProviderDisplayName("oauthprobe"),
+        usingOAuth,
+        model.baseUrl,
+        auth.ok,
+        auth.apiKey,
+        storedCommandKey,
+        commandAuth.apiKey,
+        commandAuth.headers["X-Command"],
+        commandAuth.headers["X-Literal"],
+        commandAuth.headers.Authorization,
+        storage.has("oauthprobe"),
+      ].join("|");
+    },
+  });
+}
+|};
   write_file ".pi/extensions/shortcut-renderer.ts"
     {|export default function(pi) {
   pi.registerFlag("voice", { description: "Voice flag", type: "string", defaultValue: "calm" });
@@ -199,6 +284,14 @@ export default function(pi) {
      match blocks with
      | [ Llm.Text text ] -> text = "runtime runtime-small:sys:1:false" && Buffer.contents streamed = text
      | _ -> false);
+  check "TypeScript SDK AuthStorage supports extension OAuth providers"
+    ((not node_available)
+     ||
+     match Extensions.execute_command "/authprobe" with
+     | Some output ->
+       output
+       = "true|https://oauth.invalid/login|login-code|Bearer login-code-refreshed|login-code-refreshed|OAuth Probe|true|https://login-code-refreshed.invalid/v1|true|Bearer login-code-refreshed|stored-secret|provider-secret|header-secret|literal-header|Bearer provider-secret|false"
+     | None -> false);
   check "TypeScript extension runtime registerProvider updates provider registry"
     ((not node_available)
      ||

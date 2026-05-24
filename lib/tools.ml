@@ -103,12 +103,12 @@ let is_real_dir path =
   try
     let st = Unix.lstat path in
     st.Unix.st_kind = Unix.S_DIR
-  with _ -> false
+  with Sys.Break as e -> raise e | _ -> false
 
 let walk ?(ignored = fun _ -> false) root (f : string -> unit) =
   let rec go rel visited =
     let full = if rel = "" then root else Filename.concat root rel in
-    let canon = try Unix.realpath full with _ -> full in
+    let canon = try Unix.realpath full with Sys.Break as e -> raise e | _ -> full in
     if List.mem canon visited then ()
     else if is_real_dir full then
       let visited = canon :: visited in
@@ -190,7 +190,7 @@ let load_gitignore root =
       read_file_contents path |> String.split_on_char '\n'
       |> List.map trim_line
       |> List.filter (fun line -> line <> "" && not (string_starts_with line "#") && not (string_starts_with line "!"))
-    with _ -> []
+    with Sys.Break as e -> raise e | _ -> []
 
 let ignored_by patterns rel =
   List.exists
@@ -788,15 +788,14 @@ let run_process ?stdin_data ?(timeout_s = command_timeout_s) ?(use_shell_setting
   let bytes = Bytes.create 4096 in
   let truncated = ref false in
   let rec drain () =
-    if Buffer.length buf >= max_process_output_bytes then truncated := true
-    else
-      match Unix.read rd bytes 0 (Bytes.length bytes) with
-      | 0 -> ()
-      | n ->
-        Buffer.add_subbytes buf bytes 0 n;
-        drain ()
-      | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) -> ()
-      | exception Unix.Unix_error (Unix.EINTR, _, _) -> drain ()
+    match Unix.read rd bytes 0 (Bytes.length bytes) with
+    | 0 -> ()
+    | n ->
+      if Buffer.length buf < max_process_output_bytes then Buffer.add_subbytes buf bytes 0 n
+      else truncated := true;
+      drain ()
+    | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) -> ()
+    | exception Unix.Unix_error (Unix.EINTR, _, _) -> drain ()
   in
   let deadline = Unix.gettimeofday () +. float_of_int timeout_s in
   let timed_out = ref false in

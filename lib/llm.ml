@@ -532,14 +532,14 @@ let anthropic_complete cfg ~system ~on_text ~tools_enabled ?tool_names ~client ~
           | _ -> ())
         | "content_block_stop" -> finalize (j |> member "index" |> to_int)
         | _ -> ())
-    with Api_error _ as e -> raise e | _ -> ()
+    with Api_error _ as e -> raise e | Sys.Break as e -> raise e | _ -> ()
   in
 	  (try
 	     transport.Transport.post_stream ~url ~headers body ~on_line:(fun line ->
 	         match sse_data line with
 	         | Some data when data <> "[DONE]" -> handle data
 	         | Some _ -> ()
-	         | None -> if String.trim line <> "" then Buffer.add_string err (line ^ "\n"));
+	         | None -> if String.trim line <> "" then (Buffer.add_string err line; Buffer.add_char err '\n'));
 		     emit_provider_response_hooks ~client ~status:200 ~headers:[] ()
 	   with Transport.Http_error e ->
 	     let msg = if Buffer.length err > 0 then e ^ "\n" ^ Buffer.contents err else e in

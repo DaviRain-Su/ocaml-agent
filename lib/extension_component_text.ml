@@ -98,14 +98,14 @@ and component_table_text obj =
   let widths =
     List.fold_left
       (fun widths row ->
-        List.mapi (fun i cell -> max (String.length cell) (try List.nth widths i with _ -> 0)) row)
+        List.mapi (fun i cell -> max (String.length cell) (try List.nth widths i with Sys.Break as e -> raise e | _ -> 0)) row)
       [] all_rows
   in
   let pad width s = s ^ String.make (max 0 (width - String.length s)) ' ' in
   let render_row row =
     "| "
     ^ (widths
-       |> List.mapi (fun i width -> pad width (try List.nth row i with _ -> ""))
+       |> List.mapi (fun i width -> pad width (try List.nth row i with Sys.Break as e -> raise e | _ -> ""))
        |> String.concat " | ")
     ^ " |"
   in

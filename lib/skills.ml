@@ -35,7 +35,7 @@ let read_file path =
     ~finally:(fun () -> close_in_noerr ic)
     (fun () ->
        let total = in_channel_length ic in
-       let len = min max_file_bytes total in
+       let len = max 0 (min max_file_bytes total) in
        let s = really_input_string ic len in
        if total > max_file_bytes then s ^ "\n... (truncated)" else s)
 
@@ -77,18 +77,18 @@ let is_real_dir path =
   try
     let st = Unix.lstat path in
     st.Unix.st_kind = Unix.S_DIR
-  with _ -> false
+  with Sys.Break as e -> raise e | _ -> false
 
 let discover_dir dir =
-  if (try Sys.is_directory dir with _ -> false) then
+  if (try Sys.is_directory dir with Sys.Break as e -> raise e | _ -> false) then
     let rec go root visited =
       let canon =
-        try Unix.realpath root with _ -> root
+        try Unix.realpath root with Sys.Break as e -> raise e | _ -> root
       in
       if List.mem canon visited then []
       else
         let visited = canon :: visited in
-        let entries = try Sys.readdir root |> Array.to_list |> List.sort compare with _ -> [] in
+        let entries = try Sys.readdir root |> Array.to_list |> List.sort compare with Sys.Break as e -> raise e | _ -> [] in
         let markdown =
           entries
           |> List.filter (fun f -> Filename.check_suffix f ".md")
@@ -111,7 +111,7 @@ let discover_dir dir =
   else []
 
 let discover_path path =
-  if (try Sys.is_directory path with _ -> false) then discover_dir path
+  if (try Sys.is_directory path with Sys.Break as e -> raise e | _ -> false) then discover_dir path
   else if Sys.file_exists path && Filename.check_suffix path ".md" then (match parse_skill path with Some s -> [ s ] | None -> [])
   else []
 

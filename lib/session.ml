@@ -357,7 +357,7 @@ let info_of t : info = { id = t.id; path = t.path; name = t.name; created = t.cr
 (* All sessions in the directory, newest first. *)
 let list () : info list =
   let d = default_dir () in
-  if not (try Sys.is_directory d with _ -> false) then []
+  if not (try Sys.is_directory d with Sys.Break as e -> raise e | _ -> false) then []
   else
     Sys.readdir d |> Array.to_list
     |> List.filter (fun f -> Filename.check_suffix f ".jsonl")

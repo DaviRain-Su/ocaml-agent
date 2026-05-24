@@ -84,7 +84,7 @@ export default function(pi) {
   write_file ".pi/extensions/sdk-runtime.ts"
     {|const fs = require("node:fs");
 const path = require("node:path");
-const { AgentSession, AgentSessionRuntime, ArminComponent, AssistantMessageComponent, FooterComponent, InteractiveMode, RpcClient, ToolExecutionComponent, UserMessageComponent, createAgentSession, createAgentSessionFromServices, createAgentSessionRuntime, createAgentSessionServices, main, runPrintMode, truncateToVisualLines } = require("@earendil-works/pi-coding-agent");
+const { AgentSession, AgentSessionRuntime, ArminComponent, AssistantMessageComponent, BashExecutionComponent, BorderedLoader, CustomEditor, FooterComponent, InteractiveMode, RpcClient, ToolExecutionComponent, UserMessageComponent, createAgentSession, createAgentSessionFromServices, createAgentSessionRuntime, createAgentSessionServices, main, runPrintMode, runRpcMode, truncateToVisualLines } = require("@earendil-works/pi-coding-agent");
 
 export default function(pi) {
   pi.registerCommand("sdkruntime", {
@@ -111,16 +111,80 @@ export default function(pi) {
       const runtimeResult = await createAgentSessionRuntime({ cwd: process.cwd(), agentDir });
       await runtimeResult.runtime.newSession({ setup: async (manager) => manager.appendCustomMessageEntry("runtime-note", "body", true) });
       const mode = new InteractiveMode(runtimeResult.runtime, { headless: true });
+      await mode.init();
+      const initialMessages = mode.renderInitialMessages();
+      const inputPromise = mode.getUserInput();
+      mode.onInputCallback("typed input");
+      const typedInput = await inputPromise;
+      mode.editorText = "dirty";
+      mode.clearEditor();
+      mode.showError("mode error");
+      mode.showWarning("mode warning");
+      mode.showNewVersionNotification({ version: "9.9.9", note: "note" });
+      mode.showPackageUpdateNotification(["pkg-a"]);
       const modeCode = await mode.start();
       const printCode = await runPrintMode(runtimeResult.runtime, { prompt: "print prompt" });
       const mainCode = await main({ cwd: process.cwd(), agentDir, mode: "print", prompt: "main prompt" });
       const rpc = new RpcClient({ cliPath: "missing-cli.js" });
       const trunc = truncateToVisualLines("a\nb\nc", 2, 80, 0);
       const userLines = new UserMessageComponent({ content: "user component" }).render(80).join("|");
-      const assistantLines = new AssistantMessageComponent({ message: { content: [{ type: "text", text: "assistant component" }] } }).render(80).join("|");
-      const toolLines = new ToolExecutionComponent({ name: "tool component" }).render(80).join("|");
-      const footerLines = new FooterComponent("footer component").render(80).join("|");
+      const assistant = new AssistantMessageComponent({ content: [{ type: "text", text: "assistant component" }] });
+      assistant.setHideThinkingBlock(true);
+      assistant.setHiddenThinkingLabel("hidden thinking");
+      assistant.updateContent({ content: [{ type: "text", text: "assistant updated" }] });
+      const assistantLines = assistant.render(80).join("|");
+      const tool = new ToolExecutionComponent("tool component", "call-1", { before: true });
+      tool.updateArgs({ after: true });
+      tool.markExecutionStarted();
+      tool.setArgsComplete();
+      tool.setExpanded(true);
+      tool.setShowImages(false);
+      tool.setImageWidthCells(3);
+      tool.updateResult({ content: [{ type: "text", text: "tool result" }], isError: false });
+      const toolLines = tool.render(80).join("|");
+      const bash = new BashExecutionComponent("echo hi");
+      bash.setExpanded(true);
+      bash.appendOutput("hello");
+      bash.appendOutput(" world");
+      bash.setComplete(0, false);
+      const footer = new FooterComponent("footer component");
+      footer.setSession(session);
+      footer.setAutoCompactEnabled(false);
+      footer.setExtensionStatus("sync", "ready");
+      const footerLines = footer.render(80).join("|");
+      const editor = new CustomEditor();
+      let editorAction = false;
+      editor.onAction("app.test", () => { editorAction = true; });
+      editor.actionHandlers.get("app.test")();
+      const loader = new BorderedLoader(null, { fg: (_key, text) => text }, "loading");
+      let aborted = false;
+      loader.onAbort = () => { aborted = true; };
+      loader.handleInput("\u001b");
+      loader.dispose();
       const armin = new ArminComponent("armin component").render(80).join("|");
+      const rpcRuntime = await createAgentSessionRuntime({ cwd: process.cwd(), agentDir: path.resolve("sdk-rpc-agent") });
+      const captured = [];
+      const originalWrite = process.stdout.write;
+      process.stdout.write = function(chunk, ...args) {
+        captured.push(Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk));
+        if (typeof args[args.length - 1] === "function") args[args.length - 1]();
+        return true;
+      };
+      const rpcPromise = runRpcMode(rpcRuntime.runtime);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      for (const command of [
+        { id: "rpc1", type: "get_state" },
+        { id: "rpc2", type: "set_session_name", name: "rpc session" },
+        { id: "rpc3", type: "get_state" },
+        { id: "rpc4", type: "bash", command: "printf rpc-ok" },
+        { id: "rpc5", type: "shutdown" },
+      ]) {
+        process.stdin.emit("data", `${JSON.stringify(command)}\n`);
+      }
+      await rpcPromise;
+      process.stdout.write = originalWrite;
+      const rpcResponses = captured.join("").split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line)).filter((line) => line.type === "response");
+      const rpcById = Object.fromEntries(rpcResponses.map((response) => [response.id, response]));
       return [
         typeof AgentSession,
         session instanceof AgentSession,
@@ -144,8 +208,8 @@ export default function(pi) {
         trunc.visualLines.join(","),
         trunc.skippedCount,
         userLines.includes("user component"),
-        assistantLines.includes("assistant component"),
-        toolLines.includes("tool component"),
+        assistantLines.includes("assistant updated"),
+        toolLines.includes("tool result"),
         footerLines.includes("footer component"),
         armin.includes("armin component"),
         dynamicTool,
@@ -153,6 +217,30 @@ export default function(pi) {
         actionText === "new:false",
         commandActionCalled,
         boundHasUi,
+        bash.getCommand() === "echo hi",
+        bash.getOutput() === "hello world",
+        bash.status === "complete",
+        tool.executionStarted,
+        tool.argsComplete,
+        tool.showImages === false,
+        tool.imageWidthCells === 3,
+        footer.extensionStatuses.sync === "ready",
+        editorAction,
+        typeof loader.signal === "object",
+        aborted,
+        typeof runRpcMode,
+        rpcById.rpc1 && rpcById.rpc1.success && typeof rpcById.rpc1.data.sessionId === "string",
+        rpcById.rpc3 && rpcById.rpc3.data.sessionName === "rpc session",
+        rpcById.rpc4 && rpcById.rpc4.data.output === "rpc-ok",
+        rpcById.rpc5 && rpcById.rpc5.success,
+        mode.isInitialized,
+        initialMessages.length === 1,
+        typedInput === "typed input",
+        mode.editorText === "",
+        mode.errors.includes("mode error"),
+        mode.warnings.includes("mode warning"),
+        mode.notifications.some((item) => item.type === "new_version" && item.release.version === "9.9.9"),
+        mode.notifications.some((item) => item.type === "package_updates" && item.packages[0] === "pkg-a"),
       ].join(":");
     },
   });
@@ -165,7 +253,7 @@ export default function(pi) {
      match Extensions.execute_command "/sdkruntime" with
      | Some output ->
        let parts = String.split_on_char ':' output in
-       List.length parts = 31
+       List.length parts = 55
        && List.nth parts 0 = "function"
        && List.nth parts 1 = "true"
        && List.nth parts 3 = "read,custom_sdk"
@@ -174,8 +262,9 @@ export default function(pi) {
        && List.nth parts 18 = "function"
        && List.nth parts 19 = "b,c"
        && List.nth parts 20 = "1"
+       && List.nth parts 42 = "function"
        && List.for_all (fun index -> List.nth parts index = "true")
-            [ 2; 4; 5; 7; 8; 9; 10; 11; 12; 15; 21; 22; 23; 24; 25; 26; 27; 28; 29; 30 ]
+            [ 2; 4; 5; 7; 8; 9; 10; 11; 12; 15; 21; 22; 23; 24; 25; 26; 27; 28; 29; 30; 31; 32; 33; 34; 35; 36; 37; 38; 39; 40; 41; 43; 44; 45; 46; 47; 48; 49; 50; 51; 52; 53; 54 ]
      | None -> false);
 
   if !failures > 0 then exit 1

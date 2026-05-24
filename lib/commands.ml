@@ -608,7 +608,7 @@ let read_file path =
     ~finally:(fun () -> close_in_noerr ic)
     (fun () ->
        let total = in_channel_length ic in
-       let len = min max_file_bytes total in
+       let len = max 0 (min max_file_bytes total) in
        let s = really_input_string ic len in
        if total > max_file_bytes then s ^ "\n... (truncated)" else s)
 

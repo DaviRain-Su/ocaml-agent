@@ -3,8 +3,9 @@ let source =
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const os = require("node:os");
 const childProcess = require("node:child_process");
-const { pathToFileURL } = require("node:url");
+const { pathToFileURL, fileURLToPath } = require("node:url");
 
 function readStdin() {
   return new Promise((resolve) => {
@@ -41,13 +42,175 @@ const Type = {
   Boolean: (options = {}) => schema("boolean", options),
   Array: (items, options = {}) => ({ type: "array", items, ...options }),
   Literal: (value, options = {}) => ({ const: value, ...options }),
+  Enum: (values = {}, options = {}) => ({ type: "string", enum: Array.isArray(values) ? values : Object.values(values), ...options }),
   Union: (items, options = {}) => ({ anyOf: items, ...options }),
   Optional: (inner) => ({ ...inner, __optional: true }),
   Record: (_key, value, options = {}) => ({ type: "object", additionalProperties: value, ...options }),
   Any: (options = {}) => options,
   Unknown: (options = {}) => options,
   Null: (options = {}) => ({ type: "null", ...options }),
+  Undefined: (options = {}) => ({ type: "undefined", ...options }),
+  Void: (options = {}) => ({ type: "void", ...options }),
+  Never: (options = {}) => ({ not: {}, ...options }),
+  Intersect: (items, options = {}) => ({ allOf: items, ...options }),
+  Readonly: (inner) => ({ ...inner }),
+  Unsafe: (definition = {}) => ({ ...definition }),
 };
+
+function typeboxSchemaTypes(schema) {
+  if (!schema || typeof schema !== "object") return [];
+  if (typeof schema.type === "string") return [schema.type];
+  if (Array.isArray(schema.type)) return schema.type.filter((item) => typeof item === "string");
+  return [];
+}
+
+function typeboxMatchesType(value, type) {
+  switch (type) {
+    case "string": return typeof value === "string";
+    case "number": return typeof value === "number" && Number.isFinite(value);
+    case "integer": return typeof value === "number" && Number.isInteger(value);
+    case "boolean": return typeof value === "boolean";
+    case "array": return Array.isArray(value);
+    case "object": return value !== null && typeof value === "object" && !Array.isArray(value);
+    case "null": return value === null;
+    case "undefined": return value === undefined;
+    case "void": return value === undefined;
+    default: return true;
+  }
+}
+
+function typeboxCoerce(value, schema) {
+  if (!schema || typeof schema !== "object") return value;
+  if (schema.const !== undefined) return value === schema.const ? value : value;
+  if (Array.isArray(schema.anyOf)) {
+    for (const option of schema.anyOf) {
+      const converted = typeboxCoerce(value, option);
+      if (typeboxCheck(option, converted)) return converted;
+    }
+    return value;
+  }
+  if (Array.isArray(schema.allOf)) {
+    return schema.allOf.reduce((current, option) => typeboxCoerce(current, option), value);
+  }
+  const [type] = typeboxSchemaTypes(schema);
+  if (type === "number" || type === "integer") {
+    if (typeof value === "string" && value.trim() !== "") {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) return type === "integer" ? Math.trunc(parsed) : parsed;
+    }
+    if (value === null) return 0;
+  }
+  if (type === "boolean") {
+    if (value === "true") return true;
+    if (value === "false") return false;
+  }
+  if (type === "string" && value !== undefined && value !== null && typeof value !== "object") return String(value);
+  if (type === "array" && Array.isArray(value) && schema.items) return value.map((item) => typeboxCoerce(item, schema.items));
+  if (type === "object" && value && typeof value === "object" && !Array.isArray(value)) {
+    const out = { ...value };
+    for (const [key, child] of Object.entries(schema.properties || {})) {
+      if (Object.prototype.hasOwnProperty.call(out, key)) out[key] = typeboxCoerce(out[key], child);
+      else if (child && typeof child === "object" && Object.prototype.hasOwnProperty.call(child, "default")) out[key] = child.default;
+    }
+    return out;
+  }
+  return value;
+}
+
+function typeboxCheck(schema, value, errors = [], path = "") {
+  if (!schema || typeof schema !== "object") return true;
+  if (schema.const !== undefined && value !== schema.const) {
+    errors.push({ path, instancePath: path, message: `Expected ${JSON.stringify(schema.const)}` });
+    return false;
+  }
+  if (Array.isArray(schema.enum) && !schema.enum.includes(value)) {
+    errors.push({ path, instancePath: path, message: `Expected one of ${schema.enum.map(String).join(", ")}` });
+    return false;
+  }
+  if (Array.isArray(schema.anyOf)) {
+    if (schema.anyOf.some((option) => typeboxCheck(option, value, [], path))) return true;
+    errors.push({ path, instancePath: path, message: "Expected union member" });
+    return false;
+  }
+  if (Array.isArray(schema.allOf)) {
+    let ok = true;
+    for (const option of schema.allOf) ok = typeboxCheck(option, value, errors, path) && ok;
+    return ok;
+  }
+  const types = typeboxSchemaTypes(schema);
+  if (types.length > 0 && !types.some((type) => typeboxMatchesType(value, type))) {
+    errors.push({ path, instancePath: path, message: `Expected ${types.join(" or ")}` });
+    return false;
+  }
+  if (schema.type === "object" && value && typeof value === "object" && !Array.isArray(value)) {
+    let ok = true;
+    for (const key of schema.required || []) {
+      if (!Object.prototype.hasOwnProperty.call(value, key)) {
+        errors.push({ path: `${path}/${key}`, instancePath: `${path}/${key}`, message: `Required property ${key}` });
+        ok = false;
+      }
+    }
+    for (const [key, child] of Object.entries(schema.properties || {})) {
+      if (Object.prototype.hasOwnProperty.call(value, key)) ok = typeboxCheck(child, value[key], errors, `${path}/${key}`) && ok;
+    }
+    return ok;
+  }
+  if (schema.type === "array" && Array.isArray(value) && schema.items) {
+    let ok = true;
+    value.forEach((item, index) => { ok = typeboxCheck(schema.items, item, errors, `${path}/${index}`) && ok; });
+    return ok;
+  }
+  return true;
+}
+
+const Compile = (schema) => ({
+  schema,
+  Check: (value) => typeboxCheck(schema, value),
+  Errors: (value) => {
+    const errors = [];
+    typeboxCheck(schema, value, errors);
+    return errors;
+  },
+  Decode: (value) => typeboxCoerce(value, schema),
+  Encode: (value) => value,
+  Parse: (value) => Value.Parse(schema, value),
+});
+
+const TypeCompiler = { Compile };
+
+const Value = {
+  Convert: (schema, value) => {
+    const converted = typeboxCoerce(value, schema);
+    if (value && converted && typeof value === "object" && typeof converted === "object" && !Array.isArray(value) && !Array.isArray(converted)) {
+      for (const key of Object.keys(value)) delete value[key];
+      Object.assign(value, converted);
+      return value;
+    }
+    return converted;
+  },
+  Check: (schema, value) => typeboxCheck(schema, value),
+  Errors: (schema, value) => Compile(schema).Errors(value),
+  Parse: (schema, value) => {
+    const converted = typeboxCoerce(value, schema);
+    if (!typeboxCheck(schema, converted)) throw new Error("Value does not match schema");
+    return converted;
+  },
+  Clone: (value) => cloneJson(value),
+  Default: (schema, value) => typeboxCoerce(value === undefined ? {} : value, schema),
+  Clean: (_schema, value) => value,
+  Create: (schema) => typeboxCoerce(undefined, schema),
+};
+
+function typeboxExports() { return { Type, Static: undefined, TSchema: undefined }; }
+function typeboxCompileExports() { return { Compile, TypeCompiler }; }
+function typeboxValueExports() { return { Value }; }
+function typeboxErrorExports() {
+  return {
+    ValueErrorType: {},
+    ValueErrorIterator: class ValueErrorIterator {},
+    Format: (errors) => Array.from(errors || []).map((error) => `${error.instancePath || error.path || ""}: ${error.message || ""}`).join("\n"),
+  };
+}
 
 function defineTool(tool) {
   return tool;
@@ -1165,6 +1328,33 @@ function providerEnvKeys(provider) {
   return [...(known[id.toLowerCase()] || []), `${upper}_API_KEY`].filter((key, index, keys) => key && keys.indexOf(key) === index);
 }
 
+const BRIDGE_OAUTH_PROVIDERS = new Map();
+
+function registerBridgeOAuthProvider(provider) {
+  if (!provider || typeof provider !== "object") return;
+  const id = String(provider.id || provider.name || "").trim();
+  if (!id) return;
+  BRIDGE_OAUTH_PROVIDERS.set(id, { ...provider, id });
+}
+
+function unregisterBridgeOAuthProvider(providerId) {
+  BRIDGE_OAUTH_PROVIDERS.delete(String(providerId || "").trim());
+}
+
+function getBridgeOAuthProvider(providerId) {
+  return BRIDGE_OAUTH_PROVIDERS.get(String(providerId || "").trim());
+}
+
+function bridgeOAuthApiKey(provider, credentials) {
+  if (!credentials || typeof credentials !== "object") return undefined;
+  if (provider && typeof provider.getApiKey === "function") return provider.getApiKey(credentials);
+  if (typeof credentials.access === "string") return credentials.access;
+  if (typeof credentials.accessToken === "string") return credentials.accessToken;
+  if (typeof credentials.apiKey === "string") return credentials.apiKey;
+  if (typeof credentials.key === "string") return credentials.key;
+  return undefined;
+}
+
 class FileAuthStorageBackend {
   constructor(authPath = path.join(getAgentDir(), "auth.json")) {
     this.authPath = expandBridgeTilde(authPath);
@@ -1347,8 +1537,33 @@ class AuthStorage {
     return drained;
   }
 
-  async login(provider) {
-    throw new Error(`OAuth login is not available in the ocaml-agent bridge: ${provider}`);
+  async login(providerId, callbacks = {}) {
+    const key = String(providerId || "").trim();
+    const provider = getBridgeOAuthProvider(key);
+    if (!provider || typeof provider.login !== "function") throw new Error(`Unknown OAuth provider: ${key}`);
+    const credentials = await provider.login(callbacks || {});
+    this.set(key, { type: "oauth", ...(credentials || {}) });
+  }
+
+  async refreshOAuthCredentialWithLock(providerId, provider) {
+    return this.storage.withLockAsync(async (current) => {
+      const currentData = this.parse(current);
+      this.data = currentData;
+      const credential = currentData[providerId];
+      if (!credential || credential.type !== "oauth") return { result: null };
+      if (typeof credential.expires === "number" && Date.now() >= credential.expires) {
+        if (typeof provider.refreshToken !== "function") return { result: null };
+        const refreshed = await provider.refreshToken(credential);
+        const nextCredential = { type: "oauth", ...(refreshed || {}) };
+        const merged = { ...currentData, [providerId]: nextCredential };
+        this.data = merged;
+        return {
+          result: { credential: nextCredential, apiKey: bridgeOAuthApiKey(provider, nextCredential) },
+          next: JSON.stringify(merged, null, 2),
+        };
+      }
+      return { result: { credential, apiKey: bridgeOAuthApiKey(provider, credential) } };
+    });
   }
 
   async getApiKey(provider, options = {}) {
@@ -1356,9 +1571,27 @@ class AuthStorage {
     if (this.runtimeOverrides.has(key)) return this.runtimeOverrides.get(key);
     const credential = this.data[key];
     if (credential && typeof credential === "object") {
-      if (credential.type === "api_key") return String(credential.key || "");
-      if (typeof credential.apiKey === "string") return credential.apiKey;
-      if (typeof credential.key === "string") return credential.key;
+      if (credential.type === "api_key") return resolveModelConfigValue(credential.key);
+      if (credential.type === "oauth") {
+        const oauthProvider = getBridgeOAuthProvider(key);
+        if (!oauthProvider) return undefined;
+        const needsRefresh = typeof credential.expires === "number" && Date.now() >= credential.expires;
+        if (!needsRefresh) return bridgeOAuthApiKey(oauthProvider, credential);
+        try {
+          const refreshed = await this.refreshOAuthCredentialWithLock(key, oauthProvider);
+          if (refreshed && refreshed.apiKey !== undefined) return refreshed.apiKey;
+        } catch (error) {
+          this.recordError(error);
+          this.reload();
+          const updated = this.data[key];
+          if (updated && updated.type === "oauth" && !(typeof updated.expires === "number" && Date.now() >= updated.expires)) {
+            return bridgeOAuthApiKey(oauthProvider, updated);
+          }
+        }
+        return undefined;
+      }
+      if (typeof credential.apiKey === "string") return resolveModelConfigValue(credential.apiKey);
+      if (typeof credential.key === "string") return resolveModelConfigValue(credential.key);
       if (typeof credential.accessToken === "string") return credential.accessToken;
     }
     if (typeof credential === "string") return credential;
@@ -1369,7 +1602,7 @@ class AuthStorage {
   }
 
   getOAuthProviders() {
-    return [];
+    return [...BRIDGE_OAUTH_PROVIDERS.values()];
   }
 }
 
@@ -1548,6 +1781,87 @@ class SettingsManager {
   getProviderRetrySettings() { return { timeoutMs: this.settings.retry?.provider?.timeoutMs, maxRetries: this.settings.retry?.provider?.maxRetries, maxRetryDelayMs: this.settings.retry?.provider?.maxRetryDelayMs ?? 60000 }; }
   getHideThinkingBlock() { return this.settings.hideThinkingBlock ?? false; }
   setHideThinkingBlock(hide) { this.setGlobal("hideThinkingBlock", hide); }
+  getNpmCommand() { return Array.isArray(this.settings.npmCommand) ? this.settings.npmCommand.slice() : undefined; }
+  setNpmCommand(command) { this.globalSettings.npmCommand = Array.isArray(command) ? command.slice() : undefined; this.save("global"); }
+  getPackages() { return Array.isArray(this.settings.packages) ? cloneJson(this.settings.packages) : []; }
+  setPackages(packages) { this.globalSettings.packages = Array.isArray(packages) ? cloneJson(packages) : []; this.save("global"); }
+  setProjectPackages(packages) { this.projectSettings.packages = Array.isArray(packages) ? cloneJson(packages) : []; this.save("project"); }
+  getExtensionPaths() { return Array.isArray(this.settings.extensions) ? this.settings.extensions.slice() : []; }
+  setExtensionPaths(paths) { this.globalSettings.extensions = Array.isArray(paths) ? paths.slice() : []; this.save("global"); }
+  setProjectExtensionPaths(paths) { this.projectSettings.extensions = Array.isArray(paths) ? paths.slice() : []; this.save("project"); }
+  getSkillPaths() { return Array.isArray(this.settings.skills) ? this.settings.skills.slice() : []; }
+  setSkillPaths(paths) { this.globalSettings.skills = Array.isArray(paths) ? paths.slice() : []; this.save("global"); }
+  setProjectSkillPaths(paths) { this.projectSettings.skills = Array.isArray(paths) ? paths.slice() : []; this.save("project"); }
+  getPromptTemplatePaths() { return Array.isArray(this.settings.prompts) ? this.settings.prompts.slice() : []; }
+  setPromptTemplatePaths(paths) { this.globalSettings.prompts = Array.isArray(paths) ? paths.slice() : []; this.save("global"); }
+  setProjectPromptTemplatePaths(paths) { this.projectSettings.prompts = Array.isArray(paths) ? paths.slice() : []; this.save("project"); }
+  getThemePaths() { return Array.isArray(this.settings.themes) ? this.settings.themes.slice() : []; }
+  setThemePaths(paths) { this.globalSettings.themes = Array.isArray(paths) ? paths.slice() : []; this.save("global"); }
+  setProjectThemePaths(paths) { this.projectSettings.themes = Array.isArray(paths) ? paths.slice() : []; this.save("project"); }
+  getShellPath() { return this.settings.shellPath; }
+  setShellPath(shellPath) { this.setGlobal("shellPath", shellPath); }
+  getQuietStartup() { return this.settings.quietStartup ?? false; }
+  setQuietStartup(quiet) { this.setGlobal("quietStartup", !!quiet); }
+  getShellCommandPrefix() { return this.settings.shellCommandPrefix; }
+  setShellCommandPrefix(prefix) { this.setGlobal("shellCommandPrefix", prefix); }
+  getCollapseChangelog() { return this.settings.collapseChangelog ?? false; }
+  setCollapseChangelog(collapse) { this.setGlobal("collapseChangelog", !!collapse); }
+  getEnableInstallTelemetry() { return this.settings.enableInstallTelemetry ?? true; }
+  setEnableInstallTelemetry(enabled) { this.setGlobal("enableInstallTelemetry", !!enabled); }
+  getEnableSkillCommands() { return this.settings.enableSkillCommands ?? true; }
+  setEnableSkillCommands(enabled) { this.setGlobal("enableSkillCommands", !!enabled); }
+  getThinkingBudgets() { return this.settings.thinkingBudgets ? cloneJson(this.settings.thinkingBudgets) : undefined; }
+  getShowImages() { return this.settings.terminal?.showImages ?? true; }
+  setShowImages(show) { this.setNestedGlobal("terminal", "showImages", !!show); }
+  getImageWidthCells() {
+    const width = this.settings.terminal?.imageWidthCells;
+    return typeof width === "number" && Number.isFinite(width) ? Math.max(1, Math.floor(width)) : 60;
+  }
+  setImageWidthCells(width) {
+    const numeric = Number(width);
+    this.setNestedGlobal("terminal", "imageWidthCells", Math.max(1, Math.floor(Number.isFinite(numeric) ? numeric : 1)));
+  }
+  getClearOnShrink() {
+    if (this.settings.terminal?.clearOnShrink !== undefined) return !!this.settings.terminal.clearOnShrink;
+    return process.env.PI_CLEAR_ON_SHRINK === "1";
+  }
+  setClearOnShrink(enabled) { this.setNestedGlobal("terminal", "clearOnShrink", !!enabled); }
+  getShowTerminalProgress() { return this.settings.terminal?.showTerminalProgress ?? false; }
+  setShowTerminalProgress(enabled) { this.setNestedGlobal("terminal", "showTerminalProgress", !!enabled); }
+  getImageAutoResize() { return this.settings.images?.autoResize ?? true; }
+  setImageAutoResize(enabled) { this.setNestedGlobal("images", "autoResize", !!enabled); }
+  getBlockImages() { return this.settings.images?.blockImages ?? false; }
+  setBlockImages(blocked) { this.setNestedGlobal("images", "blockImages", !!blocked); }
+  getEnabledModels() { return Array.isArray(this.settings.enabledModels) ? this.settings.enabledModels.slice() : undefined; }
+  setEnabledModels(patterns) { this.setGlobal("enabledModels", Array.isArray(patterns) ? patterns.slice() : undefined); }
+  getDoubleEscapeAction() { return this.settings.doubleEscapeAction ?? "tree"; }
+  setDoubleEscapeAction(action) { this.setGlobal("doubleEscapeAction", action); }
+  getTreeFilterMode() {
+    const mode = this.settings.treeFilterMode;
+    return ["default", "no-tools", "user-only", "labeled-only", "all"].includes(mode) ? mode : "default";
+  }
+  setTreeFilterMode(mode) { this.setGlobal("treeFilterMode", mode); }
+  getShowHardwareCursor() { return this.settings.showHardwareCursor ?? process.env.PI_HARDWARE_CURSOR === "1"; }
+  setShowHardwareCursor(enabled) { this.setGlobal("showHardwareCursor", !!enabled); }
+  getEditorPaddingX() {
+    const padding = Number(this.settings.editorPaddingX ?? 0);
+    return Math.max(0, Math.min(3, Math.floor(Number.isFinite(padding) ? padding : 0)));
+  }
+  setEditorPaddingX(padding) {
+    const numeric = Number(padding);
+    this.setGlobal("editorPaddingX", Math.max(0, Math.min(3, Math.floor(Number.isFinite(numeric) ? numeric : 0))));
+  }
+  getAutocompleteMaxVisible() {
+    const maxVisible = Number(this.settings.autocompleteMaxVisible ?? 5);
+    return Math.max(3, Math.min(20, Math.floor(Number.isFinite(maxVisible) ? maxVisible : 5)));
+  }
+  setAutocompleteMaxVisible(maxVisible) {
+    const numeric = Number(maxVisible);
+    this.setGlobal("autocompleteMaxVisible", Math.max(3, Math.min(20, Math.floor(Number.isFinite(numeric) ? numeric : 5))));
+  }
+  getCodeBlockIndent() { return this.settings.markdown?.codeBlockIndent ?? "  "; }
+  getWarnings() { return this.settings.warnings ? cloneJson(this.settings.warnings) : {}; }
+  setWarnings(warnings) { this.setGlobal("warnings", warnings && typeof warnings === "object" ? cloneJson(warnings) : {}); }
 }
 
 const BUILT_IN_PROVIDER_DISPLAY_NAMES = {
@@ -1578,12 +1892,40 @@ const BUILT_IN_MODELS = [
   { provider: "gemini", id: "gemini-2.0-flash", name: "Gemini 2.0 Flash", api: "openai", baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai", contextWindow: 1000000, maxTokens: 8192, input: ["text", "image"], reasoning: false },
 ];
 
-function resolveModelConfigValue(value) {
+const CONFIG_VALUE_CACHE = new Map();
+
+function executeConfigCommand(commandConfig) {
+  const command = String(commandConfig || "").slice(1);
+  try {
+    const output = childProcess.execSync(command, {
+      encoding: "utf8",
+      timeout: 10000,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    const value = String(output || "").trim();
+    return value || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function resolveModelConfigValueUncached(value) {
   if (value === undefined || value === null) return undefined;
   const text = String(value);
+  if (text.startsWith("!")) return executeConfigCommand(text);
   if (text.startsWith("$")) return process.env[text.slice(1)] || "";
   if (text.startsWith("env:")) return process.env[text.slice(4)] || "";
   return process.env[text] || text;
+}
+
+function resolveModelConfigValue(value) {
+  if (value === undefined || value === null) return undefined;
+  const text = String(value);
+  if (!text.startsWith("!")) return resolveModelConfigValueUncached(text);
+  if (CONFIG_VALUE_CACHE.has(text)) return CONFIG_VALUE_CACHE.get(text);
+  const resolved = resolveModelConfigValueUncached(text);
+  CONFIG_VALUE_CACHE.set(text, resolved);
+  return resolved;
 }
 
 function normalizeHeaders(headers) {
@@ -1674,6 +2016,9 @@ class ModelRegistry {
   }
 
   applyProviderConfig(provider, config = {}) {
+    if (config.oauth && typeof config.oauth === "object") {
+      registerBridgeOAuthProvider({ ...config.oauth, id: provider });
+    }
     this.storeProviderRequestConfig(provider, config);
     const providerModels = Array.isArray(config.models) ? config.models : [];
     if (providerModels.length === 0) return;
@@ -1685,6 +2030,10 @@ class ModelRegistry {
       const modelHeaders = normalizeHeaders(modelDef.headers);
       if (modelHeaders) this.modelRequestHeaders.set(modelRequestKey(provider, model.id), modelHeaders);
       this.models.push(model);
+    }
+    if (config.oauth && typeof config.oauth.modifyModels === "function") {
+      const credential = this.authStorage.get(provider);
+      if (credential && credential.type === "oauth") this.models = config.oauth.modifyModels(this.models, credential);
     }
   }
 
@@ -1708,7 +2057,7 @@ class ModelRegistry {
     const authKey = await this.authStorage.getApiKey(provider, { includeFallback: false });
     if (authKey) return authKey;
     const configKey = this.providerRequestConfigs.get(provider)?.apiKey;
-    return configKey ? resolveModelConfigValue(configKey) : undefined;
+    return configKey ? resolveModelConfigValueUncached(configKey) : undefined;
   }
 
   async getApiKeyAndHeaders(model) {
@@ -1741,7 +2090,13 @@ class ModelRegistry {
 
   getProviderDisplayName(provider) {
     const registered = this.registeredProviders.get(provider);
-    return String((registered && (registered.name || registered.displayName)) || BUILT_IN_PROVIDER_DISPLAY_NAMES[provider] || provider || "");
+    const oauthProvider = this.authStorage.getOAuthProviders().find((item) => item.id === provider);
+    return String((registered && (registered.name || registered.displayName || (registered.oauth && registered.oauth.name))) || (oauthProvider && oauthProvider.name) || BUILT_IN_PROVIDER_DISPLAY_NAMES[provider] || provider || "");
+  }
+
+  isUsingOAuth(model) {
+    const credential = model ? this.authStorage.get(model.provider) : undefined;
+    return !!(credential && credential.type === "oauth");
   }
 
   getAuthCredential(model) {
@@ -1765,6 +2120,7 @@ class ModelRegistry {
     this.registeredProviders.delete(key);
     this.providerRequestConfigs.delete(key);
     this.models = this.models.filter((model) => model.provider !== key);
+    unregisterBridgeOAuthProvider(key);
   }
 }
 
@@ -1778,77 +2134,213 @@ function createSyntheticSourceInfo(filePath, options = {}) {
   };
 }
 
+function normalizeFrontmatterNewlines(value) {
+  return String(value || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+}
+
+function parseYamlScalar(value, line, lineNumber) {
+  const trimmed = String(value || "").trim();
+  if ((trimmed.startsWith("[") && !trimmed.endsWith("]")) || (trimmed.startsWith("{") && !trimmed.endsWith("}"))) {
+    throw new Error(`YAML parse error at line ${lineNumber}, column ${String(line || "").length + 1}`);
+  }
+  if ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) return trimmed.slice(1, -1);
+  if (/^(true|false)$/i.test(trimmed)) return /^true$/i.test(trimmed);
+  if (/^-?\d+$/.test(trimmed)) {
+    const intValue = Number.parseInt(trimmed, 10);
+    if (Number.isSafeInteger(intValue)) return intValue;
+  }
+  if (/^-?(?:\d+\.\d*|\d*\.\d+)$/.test(trimmed)) {
+    const floatValue = Number.parseFloat(trimmed);
+    if (Number.isFinite(floatValue)) return floatValue;
+  }
+  return trimmed;
+}
+
+function parseSimpleYamlFrontmatter(yamlString) {
+  const data = {};
+  const lines = normalizeFrontmatterNewlines(yamlString).split("\n");
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    const trimmed = line.trim();
+    if (!trimmed || (trimmed.startsWith("#") && !trimmed.startsWith("\\#"))) continue;
+    const match = /^([^:#][^:]*):(?:\s*(.*))?$/.exec(line);
+    if (!match) throw new Error(`YAML parse error at line ${i + 1}, column ${line.length + 1}`);
+    const key = match[1].trim();
+    const value = match[2] === undefined ? "" : match[2];
+    if (value.trim() === "|") {
+      const block = [];
+      while (i + 1 < lines.length) {
+        const next = lines[i + 1];
+        if (next.trim() !== "" && !/^\s/.test(next)) break;
+        i += 1;
+        block.push(next.startsWith("  ") ? next.slice(2) : next.replace(/^\s/, ""));
+      }
+      data[key] = `${block.join("\n")}\n`;
+    } else {
+      data[key] = parseYamlScalar(value, line, i + 1);
+    }
+  }
+  return data;
+}
+
 function parseFrontmatter(markdown) {
-  const text = String(markdown || "");
+  const text = normalizeFrontmatterNewlines(markdown);
   if (!text.startsWith("---")) return { data: {}, frontmatter: {}, body: text };
   const end = text.indexOf("\n---", 3);
   if (end < 0) return { data: {}, frontmatter: {}, body: text };
-  const raw = text.slice(3, end).trim();
-  const data = {};
-  for (const line of raw.split(/\r?\n/)) {
-    const match = /^([^:#]+):\s*(.*)$/.exec(line);
-    if (!match) continue;
-    const key = match[1].trim();
-    let value = match[2].trim();
-    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) value = value.slice(1, -1);
-    if (/^(true|false)$/i.test(value)) data[key] = /^true$/i.test(value);
-    else data[key] = value;
-  }
-  return { data, frontmatter: data, body: text.slice(end + 4) };
+  const yamlString = text.slice(4, end);
+  const data = parseSimpleYamlFrontmatter(yamlString);
+  const body = text.slice(end + 4).trim();
+  return { data, frontmatter: data, body };
 }
 
 function skillNameFromPath(filePath) {
-  const base = path.basename(filePath).toLowerCase() === "skill.md" ? path.basename(path.dirname(filePath)) : path.basename(filePath, path.extname(filePath));
-  return base.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "");
+  return path.basename(path.dirname(filePath));
+}
+
+function createSkillSourceInfo(filePath, baseDir, source) {
+  if (source === "user") return createSyntheticSourceInfo(filePath, { source: "local", scope: "user", baseDir });
+  if (source === "project") return createSyntheticSourceInfo(filePath, { source: "local", scope: "project", baseDir });
+  if (source === "path") return createSyntheticSourceInfo(filePath, { source: "local", scope: "temporary", baseDir });
+  return createSyntheticSourceInfo(filePath, { source, baseDir });
+}
+
+function validateSkillName(name) {
+  const errors = [];
+  if (String(name || "").length > 64) errors.push(`name exceeds 64 characters (${String(name || "").length})`);
+  if (!/^[a-z0-9-]+$/.test(String(name || ""))) errors.push("name contains invalid characters (must be lowercase a-z, 0-9, hyphens only)");
+  if (String(name || "").startsWith("-") || String(name || "").endsWith("-")) errors.push("name must not start or end with a hyphen");
+  if (String(name || "").includes("--")) errors.push("name must not contain consecutive hyphens");
+  return errors;
+}
+
+function loadSkillFileResult(filePath, source = "path", baseDir = path.dirname(filePath)) {
+  const diagnostics = [];
+  try {
+    const markdown = fs.readFileSync(filePath, "utf8");
+    const parsed = parseFrontmatter(markdown);
+    const name = String(parsed.data.name || skillNameFromPath(filePath)).trim();
+    const description = String(parsed.data.description || "").trim();
+    if (!description) diagnostics.push({ type: "warning", message: "description is required", path: filePath });
+    for (const error of validateSkillName(name)) diagnostics.push({ type: "warning", message: error, path: filePath });
+    if (!name || !description) return { skill: null, diagnostics };
+    return {
+      skill: {
+        name,
+        description,
+        filePath,
+        baseDir,
+        sourceInfo: createSkillSourceInfo(filePath, baseDir, source),
+        disableModelInvocation: parsed.data["disable-model-invocation"] === true,
+      },
+      diagnostics,
+    };
+  } catch (error) {
+    diagnostics.push({ type: "warning", message: error && error.message ? error.message : "failed to parse skill file", path: filePath });
+    return { skill: null, diagnostics };
+  }
 }
 
 function loadSkillFile(filePath, source = "path", baseDir = path.dirname(filePath)) {
-  const markdown = fs.readFileSync(filePath, "utf8");
-  const parsed = parseFrontmatter(markdown);
-  const name = String(parsed.data.name || skillNameFromPath(filePath)).trim();
-  const description = String(parsed.data.description || "").trim();
-  const disableModelInvocation = parsed.data["disable-model-invocation"] === true;
-  if (!name || !description) return null;
-  return {
-    name,
-    description,
-    filePath,
-    baseDir,
-    sourceInfo: createSyntheticSourceInfo(filePath, { source, baseDir, scope: source === "project" ? "project" : source === "user" ? "user" : "temporary" }),
-    disableModelInvocation,
-  };
+  return loadSkillFileResult(filePath, source, baseDir).skill;
+}
+
+const SKILL_IGNORE_FILE_NAMES = [".gitignore", ".ignore", ".fdignore"];
+
+function skillIgnorePatterns(dir, rootDir) {
+  const patterns = [];
+  const relativeDir = bridgePosix(path.relative(rootDir, dir));
+  const prefix = relativeDir ? `${relativeDir}/` : "";
+  for (const filename of SKILL_IGNORE_FILE_NAMES) {
+    const ignorePath = path.join(dir, filename);
+    if (!fs.existsSync(ignorePath)) continue;
+    try {
+      const content = fs.readFileSync(ignorePath, "utf8");
+      for (const rawLine of content.split(/\r?\n/)) {
+        const trimmed = rawLine.trim();
+        if (!trimmed || (trimmed.startsWith("#") && !trimmed.startsWith("\\#"))) continue;
+        let pattern = trimmed.startsWith("\\!") ? trimmed.slice(1) : trimmed;
+        if (pattern.startsWith("!")) continue;
+        if (pattern.startsWith("/")) pattern = pattern.slice(1);
+        patterns.push(`${prefix}${pattern}`);
+      }
+    } catch {}
+  }
+  return patterns;
+}
+
+function skillPatternMatches(pattern, relativePath) {
+  const normalizedPattern = bridgePosix(pattern).replace(/^\.\//, "");
+  const normalizedPath = bridgePosix(relativePath).replace(/^\.\//, "");
+  if (!normalizedPattern) return false;
+  if (normalizedPattern.endsWith("/")) return normalizedPath.startsWith(normalizedPattern);
+  if (!/[*?]/.test(normalizedPattern)) return normalizedPath === normalizedPattern || normalizedPath.startsWith(`${normalizedPattern}/`);
+  return packageGlobToRegExp(normalizedPattern).test(normalizedPath);
+}
+
+function skillPathIgnored(patterns, rootDir, filePath, isDirectory) {
+  const relativePath = bridgePosix(path.relative(rootDir, filePath)) + (isDirectory ? "/" : "");
+  return patterns.some((pattern) => skillPatternMatches(pattern, relativePath));
 }
 
 function loadSkillsFromDir(options = {}) {
   const dir = expandBridgeTilde(options.dir || "");
   const source = options.source || "path";
-  const skills = [];
-  const diagnostics = [];
-  const visit = (current) => {
+  const rootDir = dir;
+  const visit = (current, includeRootFiles, inheritedPatterns = []) => {
+    const skills = [];
+    const diagnostics = [];
+    if (!current || !fs.existsSync(current)) return { skills, diagnostics };
+    const localPatterns = [...inheritedPatterns, ...skillIgnorePatterns(current, rootDir)];
     let entries = [];
     try {
       entries = fs.readdirSync(current, { withFileTypes: true });
     } catch (error) {
       diagnostics.push({ type: "warning", message: error.message, path: current });
-      return;
+      return { skills, diagnostics };
+    }
+    const rootSkill = entries.find((entry) => entry.name === "SKILL.md");
+    if (rootSkill) {
+      const filePath = path.join(current, rootSkill.name);
+      let isFile = rootSkill.isFile();
+      if (rootSkill.isSymbolicLink()) {
+        try { isFile = fs.statSync(filePath).isFile(); } catch { isFile = false; }
+      }
+      if (isFile && !skillPathIgnored(localPatterns, rootDir, filePath, false)) {
+        const result = loadSkillFileResult(filePath, source, path.dirname(filePath));
+        if (result.skill) skills.push(result.skill);
+        diagnostics.push(...result.diagnostics);
+      }
+      return { skills, diagnostics };
     }
     for (const entry of entries) {
       const filePath = path.join(current, entry.name);
-      if (entry.isDirectory()) visit(filePath);
-      else if (entry.isFile() && entry.name.toLowerCase() === "skill.md") {
+      if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
+      let isDirectory = entry.isDirectory();
+      let isFile = entry.isFile();
+      if (entry.isSymbolicLink()) {
         try {
-          const skill = loadSkillFile(filePath, source, path.dirname(filePath));
-          if (skill) skills.push(skill);
-          else diagnostics.push({ type: "warning", message: "invalid skill frontmatter", path: filePath });
-        } catch (error) {
-          diagnostics.push({ type: "warning", message: error.message, path: filePath });
+          const stats = fs.statSync(filePath);
+          isDirectory = stats.isDirectory();
+          isFile = stats.isFile();
+        } catch {
+          continue;
         }
       }
+      if (skillPathIgnored(localPatterns, rootDir, filePath, isDirectory)) continue;
+      if (isDirectory) {
+        const result = visit(filePath, false, localPatterns);
+        skills.push(...result.skills);
+        diagnostics.push(...result.diagnostics);
+      } else if (isFile && includeRootFiles && entry.name.endsWith(".md")) {
+        const result = loadSkillFileResult(filePath, source, path.dirname(filePath));
+        if (result.skill) skills.push(result.skill);
+        diagnostics.push(...result.diagnostics);
+      }
     }
+    return { skills, diagnostics };
   };
-  if (dir && fs.existsSync(dir)) visit(dir);
-  else diagnostics.push({ type: "warning", message: "skill path does not exist", path: dir });
-  return { skills, diagnostics };
+  return visit(dir, true, []);
 }
 
 function loadSkills(options = {}) {
@@ -1857,17 +2349,36 @@ function loadSkills(options = {}) {
   const includeDefaults = options.includeDefaults !== false;
   const skillPaths = Array.isArray(options.skillPaths) ? options.skillPaths : [];
   const byName = new Map();
+  const realPaths = new Set();
   const diagnostics = [];
+  const canonical = (filePath) => {
+    try { return fs.realpathSync(filePath); } catch { return path.resolve(filePath); }
+  };
   const add = (result) => {
     diagnostics.push(...(result.diagnostics || []));
-    for (const skill of result.skills || []) if (!byName.has(skill.name)) byName.set(skill.name, skill);
+    for (const skill of result.skills || []) {
+      const realPath = canonical(skill.filePath);
+      if (realPaths.has(realPath)) continue;
+      const existing = byName.get(skill.name);
+      if (existing) {
+        diagnostics.push({
+          type: "collision",
+          message: `name "${skill.name}" collision`,
+          path: skill.filePath,
+          collision: { resourceType: "skill", name: skill.name, winnerPath: existing.filePath, loserPath: skill.filePath },
+        });
+      } else {
+        byName.set(skill.name, skill);
+        realPaths.add(realPath);
+      }
+    }
   };
   if (includeDefaults) {
     add(loadSkillsFromDir({ dir: path.join(agentDir, "skills"), source: "user" }));
     add(loadSkillsFromDir({ dir: path.join(cwd, ".pi", "skills"), source: "project" }));
   }
   for (const raw of skillPaths) {
-    const resolved = path.isAbsolute(String(raw)) ? String(raw) : path.resolve(cwd, String(raw));
+    const resolved = resolveBridgePath(cwd, String(raw));
     if (!fs.existsSync(resolved)) {
       diagnostics.push({ type: "warning", message: "skill path does not exist", path: resolved });
       continue;
@@ -1875,8 +2386,8 @@ function loadSkills(options = {}) {
     const stats = fs.statSync(resolved);
     if (stats.isDirectory()) add(loadSkillsFromDir({ dir: resolved, source: "path" }));
     else if (stats.isFile()) {
-      const skill = loadSkillFile(resolved, "path", path.dirname(resolved));
-      if (skill && !byName.has(skill.name)) byName.set(skill.name, skill);
+      const result = loadSkillFileResult(resolved, "path", path.dirname(resolved));
+      add({ skills: result.skill ? [result.skill] : [], diagnostics: result.diagnostics });
     }
   }
   return { skills: Array.from(byName.values()), diagnostics };
@@ -2614,7 +3125,13 @@ function uniqueBridgePaths(values = []) {
 }
 
 function resolveBridgePath(baseDir, value) {
-  const expanded = expandBridgeTilde(String(value || ""));
+  const raw = String(value || "").trim();
+  if (/^file:\/\//.test(raw)) {
+    try {
+      return path.normalize(fileURLToPath(raw));
+    } catch {}
+  }
+  const expanded = expandBridgeTilde(raw);
   return path.isAbsolute(expanded) ? path.normalize(expanded) : path.resolve(baseDir || process.cwd(), expanded);
 }
 
@@ -2693,17 +3210,130 @@ function collectResourceFiles(resourcePath, kind) {
   return [];
 }
 
+function bridgePosix(value) {
+  return String(value || "").replace(/\\/g, "/");
+}
+
+function hasResourceGlobPattern(pattern) {
+  return /[*?]/.test(String(pattern || ""));
+}
+
+function isResourceOverridePattern(pattern) {
+  return /^[!+-]/.test(String(pattern || ""));
+}
+
+function packageGlobToRegExp(pattern) {
+  const input = bridgePosix(pattern);
+  let out = "";
+  for (let i = 0; i < input.length; i += 1) {
+    const ch = input[i];
+    if (ch === "*") {
+      if (input[i + 1] === "*") {
+        out += ".*";
+        i += 1;
+      } else {
+        out += "[^/]*";
+      }
+    } else if (ch === "?") {
+      out += "[^/]";
+    } else if ("\\^$+?.()|{}[]".includes(ch)) {
+      out += `\\${ch}`;
+    } else {
+      out += ch;
+    }
+  }
+  return new RegExp(`^${out}$`);
+}
+
+function packageRelativePath(baseDir, filePath) {
+  return bridgePosix(path.relative(baseDir, filePath));
+}
+
+function normalizePackageExactPattern(pattern) {
+  const normalized = bridgePosix(pattern);
+  return normalized.startsWith("./") ? normalized.slice(2) : normalized;
+}
+
+function packagePatternCandidates(baseDir, filePath, includeBasename = true) {
+  const candidates = [packageRelativePath(baseDir, filePath), bridgePosix(filePath)];
+  if (includeBasename) candidates.push(path.basename(filePath));
+  if (path.basename(filePath) === "SKILL.md") {
+    const parent = path.dirname(filePath);
+    candidates.push(packageRelativePath(baseDir, parent), bridgePosix(parent), path.basename(parent));
+  }
+  return uniqueBridgePaths(candidates.map(normalizePackageExactPattern));
+}
+
+function packagePatternMatches(baseDir, pattern, filePath) {
+  const re = packageGlobToRegExp(pattern);
+  return packagePatternCandidates(baseDir, filePath, true).some((candidate) => re.test(candidate));
+}
+
+function packageExactPatternMatches(baseDir, pattern, filePath) {
+  const normalized = normalizePackageExactPattern(pattern);
+  return packagePatternCandidates(baseDir, filePath, true).some((candidate) => candidate === normalized);
+}
+
+function applyPackageResourcePatterns(allPaths, patterns = [], baseDir) {
+  const includes = [];
+  const excludes = [];
+  const forceIncludes = [];
+  const forceExcludes = [];
+  for (const pattern of patterns.map(String)) {
+    if (pattern.startsWith("+")) forceIncludes.push(pattern.slice(1));
+    else if (pattern.startsWith("-")) forceExcludes.push(pattern.slice(1));
+    else if (pattern.startsWith("!")) excludes.push(pattern.slice(1));
+    else includes.push(pattern);
+  }
+
+  let selected = includes.length === 0
+    ? allPaths.slice()
+    : allPaths.filter((filePath) => includes.some((pattern) => packagePatternMatches(baseDir, pattern, filePath)));
+  if (excludes.length > 0) {
+    selected = selected.filter((filePath) => !excludes.some((pattern) => packagePatternMatches(baseDir, pattern, filePath)));
+  }
+  for (const pattern of forceIncludes) {
+    for (const filePath of allPaths) {
+      if (!selected.includes(filePath) && packageExactPatternMatches(baseDir, pattern, filePath)) selected.push(filePath);
+    }
+  }
+  if (forceExcludes.length > 0) {
+    selected = selected.filter((filePath) => !forceExcludes.some((pattern) => packageExactPatternMatches(baseDir, pattern, filePath)));
+  }
+  return new Set(selected);
+}
+
+function allResourceFilesUnder(root, kind) {
+  if (kind === "extensions") return recursiveFilesWithExtensions(root, [".json", ".ts", ".js", ".mjs", ".cjs"]);
+  if (kind === "themes") return recursiveFilesWithExtensions(root, [".json"]);
+  return recursiveFilesWithExtensions(root, [".md"]);
+}
+
 function packageManifestEntries(root, kind) {
   const manifest = jsonFile(path.join(root, "package.json"), {});
   const pi = manifest && typeof manifest.pi === "object" ? manifest.pi : {};
   const entries = pi && Array.isArray(pi[kind]) ? pi[kind] : [];
-  return entries.map(String).filter((entry) => entry.trim() && !/^[!+-]/.test(entry.trim()));
+  return entries.map(String).map((entry) => entry.trim()).filter(Boolean);
+}
+
+function collectManifestResourceFiles(root, kind, entries) {
+  return uniqueBridgePaths(entries.filter((entry) => !isResourceOverridePattern(entry)).flatMap((entry) => {
+    if (hasResourceGlobPattern(entry)) {
+      return allResourceFilesUnder(root, kind).filter((filePath) => packagePatternMatches(root, entry, filePath));
+    }
+    return collectResourceFiles(resolveBridgePath(root, entry), kind);
+  }));
 }
 
 function packageResourceFiles(root, kind) {
-  const manifestEntries = packageManifestEntries(root, kind);
-  if (manifestEntries.length > 0) {
-    return uniqueBridgePaths(manifestEntries.flatMap((entry) => collectResourceFiles(resolveBridgePath(root, entry), kind)));
+  if (fs.existsSync(root) && fs.statSync(root).isFile()) return collectResourceFiles(root, kind);
+  const entries = packageManifestEntries(root, kind);
+  if (entries.length > 0) {
+    const files = collectManifestResourceFiles(root, kind, entries);
+    const overrides = entries.filter(isResourceOverridePattern);
+    if (overrides.length === 0) return files;
+    const enabled = applyPackageResourcePatterns(files, overrides, root);
+    return files.filter((filePath) => enabled.has(filePath));
   }
   const conventional = { extensions: "extensions", skills: "skills", prompts: "prompts", themes: "themes" }[kind];
   return collectResourceFiles(path.join(root, conventional), kind);
@@ -2713,16 +3343,18 @@ function packageMetadata(source, scope = "temporary", origin = "package", baseDi
   return { source: String(source || ""), scope, origin, baseDir };
 }
 
-function resourceEntriesFromRoot(root, source, scope = "temporary", origin = "package") {
+function resourceEntriesFromRoot(root, source, scope = "temporary", origin = "package", filter = undefined) {
   const resolvedRoot = resolveBridgePath(process.cwd(), root);
   const metadata = packageMetadata(source || resolvedRoot, scope, origin, resolvedRoot);
   const result = { extensions: [], skills: [], prompts: [], themes: [] };
   for (const kind of Object.keys(result)) {
-    result[kind] = packageResourceFiles(resolvedRoot, kind).map((filePath) => ({
-      path: filePath,
-      enabled: true,
-      metadata,
-    }));
+    const files = packageResourceFiles(resolvedRoot, kind);
+    if (filter && Object.prototype.hasOwnProperty.call(filter, kind) && Array.isArray(filter[kind])) {
+      const enabled = applyPackageResourcePatterns(files, filter[kind], resolvedRoot);
+      result[kind] = files.map((filePath) => ({ path: filePath, enabled: enabled.has(filePath), metadata }));
+    } else {
+      result[kind] = files.map((filePath) => ({ path: filePath, enabled: true, metadata }));
+    }
   }
   return result;
 }
@@ -2753,9 +3385,25 @@ function parsePackageEntries(settings, scope) {
     if (!entry || typeof entry !== "object") return [];
     const source = String(entry.source || entry.package || entry.path || "").trim();
     if (!source) return [];
-    const filtered = ["extensions", "skills", "prompts", "themes"].some((key) => Array.isArray(entry[key]));
-    return [{ source, scope, filtered }];
+    const filters = {};
+    for (const key of ["extensions", "skills", "prompts", "themes"]) {
+      if (Array.isArray(entry[key])) filters[key] = entry[key].map(String);
+    }
+    const filtered = Object.keys(filters).length > 0;
+    return [{ source, scope, filtered, filters: filtered ? filters : undefined }];
   });
+}
+
+function dedupePackageEntries(entries, cwd) {
+  const byIdentity = new Map();
+  for (const entry of entries) {
+    const identity = packageSourceIdentity(entry.source, cwd, entry.scope);
+    const existing = byIdentity.get(identity);
+    if (!existing || (entry.scope === "project" && existing.scope !== "project")) {
+      byIdentity.set(identity, entry);
+    }
+  }
+  return [...byIdentity.values()];
 }
 
 function npmPackageName(source) {
@@ -2768,8 +3416,117 @@ function npmPackageName(source) {
   return index > 0 ? spec.slice(0, index) : spec;
 }
 
+function parseNpmSpec(spec) {
+  const match = String(spec || "").match(/^(@?[^@]+(?:\/[^@]+)?)(?:@(.+))?$/);
+  return {
+    name: match && match[1] ? match[1] : String(spec || ""),
+    version: match && match[2] ? match[2] : undefined,
+  };
+}
+
+function isLocalPackageSource(source) {
+  const text = String(source || "").trim();
+  return !(
+    text.startsWith("npm:") ||
+    text.startsWith("git:") ||
+    text.startsWith("github:") ||
+    text.startsWith("http:") ||
+    text.startsWith("https:") ||
+    text.startsWith("ssh:")
+  );
+}
+
+function splitGitRef(source) {
+  const text = String(source || "");
+  const scp = text.match(/^git@([^:]+):(.+)$/);
+  if (scp) {
+    const rest = scp[2] || "";
+    const index = rest.indexOf("@");
+    if (index > 0 && index < rest.length - 1) {
+      return { repo: `git@${scp[1]}:${rest.slice(0, index)}`, ref: rest.slice(index + 1) };
+    }
+    return { repo: text };
+  }
+  if (text.includes("://")) {
+    try {
+      const parsed = new URL(text);
+      const body = parsed.pathname.replace(/^\/+/, "");
+      const index = body.indexOf("@");
+      if (index > 0 && index < body.length - 1) {
+        parsed.pathname = `/${body.slice(0, index)}`;
+        return { repo: parsed.toString().replace(/\/$/, ""), ref: body.slice(index + 1) };
+      }
+    } catch {}
+    return { repo: text };
+  }
+  const slash = text.indexOf("/");
+  if (slash < 0) return { repo: text };
+  const host = text.slice(0, slash);
+  const body = text.slice(slash + 1);
+  const index = body.indexOf("@");
+  if (index > 0 && index < body.length - 1) return { repo: `${host}/${body.slice(0, index)}`, ref: body.slice(index + 1) };
+  return { repo: text };
+}
+
+function parseGitSource(source) {
+  const original = String(source || "").trim();
+  const hasPrefix = original.startsWith("git:");
+  const text = hasPrefix ? original.slice(4).trim() : original;
+  if (!hasPrefix && !/^(https?|ssh|git):\/\//i.test(text)) return null;
+  const split = splitGitRef(text);
+  let repo = split.repo;
+  let host = "";
+  let repoPath = "";
+  const scp = repo.match(/^git@([^:]+):(.+)$/);
+  if (scp) {
+    host = scp[1] || "";
+    repoPath = scp[2] || "";
+  } else if (/^(https?|ssh|git):\/\//i.test(repo)) {
+    try {
+      const parsed = new URL(repo);
+      host = parsed.hostname;
+      repoPath = parsed.pathname.replace(/^\/+/, "");
+    } catch {
+      return null;
+    }
+  } else {
+    const slash = repo.indexOf("/");
+    if (slash < 0) return null;
+    host = repo.slice(0, slash);
+    repoPath = repo.slice(slash + 1);
+    if (!host.includes(".") && host !== "localhost") return null;
+    repo = `https://${repo}`;
+  }
+  repoPath = repoPath.replace(/\.git$/, "").replace(/^\/+/, "");
+  if (!host || !repoPath || repoPath.split("/").length < 2) return null;
+  return { type: "git", repo, host, path: repoPath, ref: split.ref, pinned: !!split.ref };
+}
+
+function parsePackageSource(source) {
+  const text = String(source || "").trim();
+  if (text.startsWith("npm:")) {
+    const spec = text.slice(4).trim();
+    const parsed = parseNpmSpec(spec);
+    return { type: "npm", spec, name: parsed.name, pinned: !!parsed.version };
+  }
+  if (isLocalPackageSource(text)) return { type: "local", path: text };
+  return parseGitSource(text) || { type: "local", path: text };
+}
+
+function packageSourceIdentity(source, cwd, scope = undefined) {
+  const parsed = parsePackageSource(source);
+  if (parsed.type === "npm") return `npm:${parsed.name}`;
+  if (parsed.type === "git") return `git:${parsed.host}/${parsed.path}`;
+  return `local:${resolveBridgePath(cwd || process.cwd(), parsed.path)}`;
+}
+
 function packageInstallBase(agentDir, cwd, scope) {
+  if (scope === "temporary") return path.join(os.tmpdir(), "pi-extensions");
   return scope === "project" ? path.join(cwd, ".pi") : agentDir;
+}
+
+function isBridgeOfflineMode() {
+  return ["AGENT_OFFLINE", "PI_OFFLINE", "NO_NETWORK"].some((key) => /^(1|true|yes)$/i.test(String(process.env[key] || "")));
 }
 
 class DefaultPackageManager {
@@ -2804,39 +3561,203 @@ class DefaultPackageManager {
     }));
   }
 
-  getInstalledPath(source, scope = "user") {
+  expectedInstalledPath(source, scope = "user") {
     const text = String(source || "");
     if (!text) return undefined;
-    if (!text.startsWith("npm:") && !/^[a-z]+:\/\//.test(text) && !text.startsWith("git:") && !text.startsWith("git@")) {
+    const parsed = parsePackageSource(text);
+    if (parsed.type === "local") {
       return resolveBridgePath(this.cwd, text);
     }
     const base = packageInstallBase(this.agentDir, this.cwd, scope);
-    if (text.startsWith("npm:")) {
-      return path.join(base, "npm", "node_modules", npmPackageName(text));
+    if (parsed.type === "npm") {
+      return path.join(base, "npm", "node_modules", parsed.name);
     }
-    const sanitized = text.replace(/^git:/, "").replace(/^[a-z]+:\/\//, "").replace(/^git@/, "").replace(/[^\w.-]+/g, "-");
-    return path.join(base, "git", sanitized.replace(/^-+|-+$/g, ""));
+    return path.join(base, "git", parsed.host, parsed.path);
+  }
+
+  getInstalledPath(source, scope = "user") {
+    const installedPath = this.expectedInstalledPath(source, scope);
+    return installedPath && fs.existsSync(installedPath) ? installedPath : undefined;
+  }
+
+  getNpmCommand() {
+    const configured = this.settingsManager && this.settingsManager.settings ? this.settingsManager.settings.npmCommand : undefined;
+    if (Array.isArray(configured) && configured.length > 0) {
+      const [command, ...args] = configured.map(String);
+      if (!command) throw new Error("Invalid npmCommand: first array entry must be a non-empty command");
+      return { command, args };
+    }
+    return { command: "npm", args: [] };
+  }
+
+  packageManagerName() {
+    const npmCommand = this.getNpmCommand();
+    const parts = [npmCommand.command, ...npmCommand.args];
+    const separator = parts.lastIndexOf("--");
+    const command = separator >= 0 ? parts[separator + 1] : npmCommand.command;
+    return path.basename(command || "").replace(/\.(cmd|exe)$/i, "");
+  }
+
+  async runPackageCommand(command, args, options = {}) {
+    const result = await execCommand(command, args, { cwd: options.cwd || this.cwd, env: { ...process.env, ...(options.env || {}) }, timeout: options.timeout || 600000 });
+    if (result.exitCode !== 0) {
+      const detail = (result.stderr || result.stdout || result.output || "").trim();
+      throw new Error(`Command failed: ${[command, ...args].join(" ")}${detail ? `\n${detail}` : ""}`);
+    }
+    return result.stdout || "";
+  }
+
+  ensureNpmProject(root) {
+    fs.mkdirSync(root, { recursive: true });
+    const ignorePath = path.join(root, ".gitignore");
+    if (!fs.existsSync(ignorePath)) fs.writeFileSync(ignorePath, "*\n!.gitignore\n", "utf8");
+    const packageJson = path.join(root, "package.json");
+    if (!fs.existsSync(packageJson)) fs.writeFileSync(packageJson, JSON.stringify({ name: "pi-extensions", private: true }, null, 2), "utf8");
+  }
+
+  npmInstallRoot(scope, temporary = false) {
+    if (temporary || scope === "temporary") return path.join(os.tmpdir(), "pi-extensions", "npm");
+    return path.join(packageInstallBase(this.agentDir, this.cwd, scope), "npm");
+  }
+
+  npmInstallArgs(specs, root) {
+    const manager = this.packageManagerName();
+    if (manager === "bun") return ["install", ...specs, "--cwd", root, "--omit=peer"];
+    if (manager === "pnpm") {
+      return ["install", ...specs, "--prefix", root, "--config.auto-install-peers=false", "--config.strict-peer-dependencies=false", "--config.strict-dep-builds=false"];
+    }
+    return ["install", ...specs, "--prefix", root, "--legacy-peer-deps"];
+  }
+
+  async runNpm(args, options = {}) {
+    const npmCommand = this.getNpmCommand();
+    return this.runPackageCommand(npmCommand.command, [...npmCommand.args, ...args], options);
+  }
+
+  async installNpm(parsed, scope) {
+    const root = this.npmInstallRoot(scope, scope === "temporary");
+    this.ensureNpmProject(root);
+    await this.runNpm(this.npmInstallArgs([parsed.spec], root));
+  }
+
+  async uninstallNpm(parsed, scope) {
+    const root = this.npmInstallRoot(scope, false);
+    if (!fs.existsSync(root)) return;
+    const args = this.packageManagerName() === "bun" ? ["uninstall", parsed.name, "--cwd", root] : ["uninstall", parsed.name, "--prefix", root];
+    await this.runNpm(args);
+  }
+
+  getInstalledNpmVersion(installedPath) {
+    try {
+      const packageJson = JSON.parse(fs.readFileSync(path.join(installedPath, "package.json"), "utf8"));
+      return packageJson && packageJson.version ? String(packageJson.version) : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  async getLatestNpmVersion(packageName) {
+    const raw = (await this.runNpm(["view", packageName, "version", "--json"])).trim();
+    if (!raw) throw new Error("Empty response from npm view");
+    try {
+      return String(JSON.parse(raw));
+    } catch {
+      return raw.replace(/^"|"$/g, "");
+    }
+  }
+
+  async npmHasAvailableUpdate(parsed, installedPath) {
+    if (isBridgeOfflineMode()) return false;
+    const installedVersion = this.getInstalledNpmVersion(installedPath);
+    if (!installedVersion) return false;
+    try {
+      return (await this.getLatestNpmVersion(parsed.name)) !== installedVersion;
+    } catch {
+      return false;
+    }
+  }
+
+  async installGit(parsed, scope) {
+    const target = this.expectedInstalledPath(`git:${parsed.repo}${parsed.ref ? `@${parsed.ref}` : ""}`, scope);
+    if (fs.existsSync(target)) {
+      await this.runPackageCommand("git", ["pull", "--ff-only"], { cwd: target, env: { GIT_TERMINAL_PROMPT: "0" } });
+    } else {
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      await this.runPackageCommand("git", ["clone", parsed.repo, target], { env: { GIT_TERMINAL_PROMPT: "0" } });
+    }
+    if (parsed.ref) await this.runPackageCommand("git", ["checkout", parsed.ref], { cwd: target });
+    if (fs.existsSync(path.join(target, "package.json"))) await this.runNpm(["install"], { cwd: target });
+  }
+
+  async gitHasAvailableUpdate(installedPath) {
+    if (isBridgeOfflineMode()) return false;
+    try {
+      const local = (await this.runPackageCommand("git", ["rev-parse", "HEAD"], { cwd: installedPath, timeout: 60000 })).trim();
+      const remoteOutput = await this.runPackageCommand("git", ["ls-remote", "origin", "HEAD"], {
+        cwd: installedPath,
+        env: { GIT_TERMINAL_PROMPT: "0" },
+        timeout: 60000,
+      });
+      const match = remoteOutput.match(/^([0-9a-f]{40})\s+HEAD$/m) || remoteOutput.match(/^([0-9a-f]{40})\s+/m);
+      return !!(match && match[1] && match[1] !== local);
+    } catch {
+      return false;
+    }
+  }
+
+  removeGit(parsed, scope) {
+    const target = this.expectedInstalledPath(`git:${parsed.repo}${parsed.ref ? `@${parsed.ref}` : ""}`, scope);
+    if (target && fs.existsSync(target)) fs.rmSync(target, { recursive: true, force: true });
+  }
+
+  async installParsedSource(parsed, source, scope) {
+    if (parsed.type === "npm") {
+      await this.installNpm(parsed, scope);
+      return;
+    }
+    if (parsed.type === "git") {
+      await this.installGit(parsed, scope);
+    }
+  }
+
+  async resolvePackageSource(source, scope = "user", onMissing = undefined, origin = "package", filter = undefined) {
+    const parsed = parsePackageSource(source);
+    if (parsed.type === "local") {
+      const base = scope === "project" ? path.join(this.cwd, ".pi") : scope === "user" ? this.agentDir : this.cwd;
+      const root = resolveBridgePath(base, parsed.path);
+      return resourceEntriesFromRoot(root, source, scope, origin, filter);
+    }
+
+    let installedPath = this.expectedInstalledPath(source, scope);
+    if (!installedPath || !fs.existsSync(installedPath)) {
+      let action = "install";
+      if (typeof onMissing === "function") action = await onMissing(source);
+      if (action === "skip") return { extensions: [], skills: [], prompts: [], themes: [] };
+      if (action === "error") throw new Error(`Missing source: ${source}`);
+      await this.installParsedSource(parsed, source, scope);
+      installedPath = this.expectedInstalledPath(source, scope);
+    } else if (parsed.type === "git" && scope === "temporary" && !parsed.pinned) {
+      try {
+        await this.installGit(parsed, scope);
+      } catch {}
+    }
+    return resourceEntriesFromRoot(installedPath, source, scope, origin, filter);
   }
 
   async resolve(onMissing = undefined) {
     const resolved = [];
-    for (const entry of this.configuredEntries()) {
-      const installedPath = this.getInstalledPath(entry.source, entry.scope);
-      if (!installedPath || !fs.existsSync(installedPath)) {
-        if (typeof onMissing === "function") await onMissing(entry.source);
-        continue;
-      }
-      resolved.push(resourceEntriesFromRoot(installedPath, entry.source, entry.scope, "package"));
+    for (const entry of dedupePackageEntries(this.configuredEntries(), this.cwd)) {
+      resolved.push(await this.resolvePackageSource(entry.source, entry.scope, onMissing, "package", entry.filters));
     }
     return mergeResolvedResources(...resolved);
   }
 
   async resolveExtensionSources(sources = [], options = {}) {
     const scope = options.local ? "project" : options.temporary ? "temporary" : "user";
-    const resolved = sources.map((source) => {
-      const root = this.getInstalledPath(source, scope) || resolveBridgePath(this.cwd, source);
-      return resourceEntriesFromRoot(root, source, scope, options.temporary ? "top-level" : "package");
-    });
+    const resolved = [];
+    for (const source of sources) {
+      resolved.push(await this.resolvePackageSource(source, scope, undefined, options.temporary ? "top-level" : "package"));
+    }
     return mergeResolvedResources(...resolved);
   }
 
@@ -2856,16 +3777,35 @@ class DefaultPackageManager {
     const data = scope === "project" ? this.settingsManager.projectSettings : this.settingsManager.globalSettings;
     if (!data || !Array.isArray(data.packages)) return false;
     const before = data.packages.length;
-    data.packages = data.packages.filter((entry) => (typeof entry === "string" ? entry : entry && entry.source) !== source);
+    const wanted = packageSourceIdentity(source, this.cwd, options.local ? "project" : "user");
+    data.packages = data.packages.filter((entry) => {
+      const current = typeof entry === "string" ? entry : entry && entry.source;
+      if (!current) return true;
+      return packageSourceIdentity(current, this.cwd, options.local ? "project" : "user") !== wanted;
+    });
     if (data.packages.length === before) return false;
     this.settingsManager.save(scope);
     return true;
   }
 
   async install(source, options = {}) {
-    const installedPath = this.getInstalledPath(source, options.local ? "project" : "user");
-    if (installedPath && fs.existsSync(installedPath)) return;
-    throw new Error(`Package installation is not available in the ocaml-agent bridge: ${source}`);
+    const scope = options.local ? "project" : "user";
+    const parsed = parsePackageSource(source);
+    this.emitProgress({ type: "start", action: "install", source, message: `Installing ${source}...` });
+    try {
+      if (parsed.type === "local") {
+        const resolved = resolveBridgePath(this.cwd, parsed.path);
+        if (!fs.existsSync(resolved)) throw new Error(`Path does not exist: ${resolved}`);
+      } else if (parsed.type === "npm") {
+        await this.installNpm(parsed, scope);
+      } else if (parsed.type === "git") {
+        await this.installGit(parsed, scope);
+      }
+      this.emitProgress({ type: "complete", action: "install", source });
+    } catch (error) {
+      this.emitProgress({ type: "error", action: "install", source, message: error && error.message ? error.message : String(error) });
+      throw error;
+    }
   }
 
   async installAndPersist(source, options = {}) {
@@ -2873,7 +3813,11 @@ class DefaultPackageManager {
     this.addSourceToSettings(source, options);
   }
 
-  async remove(source, _options = {}) {
+  async remove(source, options = {}) {
+    const scope = options.local ? "project" : "user";
+    const parsed = parsePackageSource(source);
+    if (parsed.type === "npm") await this.uninstallNpm(parsed, scope);
+    else if (parsed.type === "git") this.removeGit(parsed, scope);
     this.emitProgress({ type: "complete", action: "remove", source });
   }
 
@@ -2884,7 +3828,40 @@ class DefaultPackageManager {
   }
 
   async update(source = undefined) {
+    const entries = this.configuredEntries();
+    const wanted = source ? packageSourceIdentity(source, this.cwd) : undefined;
+    let matched = false;
+    for (const entry of entries) {
+      if (wanted && packageSourceIdentity(entry.source, this.cwd, entry.scope) !== wanted) continue;
+      matched = true;
+      const parsed = parsePackageSource(entry.source);
+      if (parsed.type === "local") continue;
+      if (parsed.pinned) continue;
+      await this.install(entry.source, { local: entry.scope === "project" });
+    }
+    if (source && !matched) throw new Error(`No matching package found for ${source}`);
     this.emitProgress({ type: "complete", action: "update", source: source || "*" });
+  }
+
+  async checkForAvailableUpdates() {
+    if (isBridgeOfflineMode()) return [];
+    const updates = [];
+    for (const entry of dedupePackageEntries(this.configuredEntries(), this.cwd)) {
+      const parsed = parsePackageSource(entry.source);
+      if (parsed.type === "local" || parsed.pinned) continue;
+      const installedPath = this.getInstalledPath(entry.source, entry.scope);
+      if (!installedPath) continue;
+      if (parsed.type === "npm") {
+        if (await this.npmHasAvailableUpdate(parsed, installedPath)) {
+          updates.push({ source: entry.source, displayName: parsed.name, type: "npm", scope: entry.scope });
+        }
+      } else if (parsed.type === "git") {
+        if (await this.gitHasAvailableUpdate(installedPath)) {
+          updates.push({ source: entry.source, displayName: `${parsed.host}/${parsed.path}`, type: "git", scope: entry.scope });
+        }
+      }
+    }
+    return updates;
   }
 }
 
@@ -2926,8 +3903,10 @@ function loadProjectContextFiles(options = {}) {
 function loadPromptFile(filePath, source = "path", baseDir = path.dirname(filePath)) {
   const markdown = fs.readFileSync(filePath, "utf8");
   const parsed = parseFrontmatter(markdown);
-  const name = String(parsed.data.name || path.basename(filePath, path.extname(filePath))).trim();
-  const description = String(parsed.data.description || parsed.body.split(/\r?\n/).find((line) => line.trim()) || "").trim();
+  const name = String(path.basename(filePath, path.extname(filePath))).trim();
+  const firstLine = parsed.body.split(/\r?\n/).find((line) => line.trim());
+  let description = String(parsed.data.description || firstLine || "").trim();
+  if (!parsed.data.description && description.length > 60) description = `${description.slice(0, 60)}...`;
   return {
     name,
     description,
@@ -3019,6 +3998,7 @@ class DefaultResourceLoader {
     this.additionalSkillPaths = options.additionalSkillPaths || [];
     this.additionalPromptTemplatePaths = options.additionalPromptTemplatePaths || [];
     this.additionalThemePaths = options.additionalThemePaths || [];
+    this.extensionFactories = Array.isArray(options.extensionFactories) ? options.extensionFactories.slice() : [];
     this.noExtensions = !!options.noExtensions;
     this.noSkills = !!options.noSkills;
     this.noPromptTemplates = !!options.noPromptTemplates;
@@ -3026,6 +4006,13 @@ class DefaultResourceLoader {
     this.noContextFiles = !!options.noContextFiles;
     this.systemPromptSource = options.systemPrompt;
     this.appendSystemPromptSource = options.appendSystemPrompt;
+    this.extensionsOverride = typeof options.extensionsOverride === "function" ? options.extensionsOverride : undefined;
+    this.skillsOverride = typeof options.skillsOverride === "function" ? options.skillsOverride : undefined;
+    this.promptsOverride = typeof options.promptsOverride === "function" ? options.promptsOverride : undefined;
+    this.themesOverride = typeof options.themesOverride === "function" ? options.themesOverride : undefined;
+    this.agentsFilesOverride = typeof options.agentsFilesOverride === "function" ? options.agentsFilesOverride : undefined;
+    this.systemPromptOverride = typeof options.systemPromptOverride === "function" ? options.systemPromptOverride : undefined;
+    this.appendSystemPromptOverride = typeof options.appendSystemPromptOverride === "function" ? options.appendSystemPromptOverride : undefined;
     this.extensionsResult = { extensions: [], errors: [], runtime: createExtensionRuntime() };
     this.skills = [];
     this.skillDiagnostics = [];
@@ -3036,6 +4023,12 @@ class DefaultResourceLoader {
     this.agentsFiles = [];
     this.systemPrompt = undefined;
     this.appendSystemPrompt = [];
+    this.lastSkillPaths = [];
+    this.lastPromptPaths = [];
+    this.lastThemePaths = [];
+    this.extensionSkillSourceInfos = new Map();
+    this.extensionPromptSourceInfos = new Map();
+    this.extensionThemeSourceInfos = new Map();
   }
 
   getExtensions() { return this.extensionsResult; }
@@ -3057,64 +4050,365 @@ class DefaultResourceLoader {
     return String(input);
   }
 
+  discoverSystemPromptFile() {
+    for (const candidate of [path.join(this.cwd, ".pi", "SYSTEM.md"), path.join(this.agentDir, "SYSTEM.md")]) {
+      if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate;
+    }
+    return undefined;
+  }
+
+  discoverAppendSystemPromptFile() {
+    for (const candidate of [path.join(this.cwd, ".pi", "APPEND_SYSTEM.md"), path.join(this.agentDir, "APPEND_SYSTEM.md")]) {
+      if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate;
+    }
+    return undefined;
+  }
+
+  async loadExtensionFactories(runtime) {
+    const extensions = [];
+    const errors = [];
+    for (const [index, factory] of this.extensionFactories.entries()) {
+      const extensionPath = `<inline:${index + 1}>`;
+      try {
+        extensions.push(await loadExtensionFromFactory(factory, this.cwd, this.eventBus, runtime, extensionPath));
+      } catch (error) {
+        errors.push({ path: extensionPath, error: error && error.message ? error.message : String(error) });
+      }
+    }
+    return { extensions, errors };
+  }
+
+  resolveResourcePath(value) {
+    return resolveBridgePath(this.cwd, value);
+  }
+
+  canonicalResourcePath(value) {
+    try {
+      return fs.realpathSync(value);
+    } catch {
+      return path.resolve(String(value || ""));
+    }
+  }
+
+  mergePaths(primary = [], additional = []) {
+    const merged = [];
+    const seen = new Set();
+    for (const value of [...primary, ...additional]) {
+      if (!value) continue;
+      const resolved = this.resolveResourcePath(value);
+      const key = this.canonicalResourcePath(resolved);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      merged.push(resolved);
+    }
+    return merged;
+  }
+
+  normalizeExtensionPaths(entries = []) {
+    return entries.map((entry) => {
+      const rawPath = typeof entry === "string" ? entry : entry && entry.path;
+      const metadata = typeof entry === "object" && entry && entry.metadata ? { ...entry.metadata } : undefined;
+      if (metadata && metadata.baseDir) metadata.baseDir = this.resolveResourcePath(metadata.baseDir);
+      return { path: this.resolveResourcePath(rawPath), metadata };
+    }).filter((entry) => entry.path);
+  }
+
+  isUnderPath(target, root) {
+    if (!target || !root) return false;
+    const normalizedTarget = path.resolve(target);
+    const normalizedRoot = path.resolve(root);
+    return normalizedTarget === normalizedRoot || normalizedTarget.startsWith(`${normalizedRoot}${path.sep}`);
+  }
+
+  sourceInfoFromMetadata(resourcePath, metadata) {
+    if (!metadata) return undefined;
+    return createSyntheticSourceInfo(resourcePath, {
+      source: metadata.source,
+      scope: metadata.scope,
+      origin: metadata.origin,
+      baseDir: metadata.baseDir,
+    });
+  }
+
+  findSourceInfoForPath(resourcePath, extraSourceInfos = undefined, metadataByPath = undefined) {
+    if (!resourcePath) return undefined;
+    if (String(resourcePath).startsWith("<")) return this.getDefaultSourceInfoForPath(resourcePath);
+    const normalizedResourcePath = path.resolve(resourcePath);
+    if (extraSourceInfos) {
+      for (const [sourcePath, sourceInfo] of extraSourceInfos.entries()) {
+        const normalizedSourcePath = path.resolve(sourcePath);
+        if (normalizedResourcePath === normalizedSourcePath || normalizedResourcePath.startsWith(`${normalizedSourcePath}${path.sep}`)) {
+          return { ...sourceInfo, path: resourcePath };
+        }
+      }
+    }
+    if (metadataByPath) {
+      const exact = metadataByPath.get(normalizedResourcePath) || metadataByPath.get(resourcePath);
+      if (exact) return this.sourceInfoFromMetadata(resourcePath, exact);
+      for (const [sourcePath, metadata] of metadataByPath.entries()) {
+        const normalizedSourcePath = path.resolve(sourcePath);
+        if (normalizedResourcePath === normalizedSourcePath || normalizedResourcePath.startsWith(`${normalizedSourcePath}${path.sep}`)) {
+          return this.sourceInfoFromMetadata(resourcePath, metadata);
+        }
+      }
+    }
+    return undefined;
+  }
+
+  getDefaultSourceInfoForPath(filePath) {
+    const text = String(filePath || "");
+    if (text.startsWith("<") && text.endsWith(">")) {
+      return {
+        path: text,
+        source: text.slice(1, -1).split(":")[0] || "temporary",
+        scope: "temporary",
+        origin: "top-level",
+      };
+    }
+    const normalized = path.resolve(text);
+    const roots = [
+      { root: path.join(this.agentDir, "skills"), scope: "user" },
+      { root: path.join(this.agentDir, "prompts"), scope: "user" },
+      { root: path.join(this.agentDir, "themes"), scope: "user" },
+      { root: path.join(this.agentDir, "extensions"), scope: "user" },
+      { root: path.join(this.cwd, ".pi", "skills"), scope: "project" },
+      { root: path.join(this.cwd, ".pi", "prompts"), scope: "project" },
+      { root: path.join(this.cwd, ".pi", "themes"), scope: "project" },
+      { root: path.join(this.cwd, ".pi", "extensions"), scope: "project" },
+    ];
+    for (const entry of roots) {
+      if (this.isUnderPath(normalized, entry.root)) {
+        return createSyntheticSourceInfo(text, { source: "local", scope: entry.scope, baseDir: entry.root });
+      }
+    }
+    let isDirectory = false;
+    try {
+      isDirectory = fs.statSync(normalized).isDirectory();
+    } catch {}
+    return createSyntheticSourceInfo(text, {
+      source: "local",
+      scope: "temporary",
+      baseDir: isDirectory ? normalized : path.dirname(normalized),
+    });
+  }
+
+  applyExtensionSourceInfo(extensions, metadataByPath) {
+    for (const extension of extensions || []) {
+      extension.sourceInfo =
+        this.findSourceInfoForPath(extension.path, undefined, metadataByPath) ||
+        extension.sourceInfo ||
+        this.getDefaultSourceInfoForPath(extension.path);
+      for (const command of extension.commands ? extension.commands.values() : []) command.sourceInfo = extension.sourceInfo;
+      for (const tool of extension.tools ? extension.tools.values() : []) tool.sourceInfo = extension.sourceInfo;
+    }
+  }
+
+  dedupePrompts(prompts = []) {
+    const byName = new Map();
+    const diagnostics = [];
+    for (const prompt of prompts) {
+      const existing = byName.get(prompt.name);
+      if (existing) {
+        diagnostics.push({
+          type: "collision",
+          message: `name "/${prompt.name}" collision`,
+          path: prompt.filePath,
+          collision: {
+            resourceType: "prompt",
+            name: prompt.name,
+            winnerPath: existing.filePath,
+            loserPath: prompt.filePath,
+          },
+        });
+      } else {
+        byName.set(prompt.name, prompt);
+      }
+    }
+    return { prompts: [...byName.values()], diagnostics };
+  }
+
+  dedupeThemes(themes = []) {
+    const byName = new Map();
+    const diagnostics = [];
+    for (const theme of themes) {
+      const name = theme && theme.name ? theme.name : "unnamed";
+      const existing = byName.get(name);
+      if (existing) {
+        diagnostics.push({
+          type: "collision",
+          message: `name "${name}" collision`,
+          path: theme.sourcePath || theme.path,
+          collision: {
+            resourceType: "theme",
+            name,
+            winnerPath: existing.sourcePath || existing.path || "<builtin>",
+            loserPath: theme.sourcePath || theme.path || "<builtin>",
+          },
+        });
+      } else {
+        byName.set(name, theme);
+      }
+    }
+    return { themes: [...byName.values()], diagnostics };
+  }
+
+  updateSkillsFromPaths(skillPaths, metadataByPath = undefined, includeDefaults = false) {
+    const base = this.noSkills && skillPaths.length === 0
+      ? { skills: [], diagnostics: [] }
+      : loadSkills({ cwd: this.cwd, agentDir: this.agentDir, skillPaths, includeDefaults });
+    const resolved = this.skillsOverride ? this.skillsOverride(base) : base;
+    this.skills = (resolved.skills || []).map((skill) => ({
+      ...skill,
+      sourceInfo:
+        this.findSourceInfoForPath(skill.filePath, this.extensionSkillSourceInfos, metadataByPath) ||
+        skill.sourceInfo ||
+        this.getDefaultSourceInfoForPath(skill.filePath),
+    }));
+    this.skillDiagnostics = resolved.diagnostics || [];
+  }
+
+  updatePromptsFromPaths(promptPaths, metadataByPath = undefined, includeDefaults = false) {
+    let base;
+    if (this.noPromptTemplates && promptPaths.length === 0) {
+      base = { prompts: [], diagnostics: [] };
+    } else {
+      const loaded = loadPromptTemplates({ cwd: this.cwd, agentDir: this.agentDir, promptPaths, includeDefaults });
+      const deduped = this.dedupePrompts(loaded.prompts || []);
+      base = { prompts: deduped.prompts, diagnostics: [...(loaded.diagnostics || []), ...deduped.diagnostics] };
+    }
+    const resolved = this.promptsOverride ? this.promptsOverride(base) : base;
+    this.prompts = (resolved.prompts || []).map((prompt) => ({
+      ...prompt,
+      sourceInfo:
+        this.findSourceInfoForPath(prompt.filePath, this.extensionPromptSourceInfos, metadataByPath) ||
+        prompt.sourceInfo ||
+        this.getDefaultSourceInfoForPath(prompt.filePath),
+    }));
+    this.promptDiagnostics = resolved.diagnostics || [];
+  }
+
+  updateThemesFromPaths(themePaths, metadataByPath = undefined, includeDefaults = false) {
+    let base;
+    if (this.noThemes && themePaths.length === 0) {
+      base = { themes: [], diagnostics: [] };
+    } else {
+      const loaded = loadThemesFromPaths(themePaths, { cwd: this.cwd });
+      const rawThemes = includeDefaults ? [{ name: "dark" }, { name: "light" }, ...loaded.themes] : loaded.themes;
+      const deduped = this.dedupeThemes(rawThemes);
+      base = { themes: deduped.themes, diagnostics: [...(loaded.diagnostics || []), ...deduped.diagnostics] };
+    }
+    const resolved = this.themesOverride ? this.themesOverride(base) : base;
+    this.themes = (resolved.themes || []).map((theme) => {
+      const sourcePath = theme.sourcePath || theme.path;
+      return sourcePath
+        ? {
+            ...theme,
+            sourceInfo:
+              this.findSourceInfoForPath(sourcePath, this.extensionThemeSourceInfos, metadataByPath) ||
+              theme.sourceInfo ||
+              this.getDefaultSourceInfoForPath(sourcePath),
+          }
+        : theme;
+    });
+    this.themeDiagnostics = resolved.diagnostics || [];
+  }
+
   async reload() {
     if (this.settingsManager && typeof this.settingsManager.reload === "function") await this.settingsManager.reload();
     const packageResources = await this.packageManager.resolve();
     const cliResources = await this.packageManager.resolveExtensionSources(this.additionalExtensionPaths, { temporary: true });
-    const extensions = this.noExtensions ? cliResources.extensions : [...cliResources.extensions, ...packageResources.extensions];
-    const extensionPaths = extensions.filter((entry) => entry.enabled).map((entry) => entry.path);
-    this.extensionsResult = this.noExtensions
-      ? { extensions: [], errors: [], runtime: createExtensionRuntime() }
+    const metadataByPath = new Map();
+    const addMetadata = (entries = []) => {
+      for (const entry of entries) {
+        if (entry && entry.path && entry.metadata && !metadataByPath.has(path.resolve(entry.path))) {
+          metadataByPath.set(path.resolve(entry.path), entry.metadata);
+        }
+      }
+    };
+    for (const kind of ["extensions", "skills", "prompts", "themes"]) {
+      addMetadata(packageResources[kind]);
+      addMetadata(cliResources[kind]);
+    }
+    this.extensionSkillSourceInfos = new Map();
+    this.extensionPromptSourceInfos = new Map();
+    this.extensionThemeSourceInfos = new Map();
+    const cliExtensionPaths = cliResources.extensions.filter((entry) => entry.enabled).map((entry) => entry.path);
+    const packageExtensionPaths = packageResources.extensions.filter((entry) => entry.enabled).map((entry) => entry.path);
+    const extensionPaths = this.noExtensions ? this.mergePaths(cliExtensionPaths, []) : this.mergePaths(cliExtensionPaths, packageExtensionPaths);
+    const extensionsResult = this.noExtensions
+      ? await loadExtensions(extensionPaths, this.cwd, this.eventBus)
       : await discoverAndLoadExtensions(extensionPaths, this.cwd, this.agentDir, this.eventBus);
+    const inlineExtensions = await this.loadExtensionFactories(extensionsResult.runtime);
+    extensionsResult.extensions.push(...inlineExtensions.extensions);
+    extensionsResult.errors.push(...inlineExtensions.errors);
+    this.extensionsResult = this.extensionsOverride ? this.extensionsOverride(extensionsResult) : extensionsResult;
+    this.applyExtensionSourceInfo(this.extensionsResult.extensions, metadataByPath);
 
-    const skillPaths = this.noSkills ? this.additionalSkillPaths : [
-      ...packageResources.skills.filter((entry) => entry.enabled).map((entry) => entry.path),
-      ...this.additionalSkillPaths,
-    ];
-    const skillResult = loadSkills({ cwd: this.cwd, agentDir: this.agentDir, skillPaths, includeDefaults: !this.noSkills });
-    this.skills = skillResult.skills;
-    this.skillDiagnostics = skillResult.diagnostics;
+    const cliSkillPaths = cliResources.skills.filter((entry) => entry.enabled).map((entry) => entry.path);
+    const packageSkillPaths = packageResources.skills.filter((entry) => entry.enabled).map((entry) => entry.path);
+    const skillPaths = this.noSkills
+      ? this.mergePaths(cliSkillPaths, this.additionalSkillPaths)
+      : this.mergePaths([...cliSkillPaths, ...packageSkillPaths], this.additionalSkillPaths);
+    this.lastSkillPaths = skillPaths;
+    this.updateSkillsFromPaths(skillPaths, metadataByPath, !this.noSkills);
 
-    const promptPaths = this.noPromptTemplates ? this.additionalPromptTemplatePaths : [
-      ...packageResources.prompts.filter((entry) => entry.enabled).map((entry) => entry.path),
-      ...this.additionalPromptTemplatePaths,
-    ];
-    const promptResult = loadPromptTemplates({ cwd: this.cwd, agentDir: this.agentDir, promptPaths, includeDefaults: !this.noPromptTemplates });
-    this.prompts = promptResult.prompts;
-    this.promptDiagnostics = promptResult.diagnostics;
+    const cliPromptPaths = cliResources.prompts.filter((entry) => entry.enabled).map((entry) => entry.path);
+    const packagePromptPaths = packageResources.prompts.filter((entry) => entry.enabled).map((entry) => entry.path);
+    const promptPaths = this.noPromptTemplates
+      ? this.mergePaths(cliPromptPaths, this.additionalPromptTemplatePaths)
+      : this.mergePaths([...cliPromptPaths, ...packagePromptPaths], this.additionalPromptTemplatePaths);
+    this.lastPromptPaths = promptPaths;
+    this.updatePromptsFromPaths(promptPaths, metadataByPath, !this.noPromptTemplates);
 
-    const themePaths = this.noThemes ? this.additionalThemePaths : [
-      ...packageResources.themes.filter((entry) => entry.enabled).map((entry) => entry.path),
-      ...this.additionalThemePaths,
-    ];
-    const themeResult = loadThemesFromPaths(themePaths, { cwd: this.cwd });
-    this.themes = this.noThemes ? themeResult.themes : [{ name: "dark" }, { name: "light" }, ...themeResult.themes];
-    this.themeDiagnostics = themeResult.diagnostics;
+    const cliThemePaths = cliResources.themes.filter((entry) => entry.enabled).map((entry) => entry.path);
+    const packageThemePaths = packageResources.themes.filter((entry) => entry.enabled).map((entry) => entry.path);
+    const themePaths = this.noThemes
+      ? this.mergePaths(cliThemePaths, this.additionalThemePaths)
+      : this.mergePaths([...cliThemePaths, ...packageThemePaths], this.additionalThemePaths);
+    this.lastThemePaths = themePaths;
+    this.updateThemesFromPaths(themePaths, metadataByPath, !this.noThemes);
 
-    this.agentsFiles = this.noContextFiles ? [] : loadProjectContextFiles({ cwd: this.cwd, agentDir: this.agentDir });
-    this.systemPrompt = this.resolvePromptInput(this.systemPromptSource);
-    const appendSources = Array.isArray(this.appendSystemPromptSource) ? this.appendSystemPromptSource : [];
-    this.appendSystemPrompt = appendSources.map((source) => this.resolvePromptInput(source)).filter((value) => value !== undefined);
+    const baseAgentsFiles = { agentsFiles: this.noContextFiles ? [] : loadProjectContextFiles({ cwd: this.cwd, agentDir: this.agentDir }) };
+    const resolvedAgentsFiles = this.agentsFilesOverride ? this.agentsFilesOverride(baseAgentsFiles) : baseAgentsFiles;
+    this.agentsFiles = Array.isArray(resolvedAgentsFiles && resolvedAgentsFiles.agentsFiles) ? resolvedAgentsFiles.agentsFiles : [];
+    const baseSystemPrompt = this.resolvePromptInput(this.systemPromptSource || this.discoverSystemPromptFile());
+    this.systemPrompt = this.systemPromptOverride ? this.systemPromptOverride(baseSystemPrompt) : baseSystemPrompt;
+    const discoveredAppend = this.discoverAppendSystemPromptFile();
+    const appendSources =
+      this.appendSystemPromptSource !== undefined
+        ? (Array.isArray(this.appendSystemPromptSource) ? this.appendSystemPromptSource : [this.appendSystemPromptSource])
+        : (discoveredAppend ? [discoveredAppend] : []);
+    const baseAppend = appendSources.map((source) => this.resolvePromptInput(source)).filter((value) => value !== undefined);
+    this.appendSystemPrompt = this.appendSystemPromptOverride ? this.appendSystemPromptOverride(baseAppend) : baseAppend;
   }
 
   extendResources(paths = {}) {
-    const skillPaths = (paths.skillPaths || []).map((entry) => entry.path || entry);
-    const promptPaths = (paths.promptPaths || []).map((entry) => entry.path || entry);
-    const themePaths = (paths.themePaths || []).map((entry) => entry.path || entry);
+    const skillEntries = this.normalizeExtensionPaths(paths.skillPaths || []);
+    const promptEntries = this.normalizeExtensionPaths(paths.promptPaths || []);
+    const themeEntries = this.normalizeExtensionPaths(paths.themePaths || []);
+    const skillPaths = skillEntries.map((entry) => entry.path);
+    const promptPaths = promptEntries.map((entry) => entry.path);
+    const themePaths = themeEntries.map((entry) => entry.path);
+    for (const entry of skillEntries) {
+      if (entry.metadata) this.extensionSkillSourceInfos.set(entry.path, this.sourceInfoFromMetadata(entry.path, entry.metadata));
+    }
+    for (const entry of promptEntries) {
+      if (entry.metadata) this.extensionPromptSourceInfos.set(entry.path, this.sourceInfoFromMetadata(entry.path, entry.metadata));
+    }
+    for (const entry of themeEntries) {
+      if (entry.metadata) this.extensionThemeSourceInfos.set(entry.path, this.sourceInfoFromMetadata(entry.path, entry.metadata));
+    }
     if (skillPaths.length > 0) {
-      const result = loadSkills({ cwd: this.cwd, agentDir: this.agentDir, skillPaths, includeDefaults: false });
-      this.skills = [...this.skills, ...result.skills];
-      this.skillDiagnostics = [...this.skillDiagnostics, ...result.diagnostics];
+      this.lastSkillPaths = this.mergePaths(this.lastSkillPaths, skillPaths);
+      this.updateSkillsFromPaths(this.lastSkillPaths, undefined, !this.noSkills);
     }
     if (promptPaths.length > 0) {
-      const result = loadPromptTemplates({ cwd: this.cwd, agentDir: this.agentDir, promptPaths, includeDefaults: false });
-      this.prompts = [...this.prompts, ...result.prompts];
-      this.promptDiagnostics = [...this.promptDiagnostics, ...result.diagnostics];
+      this.lastPromptPaths = this.mergePaths(this.lastPromptPaths, promptPaths);
+      this.updatePromptsFromPaths(this.lastPromptPaths, undefined, !this.noPromptTemplates);
     }
     if (themePaths.length > 0) {
-      const result = loadThemesFromPaths(themePaths, { cwd: this.cwd });
-      this.themes = [...this.themes, ...result.themes];
-      this.themeDiagnostics = [...this.themeDiagnostics, ...result.diagnostics];
+      this.lastThemePaths = this.mergePaths(this.lastThemePaths, themePaths);
+      this.updateThemesFromPaths(this.lastThemePaths, undefined, !this.noThemes);
     }
   }
 }
@@ -3225,6 +4519,9 @@ class BridgeTextComponent {
   constructor(content = "") {
     this.content = content;
   }
+  setText(content) { this.content = content; }
+  invalidate() {}
+  dispose() {}
   render() {
     if (Array.isArray(this.content)) return this.content.map(String);
     return String(this.content || "").split(/\r?\n/);
@@ -3238,8 +4535,18 @@ class Container {
   addChild(child) {
     if (child !== undefined && child !== null) this.children.push(child);
   }
+  removeChild(child) {
+    const index = this.children.indexOf(child);
+    if (index >= 0) this.children.splice(index, 1);
+  }
   clear() {
     this.children = [];
+  }
+  invalidate() {
+    for (const child of this.children) if (child && typeof child.invalidate === "function") child.invalidate();
+  }
+  dispose() {
+    for (const child of this.children) if (child && typeof child.dispose === "function") child.dispose();
   }
   render(width = 80) {
     return this.children.flatMap((child) => componentLines(child, width));
@@ -3248,11 +4555,272 @@ class Container {
 
 class Box extends Container {}
 
+class Spacer {
+  constructor(lines = 1) {
+    this.lines = Math.max(0, Number(lines) || 0);
+  }
+  setLines(lines) { this.lines = Math.max(0, Number(lines) || 0); }
+  invalidate() {}
+  dispose() {}
+  render() { return Array.from({ length: this.lines }, () => ""); }
+}
+
+class GenericSelectList {
+  constructor(items = [], maxVisible = 5, theme = undefined, layout = {}) {
+    this.items = Array.isArray(items) ? items.slice() : [];
+    this.filteredItems = this.items.slice();
+    this.selectedIndex = 0;
+    this.maxVisible = Math.max(1, Number(maxVisible) || 5);
+    this.theme = theme || {};
+    this.layout = layout || {};
+  }
+  setFilter(filter = "") {
+    const query = String(filter || "").toLowerCase();
+    this.filteredItems = query
+      ? this.items.filter((item) => String(item.label || item.value || "").toLowerCase().startsWith(query))
+      : this.items.slice();
+    this.selectedIndex = 0;
+  }
+  setSelectedIndex(index) {
+    this.selectedIndex = Math.max(0, Math.min(Number(index) || 0, Math.max(0, this.filteredItems.length - 1)));
+    if (this.onSelectionChange && this.filteredItems[this.selectedIndex]) this.onSelectionChange(this.filteredItems[this.selectedIndex]);
+  }
+  getSelectedItem() {
+    return this.filteredItems[this.selectedIndex];
+  }
+  handleInput(data) {
+    if (matchesKey(data, "up")) this.setSelectedIndex(this.selectedIndex - 1);
+    else if (matchesKey(data, "down")) this.setSelectedIndex(this.selectedIndex + 1);
+    else if (matchesKey(data, "enter") && this.onSelect && this.getSelectedItem()) this.onSelect(this.getSelectedItem());
+    else if (matchesKey(data, "escape") && this.onCancel) this.onCancel();
+  }
+  invalidate() {}
+  dispose() {}
+  render(width = 80) {
+    const visible = this.filteredItems.slice(0, this.maxVisible);
+    if (visible.length === 0) return ["No matching items"];
+    return visible.map((item, index) => {
+      const selected = index === this.selectedIndex ? "> " : "  ";
+      const label = String(item.label || item.value || "");
+      const value = item.value !== undefined && String(item.value) !== label ? ` ${item.value}` : "";
+      const description = item.description ? ` - ${item.description}` : "";
+      return truncateToWidth(`${selected}${label}${value}${description}`, width, "");
+    });
+  }
+}
+
+class SelectList extends GenericSelectList {}
+
+class SettingsList extends GenericSelectList {
+  render(width = 80) {
+    const visible = this.filteredItems.slice(0, this.maxVisible);
+    if (visible.length === 0) return ["No matching settings"];
+    return visible.map((item, index) => {
+      const selected = index === this.selectedIndex ? "> " : "  ";
+      const label = String(item.label || item.key || item.value || "");
+      const currentValue = item.currentValue !== undefined ? ` = ${item.currentValue}` : "";
+      const description = item.description ? ` - ${item.description}` : "";
+      return truncateToWidth(`${selected}${label}${currentValue}${description}`, width, "");
+    });
+  }
+}
+
+class Input extends BridgeTextComponent {
+  constructor(value = "", placeholder = "") {
+    super(value);
+    this.value = String(value || "");
+    this.placeholder = String(placeholder || "");
+    this.cursor = this.value.length;
+    this.focused = false;
+  }
+  setValue(value) {
+    this.value = String(value || "");
+    this.content = this.value;
+    this.cursor = Math.min(this.cursor, this.value.length);
+  }
+  getValue() { return this.value; }
+  handleInput(data) {
+    if (matchesKey(data, "backspace")) {
+      this.value = this.value.slice(0, Math.max(0, this.value.length - 1));
+    } else if (typeof data === "string" && data.length === 1 && data >= " ") {
+      this.value += data;
+    }
+    this.content = this.value;
+    this.cursor = this.value.length;
+  }
+  render(width = 80) {
+    const text = this.value || this.placeholder;
+    const marker = this.focused ? CURSOR_MARKER : "";
+    return [truncateToWidth(`${text}${marker}`, width, "")];
+  }
+}
+
+class Editor extends BridgeTextComponent {
+  constructor(options = {}) {
+    super("");
+    this.options = options;
+    this.value = "";
+    this.cursor = 0;
+    this.focused = false;
+  }
+  setText(text) {
+    this.value = String(text || "");
+    this.content = this.value;
+    this.cursor = this.value.length;
+  }
+  getText() { return this.value; }
+  handleInput(data) {
+    if (matchesKey(data, "backspace")) this.setText(this.value.slice(0, -1));
+    else if (typeof data === "string" && data.length === 1 && data >= " ") this.setText(this.value + data);
+  }
+}
+
+class ImageComponent extends BridgeTextComponent {
+  constructor(_data = undefined, options = {}) {
+    super(options.alt || options.label || "[image]");
+    this.options = options;
+  }
+}
+
+class Loader extends BridgeTextComponent {
+  constructor(text = "Loading") {
+    super(text);
+  }
+}
+
+class CancellableLoader extends Loader {}
+
+class TruncatedText extends BridgeTextComponent {
+  render(width = 80) {
+    return [truncateToWidth(String(this.content || ""), width)];
+  }
+}
+
+class TUI {}
+class ProcessTerminal {}
+
+const CURSOR_MARKER = "\x1b_pi:c\x07";
+
+const Key = {
+  escape: "escape",
+  esc: "esc",
+  enter: "enter",
+  return: "return",
+  tab: "tab",
+  space: "space",
+  backspace: "backspace",
+  delete: "delete",
+  insert: "insert",
+  clear: "clear",
+  home: "home",
+  end: "end",
+  pageUp: "pageUp",
+  pageDown: "pageDown",
+  up: "up",
+  down: "down",
+  left: "left",
+  right: "right",
+  ctrl: (key) => `ctrl+${key}`,
+  alt: (key) => `alt+${key}`,
+  shift: (key) => `shift+${key}`,
+  super: (key) => `super+${key}`,
+  ctrlShift: (key) => `ctrl+shift+${key}`,
+  ctrlAlt: (key) => `ctrl+alt+${key}`,
+  ctrlSuper: (key) => `ctrl+super+${key}`,
+};
+
+function normalizeKeyId(keyId) {
+  return String(keyId || "").toLowerCase().replace(/^esc$/, "escape").replace(/^return$/, "enter");
+}
+
+function keySequenceName(data) {
+  if (data === "\x1b") return "escape";
+  if (data === "\n" || data === "\r") return "enter";
+  if (data === "\t") return "tab";
+  if (data === " " || data === "\x00") return "space";
+  if (data === "\x7f" || data === "\b") return "backspace";
+  if (data === "\x1b[A" || data === "\x1bOA") return "up";
+  if (data === "\x1b[B" || data === "\x1bOB") return "down";
+  if (data === "\x1b[D" || data === "\x1bOD") return "left";
+  if (data === "\x1b[C" || data === "\x1bOC") return "right";
+  return "";
+}
+
+function matchesKey(data, keyId) {
+  const wanted = normalizeKeyId(keyId);
+  const text = String(data || "");
+  if (!wanted) return false;
+  if (wanted.length === 1) return text.toLowerCase() === wanted;
+  const named = keySequenceName(text);
+  if (named && named === wanted) return true;
+  const ctrl = wanted.match(/^ctrl\+(.+)$/);
+  if (ctrl && ctrl[1].length === 1) {
+    const code = ctrl[1].toLowerCase().charCodeAt(0);
+    return text === String.fromCharCode(code - 96);
+  }
+  const shift = wanted.match(/^shift\+(.+)$/);
+  if (shift && shift[1].length === 1) return text === shift[1].toUpperCase();
+  const alt = wanted.match(/^alt\+(.+)$/);
+  if (alt && alt[1].length === 1) return text === `\x1b${alt[1]}`;
+  return false;
+}
+
+function parseKey(data) {
+  return keySequenceName(String(data || "")) || (String(data || "").length === 1 ? String(data) : undefined);
+}
+
+function isKeyRelease(data) {
+  return /[;:]3[~u]$/.test(String(data || ""));
+}
+
+function isKeyRepeat(data) {
+  return /[;:]2[~u]$/.test(String(data || ""));
+}
+
+function visibleWidth(text) {
+  return String(text || "")
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/\x1b_pi:c\x07/g, "")
+    .length;
+}
+
+function truncateToWidth(text, width = 80, suffix = "…") {
+  const value = String(text || "");
+  const limit = Math.max(0, Number(width) || 0);
+  if (visibleWidth(value) <= limit) return value;
+  const tail = String(suffix === undefined ? "…" : suffix);
+  const tailWidth = visibleWidth(tail);
+  const keep = Math.max(0, limit - tailWidth);
+  return Array.from(value).slice(0, keep).join("") + tail;
+}
+
+function wrapTextWithAnsi(text, width = 80) {
+  const limit = Math.max(1, Number(width) || 80);
+  const lines = [];
+  for (const rawLine of String(text || "").split(/\r?\n/)) {
+    let current = "";
+    for (const char of Array.from(rawLine)) {
+      if (visibleWidth(current + char) > limit) {
+        lines.push(current);
+        current = char;
+      } else {
+        current += char;
+      }
+    }
+    lines.push(current);
+  }
+  return lines;
+}
+
 class CustomEditor extends BridgeTextComponent {
   constructor(_tui, _theme, _keybindings, options = {}) {
     super("");
     this.options = options;
     this.text = "";
+    this.actionHandlers = new Map();
+  }
+  onAction(action, handler) {
+    if (typeof handler === "function") this.actionHandlers.set(String(action || ""), handler);
   }
   handleInput(data) {
     this.text += String(data || "");
@@ -3282,7 +4850,7 @@ function sdkNewEntryId(prefix = "entry") {
 }
 
 function sdkEntryMovesLeaf(entry) {
-  return entry && ["message", "custom_message", "branch_summary", "compaction"].includes(entry.type);
+  return entry && entry.type && entry.type !== "session" && entry.type !== "leaf" && typeof entry.id === "string" && entry.id;
 }
 
 function inferSdkLeafId(entries = []) {
@@ -3330,7 +4898,41 @@ function createSdkSessionManagerFromSession(session) {
     return full;
   };
   const manager = createSessionManager({ session });
+  const appendId = (entry) => append(entry).id;
+  const appendSessionInfo = (name) => {
+    const trimmed = String(name || "").trim();
+    session.name = trimmed || undefined;
+    return appendId({ type: "session_info", name: trimmed });
+  };
+  const resetSessionStateFromFile = (filePath, sessionDir = undefined, cwdOverride = undefined) => {
+    const loaded = loadSdkSessionStateFromJsonl(filePath, sessionDir, cwdOverride);
+    session.id = loaded.id;
+    session.timestamp = loaded.timestamp;
+    session.cwd = loaded.cwd;
+    session.sessionDir = loaded.sessionDir;
+    session.name = loaded.name;
+    session.parentSession = loaded.parentSession;
+    session.entries = loaded.entries;
+    session.leafId = loaded.leafId;
+    session.path = loaded.path;
+  };
   return {
+    setSessionFile: (filePath) => {
+      const resolvedPath = path.resolve(String(filePath || ""));
+      if (fs.existsSync(resolvedPath)) {
+        resetSessionStateFromFile(resolvedPath, session.sessionDir || path.dirname(resolvedPath));
+      } else {
+        const timestamp = new Date().toISOString();
+        session.id = sdkNewEntryId("session");
+        session.timestamp = timestamp;
+        session.entries = [];
+        session.leafId = null;
+        session.name = undefined;
+        session.parentSession = undefined;
+        session.sessionDir = session.sessionDir || path.dirname(resolvedPath);
+        session.path = resolvedPath;
+      }
+    },
     getCwd: manager.getCwd,
     getSessionDir: manager.getSessionDir,
     getSessionId: manager.getSessionId,
@@ -3345,22 +4947,47 @@ function createSdkSessionManagerFromSession(session) {
     getEntries: () => session.entries.slice(),
     getTree: manager.getTree,
     getSessionName: () => session.name,
-    setSessionName: (name) => {
-      session.name = name || undefined;
-      append({ type: "session_info", name: session.name });
-    },
-    isPersisted: () => !!session.path,
+    setSessionName: appendSessionInfo,
+    appendSessionInfo,
+    appendSessionName: appendSessionInfo,
+    isPersisted: () => session.persist !== false && !!session.path,
+    _persist: () => persistSdkSession(session),
     buildSessionContext: (leafId = undefined) => buildSessionContext(session.entries, leafId === undefined ? session.leafId : leafId),
-    appendMessage: (message) => append({ type: "message", message }),
-    appendThinkingLevelChange: (thinkingLevel) => append({ type: "thinking_level_change", thinkingLevel }),
-    appendModelChange: (provider, modelId) => append({ type: "model_change", provider, modelId }),
-    appendCustomEntry: (customType, data) => append({ type: "custom", customType, data }),
-    appendCustomMessageEntry: (customType, content, display = true, details = undefined) => append({ type: "custom_message", customType, content, display, details }),
-    appendLabelChange: (targetId, label) => append({ type: "label", targetId, label }),
-    appendCompaction: (summary, firstKeptEntryId, tokensBefore, details = undefined, fromHook = false) => append({ type: "compaction", summary, firstKeptEntryId, tokensBefore, details, fromHook }),
+    appendMessage: (message) => appendId({ type: "message", message }),
+    appendThinkingLevelChange: (thinkingLevel) => appendId({ type: "thinking_level_change", thinkingLevel }),
+    appendModelChange: (provider, modelId) => appendId({ type: "model_change", provider, modelId }),
+    appendCustomEntry: (customType, data) => appendId({ type: "custom", customType, data }),
+    appendCustomMessageEntry: (customType, content, display = true, details = undefined) => appendId({ type: "custom_message", customType, content, display, details }),
+    appendLabelChange: (targetId, label) => {
+      const id = String(targetId || "");
+      if (!manager.getEntry(id)) throw new Error(`Entry ${id} not found`);
+      return appendId({ type: "label", targetId: id, label });
+    },
+    appendLabel: (targetId, label) => {
+      const id = String(targetId || "");
+      if (!manager.getEntry(id)) throw new Error(`Entry ${id} not found`);
+      return appendId({ type: "label", targetId: id, label });
+    },
+    appendCompaction: (summary, firstKeptEntryId, tokensBefore, details = undefined, fromHook = false) => appendId({ type: "compaction", summary, firstKeptEntryId, tokensBefore, details, fromHook }),
     branch: (targetId) => {
       if (targetId && !manager.getEntry(targetId)) throw new Error(`Entry ${targetId} not found`);
       session.leafId = targetId || null;
+    },
+    resetLeaf: () => {
+      session.leafId = null;
+    },
+    branchWithSummary: (branchFromId, summary, details = undefined, fromHook = undefined) => {
+      const targetId = branchFromId === null || branchFromId === undefined ? null : String(branchFromId);
+      if (targetId !== null && !manager.getEntry(targetId)) throw new Error(`Entry ${targetId} not found`);
+      session.leafId = targetId;
+      return appendId({
+        type: "branch_summary",
+        parentId: targetId,
+        fromId: targetId || "root",
+        summary: String(summary || ""),
+        details,
+        fromHook,
+      });
     },
     createBranchedSession: (leafId) => {
       const branch = manager.getBranch(leafId);
@@ -3409,7 +5036,7 @@ function createSdkSessionManager(cwd = process.cwd(), sessionDir = path.join(get
   });
 }
 
-function createSdkSessionManagerFromJsonl(filePath, sessionDir = undefined, cwdOverride = undefined) {
+function loadSdkSessionStateFromJsonl(filePath, sessionDir = undefined, cwdOverride = undefined) {
   const rows = readJsonLines(filePath);
   if (rows.length === 0) throw new Error(`Session file is empty or invalid: ${filePath}`);
   const hasHeader = rows[0] && rows[0].type === "session";
@@ -3420,6 +5047,7 @@ function createSdkSessionManagerFromJsonl(filePath, sessionDir = undefined, cwdO
   const cwd = path.resolve(cwdOverride || header.cwd || process.cwd());
   const session = {
     id: String(header.id || header.sessionId || path.basename(filePath, ".jsonl")),
+    timestamp: header.timestamp || new Date().toISOString(),
     cwd,
     sessionDir: sessionDir || path.dirname(filePath),
     name: typeof header.name === "string" && header.name ? header.name : undefined,
@@ -3431,6 +5059,11 @@ function createSdkSessionManagerFromJsonl(filePath, sessionDir = undefined, cwdO
   for (const entry of entries) {
     if (entry && entry.type === "session_info" && typeof entry.name === "string") session.name = entry.name || undefined;
   }
+  return session;
+}
+
+function createSdkSessionManagerFromJsonl(filePath, sessionDir = undefined, cwdOverride = undefined) {
+  const session = loadSdkSessionStateFromJsonl(filePath, sessionDir, cwdOverride);
   return createSdkSessionManagerFromSession(session);
 }
 
@@ -4094,8 +5727,60 @@ class InteractiveMode {
     this.runtimeHost = runtimeHost;
     this.options = options;
     this.running = false;
+    this.isInitialized = false;
+    this.editorText = "";
+    this.errors = [];
+    this.warnings = [];
+    this.notifications = [];
+    this.initialMessages = [];
+    this.onInputCallback = undefined;
   }
-  async start() { this.running = true; return 0; }
+  async init() {
+    if (this.isInitialized) return;
+    this.isInitialized = true;
+    if (this.runtimeHost && this.runtimeHost.session && typeof this.runtimeHost.session.bindExtensions === "function") {
+      await this.runtimeHost.session.bindExtensions({
+        uiContext: {
+          notify: (message, type = "info") => this.notifications.push({ type, message: String(message || "") }),
+        },
+      });
+    }
+  }
+  renderInitialMessages() {
+    const manager = this.runtimeHost && this.runtimeHost.session && this.runtimeHost.session.sessionManager;
+    const context = manager && typeof manager.buildSessionContext === "function" ? manager.buildSessionContext() : { messages: [] };
+    this.initialMessages = Array.isArray(context.messages) ? context.messages.slice() : [];
+    return this.initialMessages;
+  }
+  getUserInput() {
+    return new Promise((resolve) => {
+      this.onInputCallback = (text) => {
+        this.onInputCallback = undefined;
+        resolve(String(text || ""));
+      };
+    });
+  }
+  clearEditor() {
+    this.editorText = "";
+  }
+  showError(errorMessage) {
+    this.errors.push(String(errorMessage || ""));
+  }
+  showWarning(warningMessage) {
+    this.warnings.push(String(warningMessage || ""));
+  }
+  showNewVersionNotification(release) {
+    this.notifications.push({ type: "new_version", release: safeSerializable(release || {}) });
+  }
+  showPackageUpdateNotification(packages) {
+    this.notifications.push({ type: "package_updates", packages: Array.isArray(packages) ? packages.map(String) : [] });
+  }
+  async start() {
+    await this.init();
+    this.renderInitialMessages();
+    this.running = true;
+    return 0;
+  }
   async stop() { this.running = false; }
   async run() { return this.start(); }
 }
@@ -4114,8 +5799,254 @@ async function runPrintMode(runtimeHost, options = {}) {
   return 0;
 }
 
-async function runRpcMode(_runtimeHost) {
-  throw new Error("runRpcMode requires the native ocaml-agent RPC host in this build.");
+async function runRpcMode(runtimeHost) {
+  if (!runtimeHost || !runtimeHost.session) throw new Error("runRpcMode requires an AgentSessionRuntime");
+  let session = runtimeHost.session;
+  let unsubscribe = undefined;
+  let detached = false;
+  const pendingUi = new Map();
+  const output = (value) => {
+    process.stdout.write(`${JSON.stringify(value)}\n`);
+  };
+  const success = (id, command, data = undefined) => {
+    const response = { id, type: "response", command, success: true };
+    if (data !== undefined) response.data = data;
+    return response;
+  };
+  const failure = (id, command, message) => ({ id, type: "response", command, success: false, error: String(message || "Unknown error") });
+  const sessionState = () => ({
+    model: session.model,
+    thinkingLevel: session.thinkingLevel,
+    isStreaming: session.isStreaming,
+    isCompacting: session.isCompacting,
+    steeringMode: session.steeringMode,
+    followUpMode: session.followUpMode,
+    sessionFile: session.sessionFile,
+    sessionId: session.sessionId,
+    sessionName: session.sessionName,
+    autoCompactionEnabled: session.autoCompactionEnabled,
+    messageCount: session.messages.length,
+    pendingMessageCount: session.pendingMessageCount,
+  });
+  const nextUiId = () => `ui_${Date.now().toString(36)}_${Math.floor(Math.random() * 0xffffff).toString(36)}`;
+  const requestUi = (request, defaultValue, parse) => {
+    const id = nextUiId();
+    return new Promise((resolve) => {
+      pendingUi.set(id, { resolve: (response) => resolve(parse(response)), defaultValue });
+      output({ type: "extension_ui_request", id, ...request });
+    });
+  };
+  const uiContext = () => ({
+    select: (title, options, opts = {}) => requestUi({ method: "select", title, options, timeout: opts.timeout }, undefined, (response) => response.cancelled ? undefined : response.value),
+    confirm: (title, message, opts = {}) => requestUi({ method: "confirm", title, message, timeout: opts.timeout }, false, (response) => response.cancelled ? false : !!response.confirmed),
+    input: (title, placeholder, opts = {}) => requestUi({ method: "input", title, placeholder, timeout: opts.timeout }, undefined, (response) => response.cancelled ? undefined : response.value),
+    editor: (title, prefill) => requestUi({ method: "editor", title, prefill }, undefined, (response) => response.cancelled ? undefined : response.value),
+    notify: (message, type = "info") => output({ type: "extension_ui_request", id: nextUiId(), method: "notify", message, notifyType: type }),
+    setStatus: (key, text) => output({ type: "extension_ui_request", id: nextUiId(), method: "setStatus", statusKey: key, statusText: text }),
+    setWidget: (key, content, options = {}) => {
+      if (content === undefined || Array.isArray(content)) {
+        output({ type: "extension_ui_request", id: nextUiId(), method: "setWidget", widgetKey: key, widgetLines: content, widgetPlacement: options.placement });
+      }
+    },
+    setTitle: (title) => output({ type: "extension_ui_request", id: nextUiId(), method: "setTitle", title }),
+    pasteToEditor(text) { this.setEditorText(text); },
+    setEditorText: (text) => output({ type: "extension_ui_request", id: nextUiId(), method: "set_editor_text", text }),
+    getEditorText: () => "",
+    custom: async () => undefined,
+    onTerminalInput: () => () => {},
+    setWorkingMessage: () => {},
+    setWorkingVisible: () => {},
+    setWorkingIndicator: () => {},
+    setHiddenThinkingLabel: () => {},
+    setFooter: () => {},
+    setHeader: () => {},
+    addAutocompleteProvider: () => {},
+    setEditorComponent: () => {},
+    getEditorComponent: () => undefined,
+    get theme() { return new Theme(); },
+    getAllThemes: () => [],
+    getTheme: () => undefined,
+    setTheme: () => ({ success: false, error: "Theme switching not supported in RPC mode" }),
+    getToolsExpanded: () => false,
+    setToolsExpanded: () => {},
+  });
+  const rebindSession = async () => {
+    session = runtimeHost.session;
+    await session.bindExtensions({
+      uiContext: uiContext(),
+      commandContextActions: {
+        waitForIdle: async () => {},
+        newSession: (options) => runtimeHost.newSession(options),
+        fork: async (entryId, options) => {
+          const result = await runtimeHost.fork(entryId, options);
+          return { cancelled: result.cancelled };
+        },
+        navigateTree: (targetId, options) => session.navigateTree(targetId, options || {}),
+        switchSession: (sessionPath, options) => runtimeHost.switchSession(sessionPath, options),
+        reload: () => session.reload(),
+      },
+      shutdownHandler: () => {
+        detached = true;
+      },
+      onError: (error) => output({ type: "extension_error", extensionPath: error.extensionPath, event: error.event, error: error.error }),
+    });
+    if (typeof unsubscribe === "function") unsubscribe();
+    unsubscribe = session.subscribe((event) => output(event));
+  };
+  runtimeHost.setRebindSession(rebindSession);
+  await rebindSession();
+
+  const handleCommand = async (command) => {
+    const id = command && command.id;
+    switch (command && command.type) {
+      case "prompt":
+        await session.prompt(command.message, { images: command.images, streamingBehavior: command.streamingBehavior });
+        return success(id, "prompt");
+      case "steer":
+        await session.steer(command.message, command.images);
+        return success(id, "steer");
+      case "follow_up":
+        await session.followUp(command.message, command.images);
+        return success(id, "follow_up");
+      case "abort":
+        await session.abort();
+        return success(id, "abort");
+      case "new_session":
+        return success(id, "new_session", await runtimeHost.newSession(command.parentSession ? { parentSession: command.parentSession } : undefined));
+      case "get_state":
+        return success(id, "get_state", sessionState());
+      case "set_model": {
+        const model = session.modelRegistry.getAvailable().find((item) => item.provider === command.provider && item.id === command.modelId)
+          || { provider: command.provider, id: command.modelId, name: command.modelId };
+        await session.setModel(model);
+        return success(id, "set_model", model);
+      }
+      case "cycle_model":
+        return success(id, "cycle_model", await session.cycleModel() || null);
+      case "get_available_models":
+        return success(id, "get_available_models", { models: session.modelRegistry.getAvailable() });
+      case "set_thinking_level":
+        session.setThinkingLevel(command.level);
+        return success(id, "set_thinking_level");
+      case "cycle_thinking_level": {
+        const level = session.cycleThinkingLevel();
+        return success(id, "cycle_thinking_level", level ? { level } : null);
+      }
+      case "set_steering_mode":
+        session.setSteeringMode(command.mode);
+        return success(id, "set_steering_mode");
+      case "set_follow_up_mode":
+        session.setFollowUpMode(command.mode);
+        return success(id, "set_follow_up_mode");
+      case "compact":
+        return success(id, "compact", await session.compact(command.customInstructions));
+      case "set_auto_compaction":
+        session.setAutoCompactionEnabled(command.enabled);
+        return success(id, "set_auto_compaction");
+      case "set_auto_retry":
+        session.setAutoRetryEnabled(command.enabled);
+        return success(id, "set_auto_retry");
+      case "abort_retry":
+        session.abortRetry();
+        return success(id, "abort_retry");
+      case "bash":
+        return success(id, "bash", await session.executeBash(command.command));
+      case "abort_bash":
+        session.abortBash();
+        return success(id, "abort_bash");
+      case "get_session_stats":
+        return success(id, "get_session_stats", session.getSessionStats());
+      case "export_html":
+        return success(id, "export_html", { path: await session.exportToHtml(command.outputPath) });
+      case "switch_session":
+        return success(id, "switch_session", await runtimeHost.switchSession(command.sessionPath));
+      case "fork": {
+        const result = await runtimeHost.fork(command.entryId);
+        return success(id, "fork", { text: result.selectedText, cancelled: result.cancelled });
+      }
+      case "clone": {
+        const leafId = session.sessionManager.getLeafId();
+        if (!leafId) return failure(id, "clone", "Cannot clone session: no current entry selected");
+        const result = await runtimeHost.fork(leafId, { position: "at" });
+        return success(id, "clone", { cancelled: result.cancelled });
+      }
+      case "get_fork_messages":
+        return success(id, "get_fork_messages", { messages: session.getUserMessagesForForking() });
+      case "get_last_assistant_text":
+        return success(id, "get_last_assistant_text", { text: session.getLastAssistantText() || null });
+      case "set_session_name":
+        session.setSessionName(String(command.name || "").trim());
+        return success(id, "set_session_name");
+      case "get_messages":
+        return success(id, "get_messages", { messages: session.messages });
+      case "get_commands":
+        return success(id, "get_commands", { commands: session.getCommands().map((command) => ({
+          name: command.name,
+          description: command.description,
+          source: command.source || "extension",
+          sourceInfo: command.sourceInfo || { path: "", source: command.source || "extension", scope: "project", origin: "runtime" },
+        })) });
+      case "shutdown":
+        detached = true;
+        return success(id, "shutdown");
+      default:
+        return failure(id, command && command.type || "unknown", `Unknown command: ${command && command.type}`);
+    }
+  };
+
+  return await new Promise((resolve) => {
+    let buffer = "";
+    let cleaned = false;
+    let commandQueue = Promise.resolve();
+    const cleanup = async () => {
+      if (cleaned) return;
+      cleaned = true;
+      process.stdin.off("data", onData);
+      process.stdin.off("end", onEnd);
+      if (typeof unsubscribe === "function") unsubscribe();
+      await runtimeHost.dispose();
+      resolve(0);
+    };
+    const processLine = (line) => {
+      if (!line.trim()) return;
+      commandQueue = commandQueue.then(async () => {
+        let parsed;
+        try {
+          parsed = JSON.parse(line);
+        } catch (error) {
+          output(failure(undefined, "parse", error && error.message ? error.message : String(error)));
+          return;
+        }
+        if (parsed && parsed.type === "extension_ui_response") {
+          const pending = pendingUi.get(parsed.id);
+          if (pending) {
+            pendingUi.delete(parsed.id);
+            pending.resolve(parsed);
+          }
+          return;
+        }
+        try {
+          const response = await handleCommand(parsed);
+          if (response) output(response);
+        } catch (error) {
+          output(failure(parsed && parsed.id, parsed && parsed.type || "unknown", error && error.message ? error.message : String(error)));
+        }
+        if (detached) await cleanup();
+      });
+    };
+    const onData = (data) => {
+      buffer += Buffer.from(data).toString("utf8");
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() || "";
+      for (const line of lines) processLine(line);
+    };
+    const onEnd = () => {
+      if (buffer.trim()) processLine(buffer);
+      commandQueue = commandQueue.then(() => cleanup());
+    };
+    process.stdin.on("data", onData);
+    process.stdin.on("end", onEnd);
+  });
 }
 
 async function main(options = {}) {
@@ -4277,6 +6208,15 @@ class GenericComponent extends Container {
   constructor(...args) {
     super();
     this.args = args;
+    this.expanded = false;
+    this.showImages = true;
+    this.imageWidthCells = 60;
+    this.executionStarted = false;
+    this.argsComplete = false;
+    this.output = "";
+    this.status = "running";
+    this.abortController = new AbortController();
+    this.focused = false;
     for (const arg of args) {
       if (arg instanceof BridgeTextComponent || arg instanceof Container || typeof arg === "string" || Array.isArray(arg)) this.addChild(arg);
       else if (arg && typeof arg === "object") {
@@ -4288,6 +6228,77 @@ class GenericComponent extends Container {
       }
     }
   }
+
+  setExpanded(expanded) { this.expanded = !!expanded; }
+  setHideThinkingBlock(hide) { this.hideThinkingBlock = !!hide; }
+  setHiddenThinkingLabel(label) { this.hiddenThinkingLabel = label === undefined ? undefined : String(label); }
+  updateContent(message) {
+    this.lastMessage = message;
+    this.clear();
+    if (message && typeof message === "object") this.addChild(sdkMessageText(message.content || message.message || message));
+    else this.addChild(String(message || ""));
+  }
+  updateArgs(args) { this.toolArgs = args; }
+  markExecutionStarted() { this.executionStarted = true; }
+  setArgsComplete() { this.argsComplete = true; }
+  updateResult(result, isPartial = false) {
+    this.result = result;
+    this.isPartial = !!isPartial;
+    if (result && Array.isArray(result.content)) {
+      const text = result.content
+        .map((part) => part && part.type === "text" ? String(part.text || "") : "")
+        .filter(Boolean)
+        .join("\n");
+      if (text) {
+        this.clear();
+        this.addChild(text);
+      }
+    }
+  }
+  setShowImages(show) { this.showImages = !!show; }
+  setImageWidthCells(width) {
+    const numeric = Number(width);
+    this.imageWidthCells = Math.max(1, Math.floor(Number.isFinite(numeric) ? numeric : 1));
+  }
+  appendOutput(chunk) {
+    this.output += String(chunk || "");
+    this.clear();
+    this.addChild(this.output);
+  }
+  setComplete(exitCode = undefined, cancelled = false, truncationResult = undefined, fullOutputPath = undefined) {
+    this.exitCode = exitCode;
+    this.cancelled = !!cancelled;
+    this.truncationResult = truncationResult;
+    this.fullOutputPath = fullOutputPath;
+    this.status = this.cancelled ? "cancelled" : exitCode !== 0 && exitCode !== undefined && exitCode !== null ? "error" : "complete";
+  }
+  getOutput() { return this.output; }
+  getCommand() { return String(this.args[0] || this.command || ""); }
+  get signal() { return this.abortController.signal; }
+  set onAbort(fn) { this.abortHandler = typeof fn === "function" ? fn : undefined; }
+  handleInput(data) {
+    if ((data === "\u0003" || data === "\u001b") && this.abortHandler) this.abortHandler();
+  }
+  setSession(session) { this.session = session; }
+  setAutoCompactEnabled(enabled) { this.autoCompactEnabled = !!enabled; }
+  setAvailableProviderCount(count) { this.availableProviderCount = Number(count) || 0; }
+  setCwd(cwd) { this.cwd = String(cwd || ""); }
+  getAvailableProviderCount() { return this.availableProviderCount || 0; }
+  getGitBranch() { return this.gitBranch; }
+  getExtensionStatuses() { return this.extensionStatuses || {}; }
+  setExtensionStatus(key, value) {
+    if (!this.extensionStatuses) this.extensionStatuses = {};
+    this.extensionStatuses[String(key || "")] = value;
+  }
+  clearExtensionStatuses() { this.extensionStatuses = {}; }
+  onBranchChange() { return () => {}; }
+  getSelectList() { return this.items || this.args[0] || []; }
+  getSettingsList() { return this.getSelectList(); }
+  getResourceList() { return this.getSelectList(); }
+  getSessionList() { return this.getSelectList(); }
+  getTreeList() { return this.getSelectList(); }
+  getMessageList() { return this.getSelectList(); }
+  getSearchInput() { return this.searchInput || ""; }
 }
 
 class ArminComponent extends BridgeTextComponent {}
@@ -4479,36 +6490,1608 @@ function piCodingAgentExports() {
   };
 }
 
+function StringEnum(values = [], options = {}) {
+  return {
+    type: "string",
+    enum: Array.isArray(values) ? values.slice() : [],
+    ...(options && options.description ? { description: options.description } : {}),
+    ...(options && options.default !== undefined ? { default: options.default } : {}),
+  };
+}
+
+function normalizeModelReference(providerOrModel, modelId = undefined) {
+  if (providerOrModel && typeof providerOrModel === "object") return { ...providerOrModel };
+  const text = String(providerOrModel || "");
+  if (modelId !== undefined) return { provider: text, id: String(modelId), name: String(modelId) };
+  const slash = text.indexOf("/");
+  if (slash > 0) return { provider: text.slice(0, slash), id: text.slice(slash + 1), name: text.slice(slash + 1) };
+  return { provider: "custom", id: text || "model", name: text || "model" };
+}
+
+function getModel(providerOrModel, modelId = undefined) {
+  if (modelId !== undefined) {
+    const provider = String(providerOrModel || "");
+    const found = BUILT_IN_MODELS.find((item) => item.provider === provider && item.id === String(modelId));
+    if (found) return { cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, ...cloneJson(found) };
+  }
+  const model = normalizeModelReference(providerOrModel, modelId);
+  const found = BUILT_IN_MODELS.find((item) => item.provider === model.provider && item.id === model.id);
+  if (found) return { cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, ...cloneJson(found) };
+  return {
+    api: model.api || "openai",
+    provider: model.provider || "custom",
+    id: model.id || model.model || model.name || "model",
+    name: model.name || model.id || model.model || "model",
+    baseUrl: model.baseUrl || "",
+    contextWindow: model.contextWindow || model.context_window || 128000,
+    maxTokens: model.maxTokens || model.max_tokens || 4096,
+    reasoning: !!model.reasoning,
+    cost: model.cost || { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    ...model,
+  };
+}
+
+function getProviders() {
+  return [...new Set(BUILT_IN_MODELS.map((model) => model.provider))];
+}
+
+function getModels(provider) {
+  return BUILT_IN_MODELS
+    .filter((model) => model.provider === provider)
+    .map((model) => ({ cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, ...cloneJson(model) }));
+}
+
+function calculateCost(model, usage) {
+  const cost = usage.cost || {};
+  const rates = model.cost || {};
+  cost.input = ((Number(rates.input) || 0) / 1000000) * (Number(usage.input) || 0);
+  cost.output = ((Number(rates.output) || 0) / 1000000) * (Number(usage.output) || 0);
+  cost.cacheRead = ((Number(rates.cacheRead) || 0) / 1000000) * (Number(usage.cacheRead) || 0);
+  cost.cacheWrite = ((Number(rates.cacheWrite) || 0) / 1000000) * (Number(usage.cacheWrite) || 0);
+  cost.total = cost.input + cost.output + cost.cacheRead + cost.cacheWrite;
+  usage.cost = cost;
+  return cost;
+}
+
+function modelsAreEqual(a, b) {
+  return !!a && !!b && a.provider === b.provider && a.id === b.id;
+}
+
+const EXTENDED_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"];
+
+function normalizeAiThinkingLevel(level) {
+  const value = String(level || "").trim().toLowerCase();
+  if (value === "" || value === "none") return "off";
+  return value;
+}
+
+function getSupportedThinkingLevels(model) {
+  if (!model || !model.reasoning) return ["off"];
+  const map = model.thinkingLevelMap || {};
+  return EXTENDED_THINKING_LEVELS.filter((level) => {
+    if (map[level] === null) return false;
+    if (level === "xhigh") return map[level] !== undefined;
+    return true;
+  });
+}
+
+function clampThinkingLevel(modelOrLevel, maybeLevel = undefined) {
+  if (maybeLevel === undefined) {
+    const value = normalizeAiThinkingLevel(modelOrLevel);
+    return ["off", "minimal", "low", "medium", "high", "xhigh"].includes(value) ? value : "medium";
+  }
+  const availableLevels = getSupportedThinkingLevels(modelOrLevel);
+  const requested = normalizeAiThinkingLevel(maybeLevel);
+  if (availableLevels.includes(requested)) return requested;
+  const requestedIndex = EXTENDED_THINKING_LEVELS.indexOf(requested);
+  if (requestedIndex < 0) return availableLevels[0] || "off";
+  for (let i = requestedIndex; i < EXTENDED_THINKING_LEVELS.length; i++) {
+    if (availableLevels.includes(EXTENDED_THINKING_LEVELS[i])) return EXTENDED_THINKING_LEVELS[i];
+  }
+  for (let i = requestedIndex - 1; i >= 0; i--) {
+    if (availableLevels.includes(EXTENDED_THINKING_LEVELS[i])) return EXTENDED_THINKING_LEVELS[i];
+  }
+  return availableLevels[0] || "off";
+}
+
+class EventStream {
+  constructor(isComplete = () => false, extractResult = (event) => event) {
+    this.queue = [];
+    this.waiting = [];
+    this.done = false;
+    this.isComplete = isComplete;
+    this.extractResult = extractResult;
+    this.finalResultPromise = new Promise((resolve) => {
+      this.resolveFinalResult = resolve;
+    });
+  }
+  push(event) {
+    if (this.done) return;
+    if (this.isComplete(event)) {
+      this.done = true;
+      this.resolveFinalResult(this.extractResult(event));
+    }
+    const waiter = this.waiting.shift();
+    if (waiter) waiter({ value: event, done: false });
+    else this.queue.push(event);
+  }
+  end(result = undefined) {
+    this.done = true;
+    if (result !== undefined) this.resolveFinalResult(result);
+    while (this.waiting.length > 0) this.waiting.shift()({ value: undefined, done: true });
+  }
+  async *[Symbol.asyncIterator]() {
+    while (true) {
+      if (this.queue.length > 0) yield this.queue.shift();
+      else if (this.done) return;
+      else {
+        const result = await new Promise((resolve) => this.waiting.push(resolve));
+        if (result.done) return;
+        yield result.value;
+      }
+    }
+  }
+  result() {
+    return this.finalResultPromise;
+  }
+}
+
+class AssistantMessageEventStream extends EventStream {
+  constructor() {
+    super(
+      (event) => event && (event.type === "done" || event.type === "error"),
+      (event) => event.type === "done" ? event.message : event.error,
+    );
+  }
+}
+
+function createAssistantMessageEventStream() {
+  return new AssistantMessageEventStream();
+}
+
+function normalizeContextMessages(context) {
+  if (Array.isArray(context)) return context;
+  if (context && Array.isArray(context.messages)) return context.messages;
+  if (context && Array.isArray(context.content)) return [{ role: "user", content: context.content }];
+  return [];
+}
+
+function assistantMessageFromContext(context = {}) {
+  const messages = normalizeContextMessages(context);
+  const last = messages.length ? messages[messages.length - 1] : undefined;
+  const text = last && typeof last === "object" ? sdkMessageText(last.content || last.message || last) : "";
+  return {
+    role: "assistant",
+    content: [{ type: "text", text }],
+    stopReason: "stop",
+    usage: { inputTokens: 0, outputTokens: 0 },
+  };
+}
+
+function completedAssistantStream(message) {
+  const eventStream = createAssistantMessageEventStream();
+  eventStream.push({ type: "done", message });
+  return eventStream;
+}
+
+function normalizeAssistantStream(value, context = {}) {
+  if (value && typeof value.result === "function" && typeof value[Symbol.asyncIterator] === "function") return value;
+  if (value && typeof value.result === "function") return value;
+  if (value && typeof value.then === "function") {
+    return {
+      async result() { return value; },
+      async *[Symbol.asyncIterator]() { yield { type: "done", message: await value }; },
+    };
+  }
+  return completedAssistantStream(value && value.role ? value : assistantMessageFromContext(context));
+}
+
+const apiProviderRegistry = new Map();
+
+function wrapApiStream(api, fn) {
+  return (model, context, options) => {
+    if (model && model.api && model.api !== api) throw new Error(`Mismatched api: ${model.api} expected ${api}`);
+    return normalizeAssistantStream(fn(model, context, options), context);
+  };
+}
+
+function registerApiProvider(provider, sourceId = undefined) {
+  if (!provider || !provider.api) return;
+  const api = String(provider.api);
+  const streamFn = typeof provider.stream === "function" ? provider.stream : (_model, context) => assistantMessageFromContext(context);
+  const streamSimpleFn = typeof provider.streamSimple === "function" ? provider.streamSimple : streamFn;
+  apiProviderRegistry.set(api, {
+    sourceId,
+    provider: {
+      api,
+      stream: wrapApiStream(api, streamFn),
+      streamSimple: wrapApiStream(api, streamSimpleFn),
+    },
+  });
+}
+
+function getApiProvider(api) {
+  return apiProviderRegistry.get(String(api || ""))?.provider;
+}
+
+function getApiProviders() {
+  return Array.from(apiProviderRegistry.values(), (entry) => entry.provider);
+}
+
+function unregisterApiProviders(sourceId) {
+  for (const [api, entry] of apiProviderRegistry.entries()) if (entry.sourceId === sourceId) apiProviderRegistry.delete(api);
+}
+
+function clearApiProviders() {
+  apiProviderRegistry.clear();
+}
+
+function builtInStream(model, context) {
+  return completedAssistantStream(assistantMessageFromContext(context || { messages: [] }));
+}
+
+const streamAnthropic = builtInStream;
+const streamSimpleAnthropic = builtInStream;
+const streamAzureOpenAIResponses = builtInStream;
+const streamSimpleAzureOpenAIResponses = builtInStream;
+const streamGoogle = builtInStream;
+const streamSimpleGoogle = builtInStream;
+const streamGoogleVertex = builtInStream;
+const streamSimpleGoogleVertex = builtInStream;
+const streamMistral = builtInStream;
+const streamSimpleMistral = builtInStream;
+const streamOpenAICodexResponses = builtInStream;
+const streamSimpleOpenAICodexResponses = builtInStream;
+const streamOpenAICompletions = builtInStream;
+const streamSimpleOpenAICompletions = builtInStream;
+const streamOpenAIResponses = builtInStream;
+const streamSimpleOpenAIResponses = builtInStream;
+const streamBedrock = builtInStream;
+const streamSimpleBedrock = builtInStream;
+const bedrockProviderModule = { streamBedrock, streamSimpleBedrock };
+
+function registerBuiltInApiProviders() {
+  registerApiProvider({ api: "anthropic-messages", stream: streamAnthropic, streamSimple: streamSimpleAnthropic });
+  registerApiProvider({ api: "openai-completions", stream: streamOpenAICompletions, streamSimple: streamSimpleOpenAICompletions });
+  registerApiProvider({ api: "mistral-conversations", stream: streamMistral, streamSimple: streamSimpleMistral });
+  registerApiProvider({ api: "openai-responses", stream: streamOpenAIResponses, streamSimple: streamSimpleOpenAIResponses });
+  registerApiProvider({ api: "azure-openai-responses", stream: streamAzureOpenAIResponses, streamSimple: streamSimpleAzureOpenAIResponses });
+  registerApiProvider({ api: "openai-codex-responses", stream: streamOpenAICodexResponses, streamSimple: streamSimpleOpenAICodexResponses });
+  registerApiProvider({ api: "google-generative-ai", stream: streamGoogle, streamSimple: streamSimpleGoogle });
+  registerApiProvider({ api: "google-vertex", stream: streamGoogleVertex, streamSimple: streamSimpleGoogleVertex });
+  registerApiProvider({ api: "bedrock-converse-stream", stream: builtInStream, streamSimple: builtInStream });
+}
+
+function resetApiProviders() {
+  clearApiProviders();
+  registerBuiltInApiProviders();
+}
+
+function resolveApiProvider(api) {
+  return getApiProvider(api) || {
+    api: String(api || "openai"),
+    stream: (_model, context) => completedAssistantStream(assistantMessageFromContext(context)),
+    streamSimple: (_model, context) => completedAssistantStream(assistantMessageFromContext(context)),
+  };
+}
+
+function stream(model, context = {}, options = {}) {
+  return resolveApiProvider((model && model.api) || "openai").stream(model || getModel("custom/model"), context, options);
+}
+
+async function complete(model, context = {}, options = {}) {
+  return stream(model, context, options).result();
+}
+
+function streamSimple(model, context = {}, options = {}) {
+  return resolveApiProvider((model && model.api) || "openai").streamSimple(model || getModel("custom/model"), context, options);
+}
+
+async function completeSimple(model, context = {}, options = {}) {
+  return streamSimple(model, context, options).result();
+}
+
+const imagesApiProviderRegistry = new Map();
+const BUILT_IN_IMAGE_MODELS = [
+  { provider: "openrouter", id: "openai/gpt-image-1", name: "GPT Image 1", api: "openrouter-images" },
+];
+
+function getImageProviders() {
+  return [...new Set(BUILT_IN_IMAGE_MODELS.map((model) => model.provider))];
+}
+
+function getImageModels(provider) {
+  return BUILT_IN_IMAGE_MODELS.filter((model) => model.provider === provider).map((model) => cloneJson(model));
+}
+
+function getImageModel(provider, modelId) {
+  return getImageModels(provider).find((model) => model.id === modelId) || { provider, id: modelId, name: modelId, api: provider };
+}
+
+function registerImagesApiProvider(provider, sourceId = undefined) {
+  if (!provider || !provider.api) return;
+  const api = String(provider.api);
+  const generateImages = typeof provider.generateImages === "function"
+    ? provider.generateImages
+    : async () => ({ images: [] });
+  imagesApiProviderRegistry.set(api, {
+    sourceId,
+    provider: {
+      api,
+      generateImages: (model, context, options) => {
+        if (model && model.api && model.api !== api) throw new Error(`Mismatched api: ${model.api} expected ${api}`);
+        return generateImages(model, context, options);
+      },
+    },
+  });
+}
+
+function getImagesApiProvider(api) {
+  return imagesApiProviderRegistry.get(String(api || ""))?.provider;
+}
+
+const generateImagesOpenRouter = async () => ({ images: [] });
+
+function registerBuiltInImagesApiProviders() {
+  registerImagesApiProvider({ api: "openrouter-images", generateImages: generateImagesOpenRouter });
+}
+
+async function generateImages(model, context = {}, options = {}) {
+  const provider = getImagesApiProvider((model && model.api) || "openrouter-images");
+  if (!provider) return { images: [] };
+  return provider.generateImages(model, context, options);
+}
+
+function findEnvKeys(provider) {
+  const map = {
+    openai: ["OPENAI_API_KEY"],
+    anthropic: ["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
+    deepseek: ["DEEPSEEK_API_KEY"],
+    google: ["GEMINI_API_KEY"],
+    gemini: ["GEMINI_API_KEY"],
+    "google-vertex": ["GOOGLE_CLOUD_API_KEY"],
+    groq: ["GROQ_API_KEY"],
+    xai: ["XAI_API_KEY"],
+    openrouter: ["OPENROUTER_API_KEY"],
+    mistral: ["MISTRAL_API_KEY"],
+    "github-copilot": ["COPILOT_GITHUB_TOKEN"],
+    "amazon-bedrock": ["AWS_PROFILE", "AWS_ACCESS_KEY_ID", "AWS_BEARER_TOKEN_BEDROCK"],
+  };
+  const keys = map[String(provider || "")] || [];
+  const found = keys.filter((key) => !!process.env[key]);
+  return found.length ? found : undefined;
+}
+
+function getEnvApiKey(provider) {
+  const keys = findEnvKeys(provider);
+  return keys && keys[0] ? process.env[keys[0]] : undefined;
+}
+
+const oauthProviderRegistry = new Map();
+function registerOAuthProvider(provider) { if (provider && provider.id) oauthProviderRegistry.set(String(provider.id), provider); }
+function unregisterOAuthProvider(id) { oauthProviderRegistry.delete(String(id || "")); }
+function resetOAuthProviders() { oauthProviderRegistry.clear(); }
+function getOAuthProviders() { return Array.from(oauthProviderRegistry.values()); }
+function getOAuthProvider(id) { return oauthProviderRegistry.get(String(id || "")); }
+async function getOAuthApiKey(_provider, credential) { return credential && (credential.accessToken || credential.access); }
+
+const openAICodexWebSocketDebugStats = new Map();
+function getOpenAICodexWebSocketDebugStats(sessionId) { return openAICodexWebSocketDebugStats.get(String(sessionId || "")); }
+function resetOpenAICodexWebSocketDebugStats(sessionId = undefined) {
+  if (sessionId === undefined) openAICodexWebSocketDebugStats.clear();
+  else openAICodexWebSocketDebugStats.delete(String(sessionId || ""));
+}
+function closeOpenAICodexWebSocketSessions(sessionId = undefined) {
+  resetOpenAICodexWebSocketDebugStats(sessionId);
+}
+
+function convertOpenAICompletionsMessages(messages = []) {
+  return Array.isArray(messages) ? messages.slice() : [];
+}
+
+const sessionResourceCleanups = new Set();
+function registerSessionResourceCleanup(cleanup) {
+  if (typeof cleanup !== "function") return () => {};
+  sessionResourceCleanups.add(cleanup);
+  return () => sessionResourceCleanups.delete(cleanup);
+}
+
+function cleanupSessionResources(sessionId = undefined) {
+  for (const cleanup of [...sessionResourceCleanups]) cleanup(sessionId);
+}
+
+function repairJson(json) {
+  let repaired = "";
+  let inString = false;
+  for (let index = 0; index < String(json || "").length; index++) {
+    const char = String(json || "")[index];
+    if (!inString) {
+      repaired += char;
+      if (char === '"') inString = true;
+      continue;
+    }
+    if (char === '"') {
+      repaired += char;
+      inString = false;
+      continue;
+    }
+    if (char === "\\") {
+      const next = String(json || "")[index + 1];
+      if (next === undefined) {
+        repaired += "\\\\";
+      } else if (['"', "\\", "/", "b", "f", "n", "r", "t"].includes(next) || (next === "u" && /^[0-9a-fA-F]{4}$/.test(String(json || "").slice(index + 2, index + 6)))) {
+        repaired += `\\${next}`;
+        index += 1;
+      } else {
+        repaired += "\\\\";
+      }
+      continue;
+    }
+    const code = char.codePointAt(0);
+    repaired += code !== undefined && code <= 0x1f ? `\\u${code.toString(16).padStart(4, "0")}` : char;
+  }
+  return repaired;
+}
+
+function parseJsonWithRepair(json) {
+  try {
+    return JSON.parse(json);
+  } catch (error) {
+    const repaired = repairJson(json);
+    if (repaired !== json) return JSON.parse(repaired);
+    throw error;
+  }
+}
+
+function parseStreamingJson(partialJson) {
+  if (!partialJson || !String(partialJson).trim()) return {};
+  try {
+    return parseJsonWithRepair(partialJson);
+  } catch {
+    const text = String(partialJson).trim();
+    const pairs = {};
+    for (const match of text.matchAll(/"([^"]+)"\s*:\s*("[^"]*"|-?\d+(?:\.\d+)?|true|false|null)/g)) {
+      try {
+        pairs[match[1]] = JSON.parse(match[2]);
+      } catch {}
+    }
+    return pairs;
+  }
+}
+
+function formatThrownValue(value) {
+  if (value && value.stack) return String(value.stack);
+  if (value && value.message) return String(value.message);
+  if (typeof value === "string") return value;
+  try { return JSON.stringify(value); } catch { return String(value); }
+}
+
+function extractDiagnosticError(error) {
+  return { message: error && error.message ? String(error.message) : formatThrownValue(error), stack: error && error.stack ? String(error.stack) : undefined };
+}
+
+function createAssistantMessageDiagnostic(error, title = "Provider error") {
+  return { type: "error", title, ...extractDiagnosticError(error) };
+}
+
+function appendAssistantMessageDiagnostic(message, diagnostic) {
+  message.diagnostics = [...(message.diagnostics || []), diagnostic];
+  return message;
+}
+
+function getOverflowPatterns() {
+  return [/context length/i, /maximum context/i, /too many tokens/i, /context window/i];
+}
+
+function isContextOverflow(message, contextWindow = undefined) {
+  const text = sdkMessageText(message && message.content ? message.content : message);
+  return getOverflowPatterns().some((pattern) => pattern.test(text)) || (contextWindow !== undefined && message && message.usage && Number(message.usage.inputTokens || message.usage.input || 0) > Number(contextWindow));
+}
+
+function validateToolCall(tools, toolCall) {
+  const name = toolCall && (toolCall.name || toolCall.toolName);
+  const tool = (tools || []).find((item) => item && item.name === name);
+  if (!tool) return { ok: false, error: `Unknown tool: ${name}` };
+  return validateToolArguments(tool, toolCall);
+}
+
+function validateToolArguments(_tool, toolCall) {
+  return toolCall && typeof (toolCall.arguments || toolCall.input || {}) === "object"
+    ? { ok: true, value: toolCall.arguments || toolCall.input || {} }
+    : { ok: false, error: "Tool arguments must be an object" };
+}
+
+function fauxText(text) { return { type: "text", text: String(text || "") }; }
+function fauxThinking(thinking) { return { type: "thinking", thinking: String(thinking || "") }; }
+function fauxToolCall(name, arguments_ = {}, options = {}) { return { type: "toolCall", id: options.id || sdkNewEntryId("tool"), name, arguments: arguments_ }; }
+function fauxAssistantMessage(content = [], options = {}) {
+  return { role: "assistant", content: Array.isArray(content) ? content : [fauxText(content)], stopReason: options.stopReason || "stop", usage: options.usage || { inputTokens: 0, outputTokens: 0 } };
+}
+function registerFauxProvider(options = {}) {
+  const api = options.api || "faux";
+  registerApiProvider({
+    api,
+    stream: (_model, context) => completedAssistantStream(options.message || assistantMessageFromContext(context)),
+    streamSimple: (_model, context) => completedAssistantStream(options.message || assistantMessageFromContext(context)),
+  }, options.sourceId);
+  return { api, unregister: () => unregisterApiProviders(options.sourceId) };
+}
+
+resetApiProviders();
+registerBuiltInImagesApiProviders();
+
+function piAiExports() {
+  return {
+    Type,
+    StringEnum,
+    EventStream,
+    AssistantMessageEventStream,
+    createAssistantMessageEventStream,
+    getModel,
+    getProviders,
+    getModels,
+    calculateCost,
+    getSupportedThinkingLevels,
+    modelsAreEqual,
+    clampThinkingLevel,
+    stream,
+    complete,
+    completeSimple,
+    streamSimple,
+    registerApiProvider,
+    getApiProvider,
+    getApiProviders,
+    unregisterApiProviders,
+    clearApiProviders,
+    registerBuiltInApiProviders,
+    resetApiProviders,
+    streamAnthropic,
+    streamSimpleAnthropic,
+    streamAzureOpenAIResponses,
+    streamSimpleAzureOpenAIResponses,
+    streamGoogle,
+    streamSimpleGoogle,
+    streamGoogleVertex,
+    streamSimpleGoogleVertex,
+    streamMistral,
+    streamSimpleMistral,
+    streamOpenAICodexResponses,
+    streamSimpleOpenAICodexResponses,
+    streamOpenAICompletions,
+    streamSimpleOpenAICompletions,
+    streamOpenAIResponses,
+    streamSimpleOpenAIResponses,
+    getImageModel,
+    getImageProviders,
+    getImageModels,
+    registerImagesApiProvider,
+    getImagesApiProvider,
+    generateImagesOpenRouter,
+    registerBuiltInImagesApiProviders,
+    generateImages,
+    findEnvKeys,
+    getEnvApiKey,
+    registerSessionResourceCleanup,
+    cleanupSessionResources,
+    repairJson,
+    parseJsonWithRepair,
+    parseStreamingJson,
+    formatThrownValue,
+    extractDiagnosticError,
+    createAssistantMessageDiagnostic,
+    appendAssistantMessageDiagnostic,
+    getOverflowPatterns,
+    isContextOverflow,
+    validateToolCall,
+    validateToolArguments,
+    fauxText,
+    fauxThinking,
+    fauxToolCall,
+    fauxAssistantMessage,
+    registerFauxProvider,
+  };
+}
+
+function piAiOauthExports() {
+  return {
+    registerOAuthProvider,
+    unregisterOAuthProvider,
+    resetOAuthProviders,
+    getOAuthProviders,
+    getOAuthProvider,
+    getOAuthProviderInfoList: () => getOAuthProviders().map((provider) => ({ id: provider.id, name: provider.name || provider.id })),
+    getOAuthApiKey,
+  };
+}
+
+function piAiSubpathExports(subpath) {
+  switch (String(subpath || "")) {
+    case "anthropic":
+      return { streamAnthropic, streamSimpleAnthropic };
+    case "azure-openai-responses":
+      return { streamAzureOpenAIResponses, streamSimpleAzureOpenAIResponses };
+    case "google":
+      return { streamGoogle, streamSimpleGoogle };
+    case "google-vertex":
+      return { streamGoogleVertex, streamSimpleGoogleVertex };
+    case "mistral":
+      return { streamMistral, streamSimpleMistral };
+    case "openai-codex-responses":
+      return {
+        streamOpenAICodexResponses,
+        streamSimpleOpenAICodexResponses,
+        getOpenAICodexWebSocketDebugStats,
+        resetOpenAICodexWebSocketDebugStats,
+        closeOpenAICodexWebSocketSessions,
+      };
+    case "openai-completions":
+      return {
+        streamOpenAICompletions,
+        streamSimpleOpenAICompletions,
+        convertMessages: convertOpenAICompletionsMessages,
+      };
+    case "openai-responses":
+      return { streamOpenAIResponses, streamSimpleOpenAIResponses };
+    case "bedrock-provider":
+      return { bedrockProviderModule, streamBedrock, streamSimpleBedrock };
+    case "oauth":
+      return piAiOauthExports();
+    default:
+      return null;
+  }
+}
+
+function fuzzyMatch(query, text) {
+  const q = String(query || "").toLowerCase();
+  const value = String(text || "").toLowerCase();
+  if (!q) return { score: 0, indexes: [] };
+  let position = 0;
+  const indexes = [];
+  for (const char of q) {
+    const found = value.indexOf(char, position);
+    if (found < 0) return null;
+    indexes.push(found);
+    position = found + 1;
+  }
+  return { score: indexes.length, indexes };
+}
+
+function fuzzyFilter(items = [], query = "", getText = (item) => String(item || "")) {
+  return (Array.isArray(items) ? items : [])
+    .map((item) => ({ item, match: fuzzyMatch(query, getText(item)) }))
+    .filter((entry) => entry.match)
+    .map((entry) => entry.item);
+}
+
+class KeybindingsManager {
+  constructor(config = {}) { this.config = config; }
+  matches(data, keyId) { return matchesKey(data, keyId); }
+  get(key) { return this.config[key]; }
+}
+
+let activeKeybindings = new KeybindingsManager();
+function setKeybindings(keybindings) { activeKeybindings = keybindings || new KeybindingsManager(); }
+function getKeybindings() { return activeKeybindings; }
+
+function isFocusable(component) {
+  return component !== null && component !== undefined && Object.prototype.hasOwnProperty.call(component, "focused");
+}
+
+function getCapabilities() { return {}; }
+function getImageDimensions() { return undefined; }
+function imageFallback() { return "[image]"; }
+
+function piTuiExports() {
+  return {
+    Box,
+    CancellableLoader,
+    Container,
+    CURSOR_MARKER,
+    Editor,
+    Image: ImageComponent,
+    Input,
+    Key,
+    KeybindingsManager,
+    Loader,
+    Markdown: BridgeTextComponent,
+    ProcessTerminal,
+    SelectList,
+    SettingsList,
+    Spacer,
+    Text: BridgeTextComponent,
+    TruncatedText,
+    TUI,
+    fuzzyFilter,
+    fuzzyMatch,
+    getCapabilities,
+    getImageDimensions,
+    getKeybindings,
+    imageFallback,
+    isFocusable,
+    isKeyRelease,
+    isKeyRepeat,
+    matchesKey,
+    parseKey,
+    setKeybindings,
+    truncateToWidth,
+    visibleWidth,
+    wrapTextWithAnsi,
+  };
+}
+
+function ok(value) { return { ok: true, value }; }
+function err(error) { return { ok: false, error }; }
+function getOrThrow(result) { if (!result || !result.ok) throw (result && result.error ? result.error : new Error("Result is not ok")); return result.value; }
+function getOrUndefined(result) { return result && result.ok ? result.value : undefined; }
+function toError(error) {
+  if (error instanceof Error) return error;
+  if (typeof error === "string") return new Error(error);
+  try { return new Error(JSON.stringify(error)); } catch { return new Error(String(error)); }
+}
+
+class FileError extends Error {
+  constructor(code, message, filePath = undefined, cause = undefined) {
+    super(String(message || code || "File error"), cause === undefined ? undefined : { cause });
+    this.name = "FileError";
+    this.code = code;
+    this.path = filePath;
+  }
+}
+
+class ExecutionError extends Error {
+  constructor(code, message, cause = undefined) {
+    super(String(message || code || "Execution error"), cause === undefined ? undefined : { cause });
+    this.name = "ExecutionError";
+    this.code = code;
+  }
+}
+
+class CompactionError extends Error {
+  constructor(code, message, cause = undefined) {
+    super(String(message || code || "Compaction error"), cause === undefined ? undefined : { cause });
+    this.name = "CompactionError";
+    this.code = code;
+  }
+}
+
+class BranchSummaryError extends Error {
+  constructor(code, message, cause = undefined) {
+    super(String(message || code || "Branch summary error"), cause === undefined ? undefined : { cause });
+    this.name = "BranchSummaryError";
+    this.code = code;
+  }
+}
+
+class SessionError extends Error {
+  constructor(code, message, cause = undefined) {
+    super(String(message || code || "Session error"), cause === undefined ? undefined : { cause });
+    this.name = "SessionError";
+    this.code = code;
+  }
+}
+
+class AgentHarnessError extends Error {
+  constructor(code, message, cause = undefined) {
+    super(String(message || code || "Agent harness error"), cause === undefined ? undefined : { cause });
+    this.name = "AgentHarnessError";
+    this.code = code;
+  }
+}
+
+function createSessionId() { return sdkNewEntryId("session"); }
+function createTimestamp() { return new Date().toISOString(); }
+
+function formatSkillInvocation(skill, additionalInstructions = undefined) {
+  const filePath = String(skill && skill.filePath || "");
+  const skillBlock = `<skill name="${skill && skill.name || ""}" location="${filePath}">\nReferences are relative to ${path.dirname(filePath)}.\n\n${skill && skill.content || ""}\n</skill>`;
+  return additionalInstructions ? `${skillBlock}\n\n${additionalInstructions}` : skillBlock;
+}
+
+function escapeXml(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+function formatSkillsForSystemPrompt(skills = []) {
+  const visibleSkills = (Array.isArray(skills) ? skills : []).filter((skill) => !skill.disableModelInvocation);
+  if (!visibleSkills.length) return "";
+  const lines = [
+    "The following skills provide specialized instructions for specific tasks.",
+    "Read the full skill file when the task matches its description.",
+    "When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.",
+    "",
+    "<available_skills>",
+  ];
+  for (const skill of visibleSkills) {
+    lines.push("  <skill>");
+    lines.push(`    <name>${escapeXml(skill.name)}</name>`);
+    lines.push(`    <description>${escapeXml(skill.description)}</description>`);
+    lines.push(`    <location>${escapeXml(skill.filePath)}</location>`);
+    lines.push("  </skill>");
+  }
+  lines.push("</available_skills>");
+  return lines.join("\n");
+}
+
+function parseCommandArgs(argsString = "") {
+  const args = [];
+  let current = "";
+  let inQuote = null;
+  for (const char of String(argsString || "")) {
+    if (inQuote) {
+      if (char === inQuote) inQuote = null;
+      else current += char;
+    } else if (char === '"' || char === "'") {
+      inQuote = char;
+    } else if (char === " " || char === "\t") {
+      if (current) {
+        args.push(current);
+        current = "";
+      }
+    } else {
+      current += char;
+    }
+  }
+  if (current) args.push(current);
+  return args;
+}
+
+function substituteArgs(content, args = []) {
+  const values = Array.isArray(args) ? args : [];
+  let result = String(content || "");
+  result = result.replace(/\$(\d+)/g, (_match, num) => values[parseInt(num, 10) - 1] ?? "");
+  result = result.replace(/\$\{@:(\d+)(?::(\d+))?\}/g, (_match, startText, lengthText) => {
+    const start = Math.max(0, parseInt(startText, 10) - 1);
+    return lengthText ? values.slice(start, start + parseInt(lengthText, 10)).join(" ") : values.slice(start).join(" ");
+  });
+  const allArgs = values.join(" ");
+  return result.replace(/\$ARGUMENTS/g, allArgs).replace(/\$@/g, allArgs);
+}
+
+function formatPromptTemplateInvocation(template, args = []) {
+  return substituteArgs(template && template.content || "", args);
+}
+
+function sanitizeBinaryOutput(value) {
+  return Array.from(String(value || ""))
+    .filter((char) => {
+      const code = char.codePointAt(0);
+      if (code === undefined) return false;
+      if (code === 0x09 || code === 0x0a || code === 0x0d) return true;
+      if (code <= 0x1f) return false;
+      if (code >= 0xfff9 && code <= 0xfffb) return false;
+      return true;
+    })
+    .join("");
+}
+
+class MemorySessionStorage {
+  constructor(options = {}) {
+    this.metadata = options.metadata || { id: createSessionId(), createdAt: createTimestamp() };
+    this.entries = (options.entries || []).map((entry) => ({ ...entry }));
+    this.leafId = this.entries.length ? this.entries[this.entries.length - 1].id : null;
+  }
+  async getMetadata() { return this.metadata; }
+  async getLeafId() { return this.leafId; }
+  async setLeafId(id) { this.leafId = id; }
+  async createEntryId() { return sdkNewEntryId("entry"); }
+  async getEntry(id) { return this.entries.find((entry) => entry.id === id); }
+  async getEntries() { return this.entries.slice(); }
+  async appendEntry(entry) { this.entries.push(entry); this.leafId = entry.id; }
+  async findEntries(type) { return this.entries.filter((entry) => entry.type === type); }
+  async getLabel(id) {
+    for (let i = this.entries.length - 1; i >= 0; i--) {
+      const entry = this.entries[i];
+      if (entry.type === "label" && entry.targetId === id) return entry.label;
+    }
+    return undefined;
+  }
+  async getPathToRoot(leafId = this.leafId) {
+    if (leafId === null) return [];
+    const byId = new Map(this.entries.map((entry) => [entry.id, entry]));
+    let current = leafId ? byId.get(leafId) : undefined;
+    if (!current && this.entries.length) current = this.entries[this.entries.length - 1];
+    const pathEntries = [];
+    const seen = new Set();
+    while (current && !seen.has(current.id)) {
+      seen.add(current.id);
+      pathEntries.unshift(current);
+      current = current.parentId ? byId.get(current.parentId) : undefined;
+    }
+    return pathEntries;
+  }
+}
+
+class Session {
+  constructor(storage) { this.storage = storage; }
+  getMetadata() { return this.storage.getMetadata(); }
+  getStorage() { return this.storage; }
+  getLeafId() { return this.storage.getLeafId(); }
+  getEntry(id) { return this.storage.getEntry(id); }
+  getEntries() { return this.storage.getEntries(); }
+  async getBranch(fromId = undefined) { return this.storage.getPathToRoot(fromId ?? await this.storage.getLeafId()); }
+  async buildContext() { return buildSessionContext(await this.getBranch()); }
+  getLabel(id) { return this.storage.getLabel(id); }
+  async getSessionName() {
+    const entries = await this.storage.findEntries("session_info");
+    return entries.length ? String(entries[entries.length - 1].name || "").trim() || undefined : undefined;
+  }
+  async appendTypedEntry(entry) { await this.storage.appendEntry(entry); return entry.id; }
+  async appendMessage(message) {
+    return this.appendTypedEntry({ type: "message", id: await this.storage.createEntryId(), parentId: await this.storage.getLeafId(), timestamp: createTimestamp(), message });
+  }
+  async appendThinkingLevelChange(thinkingLevel) {
+    return this.appendTypedEntry({ type: "thinking_level_change", id: await this.storage.createEntryId(), parentId: await this.storage.getLeafId(), timestamp: createTimestamp(), thinkingLevel });
+  }
+  async appendModelChange(provider, modelId) {
+    return this.appendTypedEntry({ type: "model_change", id: await this.storage.createEntryId(), parentId: await this.storage.getLeafId(), timestamp: createTimestamp(), provider, modelId });
+  }
+  async appendCompaction(summary, firstKeptEntryId, tokensBefore, details = undefined, fromHook = undefined) {
+    return this.appendTypedEntry({ type: "compaction", id: await this.storage.createEntryId(), parentId: await this.storage.getLeafId(), timestamp: createTimestamp(), summary, firstKeptEntryId, tokensBefore, details, fromHook });
+  }
+  async appendCustomEntry(customType, data = undefined) {
+    return this.appendTypedEntry({ type: "custom", id: await this.storage.createEntryId(), parentId: await this.storage.getLeafId(), timestamp: createTimestamp(), customType, data });
+  }
+  async appendCustomMessageEntry(customType, content, display, details = undefined) {
+    return this.appendTypedEntry({ type: "custom_message", id: await this.storage.createEntryId(), parentId: await this.storage.getLeafId(), timestamp: createTimestamp(), customType, content, display, details });
+  }
+  async appendLabel(targetId, label) {
+    if (!(await this.storage.getEntry(targetId))) throw new SessionError("not_found", `Entry ${targetId} not found`);
+    return this.appendTypedEntry({ type: "label", id: await this.storage.createEntryId(), parentId: await this.storage.getLeafId(), timestamp: createTimestamp(), targetId, label });
+  }
+  async appendSessionName(name) {
+    return this.appendTypedEntry({ type: "session_info", id: await this.storage.createEntryId(), parentId: await this.storage.getLeafId(), timestamp: createTimestamp(), name: String(name || "").trim() });
+  }
+  async moveTo(entryId, summary = undefined) {
+    if (entryId !== null && !(await this.storage.getEntry(entryId))) throw new SessionError("not_found", `Entry ${entryId} not found`);
+    await this.storage.setLeafId(entryId);
+    if (!summary) return undefined;
+    return this.appendTypedEntry({ type: "branch_summary", id: await this.storage.createEntryId(), parentId: entryId, timestamp: createTimestamp(), fromId: entryId || "root", summary: summary.summary, details: summary.details, fromHook: summary.fromHook });
+  }
+}
+
+function toSession(storage) { return new Session(storage); }
+
+async function getEntriesToFork(storage, options = {}) {
+  if (!options.entryId) return storage.getEntries();
+  const target = await storage.getEntry(options.entryId);
+  if (!target) throw new SessionError("invalid_fork_target", `Entry ${options.entryId} not found`);
+  const effectiveLeafId = (options.position || "before") === "at" ? target.id : target.parentId;
+  return storage.getPathToRoot(effectiveLeafId || null);
+}
+
+class InMemorySessionRepo {
+  constructor() { this.sessions = new Map(); }
+  async create(options = {}) {
+    const metadata = { id: options.id || createSessionId(), createdAt: createTimestamp() };
+    const session = toSession(new MemorySessionStorage({ metadata }));
+    this.sessions.set(metadata.id, session);
+    return session;
+  }
+  async open(metadata) {
+    const id = typeof metadata === "string" ? metadata : metadata && metadata.id;
+    const session = this.sessions.get(id);
+    if (!session) throw new SessionError("not_found", `Session not found: ${id}`);
+    return session;
+  }
+  async list() { return Promise.all([...this.sessions.values()].map((session) => session.getMetadata())); }
+  async delete(metadata) { this.sessions.delete(typeof metadata === "string" ? metadata : metadata && metadata.id); }
+  async fork(sourceMetadata, options = {}) {
+    const source = await this.open(sourceMetadata);
+    const entries = await getEntriesToFork(source.getStorage(), options);
+    const metadata = { id: options.id || createSessionId(), createdAt: createTimestamp() };
+    const session = toSession(new MemorySessionStorage({ metadata, entries }));
+    this.sessions.set(metadata.id, session);
+    return session;
+  }
+}
+
+class InMemorySessionStorage extends MemorySessionStorage {}
+
+class JsonlSessionRepo extends InMemorySessionRepo {}
+class JsonlSessionStorage extends MemorySessionStorage {}
+
+function defaultAgentState(initialState = {}) {
+  return {
+    systemPrompt: initialState.systemPrompt || "",
+    model: initialState.model || { id: "unknown", name: "unknown", api: "unknown", provider: "unknown", baseUrl: "", reasoning: false, input: [], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 0, maxTokens: 0 },
+    thinkingLevel: initialState.thinkingLevel || "off",
+    tools: Array.isArray(initialState.tools) ? initialState.tools.slice() : [],
+    messages: Array.isArray(initialState.messages) ? initialState.messages.slice() : [],
+    isStreaming: false,
+    pendingToolCalls: new Set(),
+  };
+}
+
+function createAgentStream() {
+  return new EventStream((event) => event && event.type === "done", (event) => event.messages || []);
+}
+
+function normalizeAgentPromptInput(input, images = undefined) {
+  if (Array.isArray(input)) return input;
+  if (input && typeof input === "object") return [input];
+  const content = [{ type: "text", text: String(input || "") }];
+  if (Array.isArray(images)) content.push(...images);
+  return [{ role: "user", content, timestamp: Date.now() }];
+}
+
+async function runAgentCoreTurn(prompts, context, config = {}, emit = async () => {}, signal = undefined, streamFn = undefined) {
+  const newMessages = [...prompts];
+  await emit({ type: "agent_start" });
+  await emit({ type: "turn_start" });
+  for (const prompt of prompts) {
+    await emit({ type: "message_start", message: prompt });
+    await emit({ type: "message_end", message: prompt });
+  }
+  const currentContext = { ...context, messages: [...(context.messages || []), ...prompts] };
+  const resultStream = (streamFn || config.streamFn || streamSimple)(config.model || (context && context.model) || getModel("custom/model"), currentContext, config);
+  const assistant = await normalizeAssistantStream(resultStream, currentContext).result();
+  if (assistant) {
+    newMessages.push(assistant);
+    await emit({ type: "message_start", message: assistant });
+    await emit({ type: "message_end", message: assistant });
+  }
+  await emit({ type: "turn_end", messages: newMessages });
+  await emit({ type: "agent_end", messages: newMessages });
+  return newMessages;
+}
+
+function agentLoop(prompts, context, config = {}, signal = undefined, streamFn = undefined) {
+  const eventStream = createAgentStream();
+  void runAgentCoreTurn(prompts || [], context || { messages: [], tools: [], systemPrompt: "" }, config, (event) => eventStream.push(event), signal, streamFn)
+    .then((messages) => eventStream.end(messages))
+    .catch((error) => eventStream.end([{ role: "assistant", content: [{ type: "text", text: formatThrownValue(error) }], stopReason: "error" }]));
+  return eventStream;
+}
+
+function agentLoopContinue(context, config = {}, signal = undefined, streamFn = undefined) {
+  if (!context || !Array.isArray(context.messages) || context.messages.length === 0) throw new Error("Cannot continue: no messages in context");
+  if (context.messages[context.messages.length - 1].role === "assistant") throw new Error("Cannot continue from message role: assistant");
+  return agentLoop([], context, config, signal, streamFn);
+}
+
+const runAgentLoop = runAgentCoreTurn;
+const runAgentLoopContinue = (context, config = {}, emit = async () => {}, signal = undefined, streamFn = undefined) =>
+  runAgentCoreTurn([], context, config, emit, signal, streamFn);
+
+class Agent {
+  constructor(options = {}) {
+    this._state = defaultAgentState(options.initialState || {});
+    this.listeners = new Set();
+    this.streamFn = options.streamFn || streamSimple;
+    this.convertToLlm = options.convertToLlm || ((messages) => messages.filter((message) => ["user", "assistant", "toolResult"].includes(message.role)));
+    this.steeringQueue = [];
+    this.followUpQueue = [];
+    this.steeringMode = options.steeringMode || "one-at-a-time";
+    this.followUpMode = options.followUpMode || "one-at-a-time";
+    this.transport = options.transport || "auto";
+    this.toolExecution = options.toolExecution || "parallel";
+    this.sessionId = options.sessionId;
+  }
+  subscribe(listener) { this.listeners.add(listener); return () => this.listeners.delete(listener); }
+  get state() { return this._state; }
+  steer(message) { this.steeringQueue.push(message); }
+  followUp(message) { this.followUpQueue.push(message); }
+  clearSteeringQueue() { this.steeringQueue = []; }
+  clearFollowUpQueue() { this.followUpQueue = []; }
+  clearAllQueues() { this.clearSteeringQueue(); this.clearFollowUpQueue(); }
+  hasQueuedMessages() { return this.steeringQueue.length > 0 || this.followUpQueue.length > 0; }
+  abort() { if (this.abortController) this.abortController.abort(); }
+  waitForIdle() { return this.activeRun || Promise.resolve(); }
+  reset() { this._state.messages = []; this._state.isStreaming = false; this._state.pendingToolCalls = new Set(); this.clearAllQueues(); }
+  async emit(event, signal = undefined) { for (const listener of [...this.listeners]) await listener(event, signal || new AbortController().signal); }
+  async prompt(input, images = undefined) {
+    if (this.activeRun) throw new Error("Agent is already processing a prompt. Use steer() or followUp() to queue messages, or wait for completion.");
+    const prompts = normalizeAgentPromptInput(input, images);
+    this.abortController = new AbortController();
+    this.activeRun = (async () => {
+      this._state.isStreaming = true;
+      const messages = await runAgentCoreTurn(
+        prompts,
+        { systemPrompt: this._state.systemPrompt, messages: this._state.messages.slice(), tools: this._state.tools.slice() },
+        { model: this._state.model, streamFn: this.streamFn, transport: this.transport, toolExecution: this.toolExecution },
+        async (event) => this.emit(event, this.abortController.signal),
+        this.abortController.signal,
+        this.streamFn,
+      );
+      this._state.messages.push(...messages);
+      this._state.isStreaming = false;
+    })().finally(() => { this.activeRun = undefined; });
+    return this.activeRun;
+  }
+  async continue() {
+    if (this.activeRun) throw new Error("Agent is already processing. Wait for completion before continuing.");
+    const last = this._state.messages[this._state.messages.length - 1];
+    if (!last) throw new Error("No messages to continue from");
+    if (last.role === "assistant") throw new Error("Cannot continue from message role: assistant");
+    return this.prompt([]);
+  }
+}
+
+class AgentHarness {
+  constructor(options = {}) { this.options = options; this.agent = options.agent || new Agent(options); }
+}
+
+function streamProxy(model, context, options = {}) {
+  return normalizeAssistantStream((options.streamFn || streamSimple)(model, context, options), context);
+}
+
+function nodeFileError(error, filePath = undefined) {
+  if (error && error.code === "ENOENT") return new FileError("not_found", error.message, filePath || error.path, error);
+  if (error && error.code === "EACCES") return new FileError("permission_denied", error.message, filePath || error.path, error);
+  if (error && error.code === "ENOTDIR") return new FileError("not_directory", error.message, filePath || error.path, error);
+  if (error && error.code === "EISDIR") return new FileError("is_directory", error.message, filePath || error.path, error);
+  return new FileError("unknown", error && error.message ? error.message : String(error), filePath || (error && error.path), error instanceof Error ? error : undefined);
+}
+
+function nodeFileKind(stat) {
+  if (stat.isSymbolicLink()) return "symlink";
+  if (stat.isDirectory()) return "directory";
+  return "file";
+}
+
+class NodeExecutionEnv {
+  constructor(options = {}) {
+    this.cwd = options.cwd || process.cwd();
+    this.shellPath = options.shellPath;
+    this.shellEnv = options.shellEnv;
+  }
+  resolve(filePath) { return path.isAbsolute(String(filePath || "")) ? String(filePath || "") : path.resolve(this.cwd, String(filePath || "")); }
+  async absolutePath(filePath) { return ok(this.resolve(filePath)); }
+  async joinPath(parts) { return ok(path.join(...(Array.isArray(parts) ? parts : []))); }
+  async readTextFile(filePath) {
+    const resolved = this.resolve(filePath);
+    try { return ok(fs.readFileSync(resolved, "utf8")); } catch (error) { return err(nodeFileError(error, resolved)); }
+  }
+  async readTextLines(filePath, options = {}) {
+    const result = await this.readTextFile(filePath);
+    if (!result.ok) return result;
+    const lines = String(result.value || "").split(/\r?\n/);
+    if (lines.length && lines[lines.length - 1] === "") lines.pop();
+    return ok(options.maxLines ? lines.slice(0, options.maxLines) : lines);
+  }
+  async readBinaryFile(filePath) {
+    const resolved = this.resolve(filePath);
+    try { return ok(new Uint8Array(fs.readFileSync(resolved))); } catch (error) { return err(nodeFileError(error, resolved)); }
+  }
+  async writeFile(filePath, content) {
+    const resolved = this.resolve(filePath);
+    try {
+      ensureParentDir(resolved);
+      fs.writeFileSync(resolved, content);
+      return ok(undefined);
+    } catch (error) {
+      return err(nodeFileError(error, resolved));
+    }
+  }
+  async appendFile(filePath, content) {
+    const resolved = this.resolve(filePath);
+    try {
+      ensureParentDir(resolved);
+      fs.appendFileSync(resolved, content);
+      return ok(undefined);
+    } catch (error) {
+      return err(nodeFileError(error, resolved));
+    }
+  }
+  fileInfoFromPath(filePath) {
+    const resolved = this.resolve(filePath);
+    const stat = fs.lstatSync(resolved);
+    return { name: path.basename(resolved), path: resolved, kind: nodeFileKind(stat), size: stat.size, mtimeMs: stat.mtimeMs };
+  }
+  async fileInfo(filePath) {
+    const resolved = this.resolve(filePath);
+    try { return ok(this.fileInfoFromPath(resolved)); } catch (error) { return err(nodeFileError(error, resolved)); }
+  }
+  async listDir(filePath) {
+    const resolved = this.resolve(filePath);
+    try { return ok(fs.readdirSync(resolved).map((name) => this.fileInfoFromPath(path.join(resolved, name)))); } catch (error) { return err(nodeFileError(error, resolved)); }
+  }
+  async canonicalPath(filePath) {
+    const resolved = this.resolve(filePath);
+    try { return ok(fs.realpathSync(resolved)); } catch (error) { return err(nodeFileError(error, resolved)); }
+  }
+  async exists(filePath) {
+    const resolved = this.resolve(filePath);
+    try { return ok(fs.existsSync(resolved)); } catch (error) { return err(nodeFileError(error, resolved)); }
+  }
+  async createDir(filePath, options = {}) {
+    const resolved = this.resolve(filePath);
+    try { fs.mkdirSync(resolved, { recursive: options.recursive !== false }); return ok(undefined); } catch (error) { return err(nodeFileError(error, resolved)); }
+  }
+  async remove(filePath, options = {}) {
+    const resolved = this.resolve(filePath);
+    try { fs.rmSync(resolved, { recursive: !!options.recursive, force: !!options.force }); return ok(undefined); } catch (error) { return err(nodeFileError(error, resolved)); }
+  }
+  async createTempDir(prefix = "tmp-") {
+    try { return ok(fs.mkdtempSync(path.join(os.tmpdir(), String(prefix || "tmp-")))); } catch (error) { return err(nodeFileError(error)); }
+  }
+  async createTempFile(options = {}) {
+    try {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), String(options.prefix || "tmp-")));
+      const filePath = path.join(dir, `${Date.now().toString(36)}${options.suffix || ""}`);
+      fs.writeFileSync(filePath, "");
+      return ok(filePath);
+    } catch (error) {
+      return err(nodeFileError(error));
+    }
+  }
+  async exec(command, options = {}) {
+    return new Promise((resolve) => {
+      const cwd = options.cwd ? this.resolve(options.cwd) : this.cwd;
+      const child = childProcess.exec(String(command || ""), {
+        cwd,
+        env: { ...process.env, ...(this.shellEnv || {}), ...(options.env || {}) },
+        timeout: options.timeout ? Number(options.timeout) * 1000 : undefined,
+        shell: this.shellPath || undefined,
+      }, (error, stdout, stderr) => {
+        if (error && error.killed) {
+          resolve(err(new ExecutionError("timeout", error.message, error)));
+          return;
+        }
+        resolve(ok({ stdout: String(stdout || ""), stderr: String(stderr || ""), exitCode: error && typeof error.code === "number" ? error.code : 0 }));
+      });
+      if (options.abortSignal) {
+        if (options.abortSignal.aborted) child.kill();
+        else options.abortSignal.addEventListener("abort", () => child.kill(), { once: true });
+      }
+      if (child.stdout && typeof options.onStdout === "function") child.stdout.on("data", (chunk) => options.onStdout(String(chunk)));
+      if (child.stderr && typeof options.onStderr === "function") child.stderr.on("data", (chunk) => options.onStderr(String(chunk)));
+    });
+  }
+  async cleanup() {}
+}
+
+function piAgentCoreNodeExports() {
+  return { ...piAgentCoreExports(), NodeExecutionEnv };
+}
+
+function piAgentCoreExports() {
+  return {
+    Agent,
+    agentLoop,
+    agentLoopContinue,
+    runAgentLoop,
+    runAgentLoopContinue,
+    AgentHarness,
+    calculateContextTokens,
+    collectEntriesForBranchSummary,
+    compact,
+    DEFAULT_COMPACTION_SETTINGS,
+    estimateContextTokens,
+    estimateTokens,
+    findCutPoint,
+    findTurnStartIndex,
+    generateBranchSummary,
+    generateSummary,
+    getLastAssistantUsage,
+    prepareBranchEntries,
+    serializeConversation,
+    shouldCompact,
+    buildSessionContext,
+    COMPACTION_SUMMARY_PREFIX,
+    COMPACTION_SUMMARY_SUFFIX,
+    BRANCH_SUMMARY_PREFIX,
+    BRANCH_SUMMARY_SUFFIX,
+    bashExecutionToText,
+    createBranchSummaryMessage,
+    createCompactionSummaryMessage,
+    createCustomMessage,
+    convertToLlm,
+    parseCommandArgs,
+    substituteArgs,
+    formatPromptTemplateInvocation,
+    JsonlSessionRepo,
+    JsonlSessionStorage,
+    InMemorySessionRepo,
+    InMemorySessionStorage,
+    createSessionId,
+    createTimestamp,
+    toSession,
+    getEntriesToFork,
+    uuidv7: () => sdkNewEntryId("uuid"),
+    formatSkillInvocation,
+    formatSkillsForSystemPrompt,
+    ok,
+    err,
+    getOrThrow,
+    getOrUndefined,
+    toError,
+    FileError,
+    ExecutionError,
+    CompactionError,
+    BranchSummaryError,
+    SessionError,
+    AgentHarnessError,
+    Session,
+    DEFAULT_MAX_LINES,
+    DEFAULT_MAX_BYTES,
+    GREP_MAX_LINE_LENGTH: 500,
+    formatSize,
+    truncateHead,
+    truncateTail,
+    truncateLine,
+    sanitizeBinaryOutput,
+    createFileOps,
+    extractFileOpsFromMessage,
+    computeFileLists,
+    formatFileOperations,
+    streamProxy,
+  };
+}
+
+const bridgeModuleCache = new Map();
+
+function resolveLocalModule(baseDir, specifier) {
+  const raw = path.resolve(baseDir, specifier);
+  const candidates = [raw];
+  if (!path.extname(raw)) {
+    candidates.push(`${raw}.ts`, `${raw}.js`, `${raw}.cjs`, `${raw}.mjs`, `${raw}.json`);
+  }
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate;
+  }
+  if (fs.existsSync(raw) && fs.statSync(raw).isDirectory()) {
+    const manifest = jsonFile(path.join(raw, "package.json"), {});
+    for (const field of ["main", "module"]) {
+      if (manifest[field]) {
+        const entry = resolveLocalModule(raw, String(manifest[field]));
+        if (entry) return entry;
+      }
+    }
+    for (const name of ["index.ts", "index.js", "index.cjs", "index.mjs", "index.json"]) {
+      const candidate = path.join(raw, name);
+      if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate;
+    }
+  }
+  return raw;
+}
+
 function localRequire(baseDir) {
   return (specifier) => {
-    if (specifier === "typebox" || specifier === "@sinclair/typebox") return { Type };
-    if (specifier === "typebox/compile" || specifier === "@sinclair/typebox/compile") return {};
-    if (specifier === "typebox/value" || specifier === "@sinclair/typebox/value") return {};
+    if (specifier === "typebox" || specifier === "@sinclair/typebox") return typeboxExports();
+    if (specifier === "typebox/compile" || specifier === "typebox/compiler" || specifier === "@sinclair/typebox/compile" || specifier === "@sinclair/typebox/compiler") return typeboxCompileExports();
+    if (specifier === "typebox/value" || specifier === "@sinclair/typebox/value") return typeboxValueExports();
+    if (specifier === "typebox/error" || specifier === "@sinclair/typebox/error") return typeboxErrorExports();
+    if (specifier === "@earendil-works/pi-coding-agent/hooks" || specifier === "@mariozechner/pi-coding-agent/hooks") {
+      return piCodingAgentExports();
+    }
     if (specifier === "@earendil-works/pi-coding-agent" || specifier === "@mariozechner/pi-coding-agent") {
       return piCodingAgentExports();
     }
     if (specifier === "@earendil-works/pi-tui" || specifier === "@mariozechner/pi-tui") {
-      return piCodingAgentExports();
+      return piTuiExports();
     }
-    if (specifier.startsWith(".")) return require(path.resolve(baseDir, specifier));
+    if (specifier === "@earendil-works/pi-ai" || specifier === "@mariozechner/pi-ai") {
+      return piAiExports();
+    }
+    if (specifier === "@earendil-works/pi-ai/oauth" || specifier === "@mariozechner/pi-ai/oauth") {
+      return piAiOauthExports();
+    }
+    if (specifier.startsWith("@earendil-works/pi-ai/") || specifier.startsWith("@mariozechner/pi-ai/")) {
+      const subpath = specifier.replace(/^@(earendil-works|mariozechner)\/pi-ai\//, "");
+      const exports = piAiSubpathExports(subpath);
+      if (exports) return exports;
+    }
+    if (specifier === "@earendil-works/pi-agent-core/node" || specifier === "@mariozechner/pi-agent-core/node") {
+      return piAgentCoreNodeExports();
+    }
+    if (specifier === "@earendil-works/pi-agent-core" || specifier === "@mariozechner/pi-agent-core") {
+      return piAgentCoreExports();
+    }
+    if (specifier.startsWith(".")) {
+      const resolved = resolveLocalModule(baseDir, specifier);
+      if (/\.(ts|js)$/i.test(resolved)) return loadBridgeModule(resolved);
+      return require(resolved);
+    }
     return require(specifier);
   };
 }
 
+function transformImportBindings(bindings) {
+  return String(bindings || "")
+    .split(",")
+    .map((part) => part.trim())
+    .filter((part) => part && !part.startsWith("type "))
+    .map((part) => part.replace(/\s+as\s+/g, ": "))
+    .join(", ");
+}
+
+function transformExportBindings(bindings) {
+  return String(bindings || "")
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => {
+      const match = part.match(/^([A-Za-z_$][\w$]*)\s+as\s+([A-Za-z_$][\w$]*|default)$/);
+      if (match) return { local: match[1], exported: match[2] };
+      return { local: part, exported: part };
+    });
+}
+
+function stripTypeOnlyDeclarations(code) {
+  const lines = String(code || "").split("\n");
+  const out = [];
+  let skipping = false;
+  let depth = 0;
+  let untilSemicolon = false;
+  const updateDepth = (line) => {
+    for (const char of line) {
+      if (char === "{" || char === "(" || char === "[") depth += 1;
+      else if (char === "}" || char === ")" || char === "]") depth = Math.max(0, depth - 1);
+    }
+  };
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!skipping && /^(export\s+)?interface\s+[A-Za-z_$][\w$]*/.test(trimmed)) {
+      skipping = true;
+      untilSemicolon = false;
+      depth = 0;
+      updateDepth(line);
+      if (depth === 0 && trimmed.endsWith("}")) skipping = false;
+      continue;
+    }
+    if (!skipping && /^(export\s+)?type\s+[A-Za-z_$][\w$]*(?:<[^>]+>)?\s*=/.test(trimmed)) {
+      skipping = true;
+      untilSemicolon = true;
+      depth = 0;
+      updateDepth(line);
+      if (trimmed.endsWith(";") && depth === 0) skipping = false;
+      continue;
+    }
+    if (skipping) {
+      updateDepth(line);
+      if (untilSemicolon ? trimmed.endsWith(";") && depth === 0 : depth === 0 && trimmed.endsWith("}")) {
+        skipping = false;
+      }
+      continue;
+    }
+    out.push(line);
+  }
+  return out.join("\n");
+}
+
+function stripParamTypes(params) {
+  return String(params || "")
+    .replace(/(\.\.\.)?([A-Za-z_$][\w$]*)\??\s*:\s*[^,)=]+(?=\s*(?:,|=|$))/g, (_m, rest, name) => `${rest || ""}${name}`)
+    .replace(/(\{[^{}]*\}|\[[^\[\]]*\])\s*:\s*[^,)=]+(?=\s*(?:,|=|$))/g, "$1");
+}
+
+function stripTypeScriptSyntax(code) {
+  let out = stripTypeOnlyDeclarations(code);
+  out = out.replace(/\b(private|public|protected|readonly)\s+/g, "");
+  out = out.replace(/(function\s+[A-Za-z_$][\w$]*)<[^()\n]+>\s*\(/g, "$1(");
+  out = out.replace(/([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)<[^<>\n]+>\s*\(/g, "$1(");
+  out = out.replace(/(function(?:\s+[A-Za-z_$][\w$]*)?\s*)\(([^()\n]*)\)/g,
+    (_m, prefix, params) => `${prefix}(${stripParamTypes(params)})`);
+  out = out.replace(/(constructor\s*)\(([^()\n]*)\)/g,
+    (_m, prefix, params) => `${prefix}(${stripParamTypes(params)})`);
+  out = out.replace(/^(\s*[A-Za-z_$][\w$]*\s*)\(([^()\n]*)\)(\s*:\s*[^({=>;\n]+(?:\[\])?)?\s*\{/mg,
+    (_m, prefix, params) => `${prefix}(${stripParamTypes(params)}) {`);
+  out = out.replace(/\(([^()\n]*)\)\s*:\s*[^=\n]+?\s*=>/g,
+    (_m, params) => `(${stripParamTypes(params)}) =>`);
+  out = out.replace(/\(([^()\n]*)\)\s*=>/g,
+    (_m, params) => `(${stripParamTypes(params)}) =>`);
+  out = out.replace(/(function(?:\s+[A-Za-z_$][\w$]*)?\s*\([^()\n]*\))\s*:\s*[^({=>;\n]+(?:\[\])?\s*(?=\{)/g, "$1 ");
+  out = out.replace(/\b(const|let|var)\s+([A-Za-z_$][\w$]*)\s*:\s*[^=;\n]+(?=\s*[=;])/g, "$1 $2");
+  out = out.replace(/^(\s*[A-Za-z_$][\w$]*)\s*:\s*[^=;\n]+;/mg, "$1;");
+  const preservedExportLists = [];
+  out = out.replace(/^\s*export\s+\{[^}]+\};?\s*$/mg, (match) => {
+    const token = `__PI_EXPORT_LIST_${preservedExportLists.length}__`;
+    preservedExportLists.push(match);
+    return token;
+  });
+  out = out.replace(/\s+as\s+const\b/g, "");
+  out = out.replace(/\s+as\s+\{[\s\S]*?\}(?:\s*\|\s*[A-Za-z_$][\w$]*)?(?=\s*[;\),\]\}])/g, "");
+  out = out.replace(/\s+as\s+[A-Za-z_$][\w$]*(?:<[^>\n]+>)?(?:\[\])?(?=\s*[,;\)\]\}])/g, "");
+  out = out.replace(/\s+satisfies\s+[A-Za-z_$][\w$]*(?:<[^>\n]+>)?(?=\s*[,;\)\]\}])/g, "");
+  out = out.replace(/__PI_EXPORT_LIST_(\d+)__/g, (_m, index) => preservedExportLists[Number(index)] || "");
+  return out;
+}
+
 function transformModule(source) {
   let code = source;
-  code = code.replace(/^\s*import\s+type\s+[^;]+;?\s*$/mg, "");
+  const namedExports = [];
+  let importCounter = 0;
+  code = stripTypeOnlyDeclarations(code);
+  code = code.replace(/^\s*import\s+type\s+[\s\S]*?\s+from\s+["'][^"']+["'];?\s*$/mg, "");
+  code = code.replace(/^\s*import\s+([A-Za-z_$][\w$]*)\s*,\s*\{([\s\S]*?)\}\s+from\s+["']([^"']+)["'];?\s*$/mg,
+    (_m, defaultName, names, spec) => {
+      const mod = `__import_${++importCounter}`;
+      const bindings = transformImportBindings(names);
+      return [
+        `const ${mod} = require(${JSON.stringify(spec)});`,
+        `const ${defaultName} = ${mod}.default ?? ${mod};`,
+        bindings ? `const {${bindings}} = ${mod};` : "",
+      ].filter(Boolean).join("\n");
+    });
+  code = code.replace(/^\s*import\s+([A-Za-z_$][\w$]*)\s*,\s*\*\s+as\s+([A-Za-z_$][\w$]*)\s+from\s+["']([^"']+)["'];?\s*$/mg,
+    (_m, defaultName, namespaceName, spec) => {
+      const mod = `__import_${++importCounter}`;
+      return `const ${mod} = require(${JSON.stringify(spec)});\nconst ${defaultName} = ${mod}.default ?? ${mod};\nconst ${namespaceName} = ${mod};`;
+    });
+  code = code.replace(/^\s*import\s+\*\s+as\s+([A-Za-z_$][\w$]*)\s+from\s+["']([^"']+)["'];?\s*$/mg,
+    (_m, name, spec) => `const ${name} = require(${JSON.stringify(spec)});`);
   code = code.replace(/^\s*import\s+\{([^}]+)\}\s+from\s+["']([^"']+)["'];?\s*$/mg,
-    (_m, names, spec) => `const {${names}} = require(${JSON.stringify(spec)});`);
+    (_m, names, spec) => {
+      const bindings = transformImportBindings(names);
+      return bindings ? `const {${bindings}} = require(${JSON.stringify(spec)});` : "";
+    });
   code = code.replace(/^\s*import\s+([A-Za-z_$][\w$]*)\s+from\s+["']([^"']+)["'];?\s*$/mg,
     (_m, name, spec) => `const ${name} = require(${JSON.stringify(spec)}).default ?? require(${JSON.stringify(spec)});`);
+  code = code.replace(/^\s*import\s+["']([^"']+)["'];?\s*$/mg,
+    (_m, spec) => `require(${JSON.stringify(spec)});`);
+  code = stripTypeScriptSyntax(code);
   code = code.replace(/export\s+default\s+async\s+function\s*/g, "module.exports.default = async function ");
   code = code.replace(/export\s+default\s+function\s*/g, "module.exports.default = function ");
   code = code.replace(/export\s+default\s+async\s*\(/g, "module.exports.default = async (");
   code = code.replace(/export\s+default\s*\(/g, "module.exports.default = (");
   code = code.replace(/export\s+default\s+/g, "module.exports.default = ");
-  code = code.replace(/export\s+\{[^}]+\};?\s*$/mg, "");
+  code = code.replace(/export\s+async\s+function\s+([A-Za-z_$][\w$]*)/g, (_m, name) => {
+    namedExports.push({ local: name, exported: name });
+    return `async function ${name}`;
+  });
+  code = code.replace(/export\s+function\s+([A-Za-z_$][\w$]*)/g, (_m, name) => {
+    namedExports.push({ local: name, exported: name });
+    return `function ${name}`;
+  });
+  code = code.replace(/export\s+class\s+([A-Za-z_$][\w$]*)/g, (_m, name) => {
+    namedExports.push({ local: name, exported: name });
+    return `class ${name}`;
+  });
+  code = code.replace(/export\s+(const|let|var)\s+([A-Za-z_$][\w$]*)\s*=/g, (_m, kind, name) => {
+    namedExports.push({ local: name, exported: name });
+    return `${kind} ${name} =`;
+  });
+  code = code.replace(/^\s*export\s+\{([^}]+)\};?\s*$/mg, (_m, names) =>
+    transformExportBindings(names)
+      .map((entry) => entry.exported === "default"
+        ? `module.exports.default = ${entry.local};`
+        : `module.exports.${entry.exported} = ${entry.local};`)
+      .join("\n"));
+  if (namedExports.length > 0) {
+    code += "\n" + namedExports
+      .map((entry) => `module.exports.${entry.exported} = ${entry.local};`)
+      .join("\n");
+  }
   return code;
+}
+
+function loadBridgeModule(filePath) {
+  const resolved = path.resolve(filePath);
+  const ext = path.extname(resolved);
+  if (ext === ".json" || ext === ".cjs") return require(resolved);
+  if (ext === ".mjs") {
+    throw new Error(`Cannot synchronously require ESM module: ${resolved}`);
+  }
+  if (bridgeModuleCache.has(resolved)) return bridgeModuleCache.get(resolved).exports;
+  const source = fs.readFileSync(resolved, "utf8");
+  const module = { exports: {} };
+  bridgeModuleCache.set(resolved, module);
+  const dirname = path.dirname(resolved);
+  const sandbox = {
+    module,
+    exports: module.exports,
+    require: localRequire(dirname),
+    console,
+    process,
+    Buffer,
+    setTimeout,
+    clearTimeout,
+    setInterval,
+    clearInterval,
+    fetch: globalThis.fetch,
+    URL,
+    AbortController,
+    __dirname: dirname,
+    __filename: resolved,
+  };
+  vm.runInNewContext(transformModule(source), sandbox, { filename: resolved });
+  return module.exports;
 }
 
 async function loadFactory(extensionPath) {
@@ -4538,6 +8121,8 @@ async function loadFactory(extensionPath) {
     fetch: globalThis.fetch,
     URL,
     AbortController,
+    __dirname: dirname,
+    __filename: extensionPath,
   };
   vm.runInNewContext(transformModule(source), sandbox, { filename: extensionPath });
   return module.exports.default ?? module.exports;
@@ -5746,6 +9331,11 @@ function createModelRegistry(registry) {
     getAvailable: () => models.slice(),
     find: (provider, modelId) => models.find((model) => model.provider === provider && model.id === modelId),
     hasConfiguredAuth: (model) => !!model,
+    isUsingOAuth: (model) => {
+      const authStorage = registry && registry.authStorage;
+      const credential = model && authStorage && typeof authStorage.get === "function" ? authStorage.get(model.provider) : undefined;
+      return !!(credential && credential.type === "oauth");
+    },
     getApiKeyAndHeaders: async (_model) => ({ ok: true }),
     getProviderAuthStatus: (provider) => ({ configured: true, source: "runtime", label: String(provider || "") }),
     getProviderDisplayName: providerDisplay,
@@ -6722,7 +10312,7 @@ async function handleRequest(request) {
 let bridge_path = lazy (
   let path = Filename.temp_file "ocaml-agent-pi-extension-bridge-" ".cjs" in
   Tools.write_file_contents path source;
-  at_exit (fun () -> try Sys.remove path with _ -> ());
+  at_exit (fun () -> try Sys.remove path with Sys.Break as e -> raise e | _ -> ());
   path)
 
 

@@ -60,7 +60,7 @@ let is_local_source s =
 
 let normalize path =
   let path = Config_paths.expand_tilde path in
-  try Unix.realpath path with _ -> path
+  try Unix.realpath path with Sys.Break as e -> raise e | _ -> path
 
 let resolve_path ~base path =
   let path = Config_paths.expand_tilde path in
@@ -172,8 +172,9 @@ let apply_patterns all_paths patterns base =
       (fun acc pattern ->
         all_paths
         |> List.filter (fun path -> exact_pattern_matches ~base pattern path)
-        |> List.fold_left (fun acc path -> if List.mem path acc then acc else acc @ [ path ]) acc)
+        |> List.fold_left (fun acc path -> if List.mem path acc then acc else path :: acc) acc)
       selected force_includes
+    |> List.rev
   in
   List.filter (fun path -> not (List.exists (fun pattern -> exact_pattern_matches ~base pattern path) force_excludes)) selected
 

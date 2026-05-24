@@ -234,9 +234,13 @@ let interactive agent cfg resumed =
       if line = "/exit" || line = "/quit" then ()
       else begin
         if line <> "" then
-          if handle_bang agent line then ()
-          else if String.length line > 0 && line.[0] = '/' then handle_command agent line
-          else run_turn agent line;
+          (try
+             if handle_bang agent line then ()
+             else if String.length line > 0 && line.[0] = '/' then handle_command agent line
+             else run_turn agent line
+           with
+           | Sys.Break as e -> raise e
+           | e -> Printf.eprintf "%s %s\n%!" (red "Error:") (Printexc.to_string e));
         print_newline ();
         loop ()
       end

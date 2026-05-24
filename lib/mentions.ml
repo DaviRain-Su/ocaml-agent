@@ -44,7 +44,7 @@ let read_file_prefix path n =
   Fun.protect
     ~finally:(fun () -> close_in_noerr ic)
     (fun () ->
-      let len = min n (in_channel_length ic) in
+      let len = max 0 (min n (in_channel_length ic)) in
       really_input_string ic len)
 
 let base64_table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
@@ -159,7 +159,7 @@ let referenced input =
        let start = Str.search_forward mention_re input !i in
        i := start + String.length (Str.matched_string input);
        let p = trim_path (Str.matched_group 1 input) in
-       if p <> "" && (not (List.mem p !paths)) && (try Sys.file_exists p && not (Sys.is_directory p) with _ -> false)
+       if p <> "" && (not (List.mem p !paths)) && (try Sys.file_exists p && not (Sys.is_directory p) with Sys.Break as e -> raise e | _ -> false)
        then paths := p :: !paths
      done
    with Not_found -> ());

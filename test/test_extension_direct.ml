@@ -129,7 +129,7 @@ let () =
   in
   let _ =
     run "write_file"
-      {|{"path":".pi/extensions/model-registry.ts","content":"export default function(pi) {\n  pi.registerCommand(\"modelregistry\", {\n    description: \"Read model registry\",\n    handler: async (_args, ctx) => {\n      const registry = ctx.modelRegistry;\n      const all = registry.getAll();\n      const available = registry.getAvailable();\n      const current = ctx.model;\n      const found = current ? registry.find(current.provider, current.id) : undefined;\n      const status = current ? registry.getProviderAuthStatus(current.provider) : { configured: false };\n      const auth = found ? await registry.getApiKeyAndHeaders(found) : { ok: false };\n      return `${all.length}:${available.length}:${found ? found.id : \"none\"}:${found ? registry.hasConfiguredAuth(found) : false}:${status.configured}:${current ? registry.getProviderDisplayName(current.provider) : \"none\"}:${auth.ok}:${registry.getError() || \"none\"}`;\n    },\n  });\n}\n"}|}
+      {|{"path":".pi/extensions/model-registry.ts","content":"const { AuthStorage, ModelRegistry } = require(\"@earendil-works/pi-coding-agent\");\n\nexport default function(pi) {\n  pi.registerCommand(\"modelregistry\", {\n    description: \"Read model registry\",\n    handler: async (_args, ctx) => {\n      const registry = ctx.modelRegistry;\n      const all = registry.getAll();\n      const available = registry.getAvailable();\n      const current = ctx.model;\n      const found = current ? registry.find(current.provider, current.id) : undefined;\n      const status = current ? registry.getProviderAuthStatus(current.provider) : { configured: false };\n      const auth = found ? await registry.getApiKeyAndHeaders(found) : { ok: false };\n      const oauthRegistry = ModelRegistry.inMemory(AuthStorage.inMemory({ oauthai: { type: \"oauth\", accessToken: \"token\" } }));\n      return `${all.length}:${available.length}:${found ? found.id : \"none\"}:${found ? registry.hasConfiguredAuth(found) : false}:${status.configured}:${current ? registry.getProviderDisplayName(current.provider) : \"none\"}:${auth.ok}:${registry.getError() || \"none\"}:${found ? registry.isUsingOAuth(found) : false}:${oauthRegistry.isUsingOAuth({ provider: \"oauthai\", id: \"oauth-small\" })}`;\n    },\n  });\n}\n"}|}
   in
   let _ =
     run "write_file"
@@ -578,7 +578,7 @@ let () =
          `Assoc [ ("id", `String "other-model"); ("provider", `String "other-provider") ] ]
      in
      match Extensions.execute_command_response ~model ~models "/modelregistry" with
-     | Some response -> response.Extensions.text = "2:2:ctx-model:true:true:ctx-provider:true:none"
+    | Some response -> response.Extensions.text = "2:2:ctx-model:true:true:ctx-provider:true:none:false:true"
      | None -> false);
   check "TypeScript extension command session actions return requests"
     ((not node_available)

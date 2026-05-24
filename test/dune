@@ -49,7 +49,21 @@
  (deps ocaml_sdk_extension.exe))
 
 (test
+ (name test_extension_package_manager)
+ (libraries agent_lib)
+ (deps ocaml_sdk_extension.exe))
+
+(test
+ (name test_extension_settings_manager)
+ (libraries agent_lib)
+ (deps ocaml_sdk_extension.exe))
+
+(test
  (name test_extension_provider_ui)
+ (libraries agent_lib))
+
+(test
+ (name test_extension_frontmatter)
  (libraries agent_lib))
 
 (test
