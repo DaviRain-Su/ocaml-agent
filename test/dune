@@ -48,6 +48,11 @@
  (name test_extension_session_actions)
  (libraries agent_lib))
 
+(test
+ (name test_extension_runtime_lifecycle)
+ (libraries agent_lib)
+ (deps ocaml_sdk_extension.exe))
+
 (executable
  (name ocaml_sdk_extension)
  (libraries agent_lib str))
