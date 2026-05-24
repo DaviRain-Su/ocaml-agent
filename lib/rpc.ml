@@ -20,6 +20,17 @@ let emit_stdout (j : Yojson.Safe.t) =
 let event emit ty fields = emit (`Assoc (("type", `String ty) :: fields))
 let error_event emit msg = event emit "error" [ ("message", `String msg) ]
 
+(* The RPC bash/execute_bash endpoint runs arbitrary shell commands from stdin.
+   Enabled by default, but can be disabled (e.g. when the RPC channel may carry
+   untrusted input) by setting AGENT_RPC_ALLOW_BASH to a falsy value. *)
+let rpc_bash_allowed () =
+  match Sys.getenv_opt "AGENT_RPC_ALLOW_BASH" with
+  | None -> true
+  | Some v -> (
+    match String.lowercase_ascii (String.trim v) with
+    | "0" | "false" | "no" | "off" | "" -> false
+    | _ -> true)
+
 let id_field = function Some id -> [ ("id", `String id) ] | None -> []
 
 let response ?id ?data command =
@@ -238,7 +249,12 @@ let fork_messages_json agent =
   in
   `Assoc [ ("messages", `List (List.rev messages)) ]
 
-let source_info path = `Assoc [ ("path", `String path) ]
+let source_info source path =
+  `Assoc
+    [ ("path", `String path);
+      ("source", `String source);
+      ("scope", `String "temporary");
+      ("origin", `String "top-level") ]
 
 let command_json name description source path =
   `Assoc
@@ -246,7 +262,7 @@ let command_json name description source path =
       ("slashCommand", `String ("/" ^ name));
       ("description", `String description);
       ("source", `String source);
-      ("sourceInfo", source_info path) ]
+      ("sourceInfo", source_info source path) ]
 
 let commands_json () =
   let extension_tools =
@@ -274,6 +290,17 @@ let commands_json () =
     |> List.map (fun (s : Skills.t) -> command_json ("skill:" ^ s.name) s.description "skill" s.location)
   in
   `Assoc [ ("commands", `List (extension_tools @ extension_commands @ prompts @ skills)) ]
+
+let prompt_skill_commands_json () =
+  let prompts =
+    Prompts.discover ()
+    |> List.map (fun (p : Prompts.t) -> command_json p.name p.description "prompt" p.location)
+  in
+  let skills =
+    Skills.discover ()
+    |> List.map (fun (s : Skills.t) -> command_json ("skill:" ^ s.name) s.description "skill" s.location)
+  in
+  prompts @ skills
 
 let ui_capture_json (ui : Extensions.ui_capture) =
   `Assoc
@@ -429,6 +456,7 @@ let execute_slash_command_response_json agent line =
     Extensions.execute_command_response ?session_name:(Agent.session_name agent) ~themes ~theme_name
       ~session_context:(extension_session_context agent)
       ~model:(config_model_json (Agent.config agent)) ~models:(Extensions.model_catalog_json ())
+      ~commands:(prompt_skill_commands_json ())
       ~context_usage:(extension_context_usage agent)
       ~system_prompt:(Agent.system_prompt agent) ~has_ui:false line
   with
@@ -797,6 +825,8 @@ let handle_pi_command ?(prompt_prefix = []) emit agent j =
         success emit ?id "set_auto_retry"
       | None -> failure emit ?id "set_auto_retry" "set_auto_retry requires boolean enabled")
     | "abort_retry" -> success emit ?id "abort_retry"
+    | "bash" | "execute_bash" when not (rpc_bash_allowed ()) ->
+      failure emit ?id command "bash is disabled over RPC (set AGENT_RPC_ALLOW_BASH=1 to enable)"
     | "bash" | "execute_bash" -> (
       match required_str j [ "command" ] with
       | Error msg -> failure emit ?id command msg

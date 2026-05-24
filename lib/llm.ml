@@ -164,11 +164,12 @@ let read_thinking () =
   match configured with
   | Some s -> (
     match String.lowercase_ascii (String.trim s) with
-    | ("off" | "none" | "") -> "off"
     | ("low" | "minimal") -> "low"
     | "medium" -> "medium"
     | ("high" | "xhigh") -> "high"
-    | other -> other)
+    (* Clamp anything unrecognized to "off" so an invalid value never reaches
+       the Anthropic thinking block or OpenAI reasoning_effort field. *)
+    | _ -> "off")
   | None -> "off"
 
 (* Canonical provider names paired with whether their key env var is set. *)

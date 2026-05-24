@@ -7,10 +7,12 @@ let valid_thinking_level s =
 
 let normalize_thinking s =
   match String.lowercase_ascii (String.trim s) with
-  | "none" | "off" | "" -> "off"
-  | "minimal" -> "low"
-  | "xhigh" -> "high"
-  | other -> other
+  | "minimal" | "low" -> "low"
+  | "medium" -> "medium"
+  | "xhigh" | "high" -> "high"
+  (* Clamp unrecognized levels (incl. "none"/"off"/"") to "off" so only the
+     canonical {off,low,medium,high} set ever reaches a provider API. *)
+  | _ -> "off"
 
 let split_thinking spec =
   match String.rindex_opt spec ':' with

@@ -1127,6 +1127,8 @@ let reset_extensions () =
 (* Register an extension-provided tool. Pi lets extensions override built-ins. *)
 let register (t : tool) =
   let name = canonical_name t.name in
+  if is_builtin_name name then
+    Printf.eprintf "warning: extension tool %S shadows the built-in tool of the same name\n%!" (wire_name name);
   let t = { t with name } in
   registry := List.filter (fun x -> x.name <> name) !registry @ [ t ];
   extension_registered_names := name :: List.filter (fun existing -> existing <> name) !extension_registered_names;

@@ -61,7 +61,7 @@ let parse_skill path : t option =
     let name = match List.assoc_opt "name" fm with Some n when n <> "" -> n | _ -> Filename.remove_extension (Filename.basename path) in
     let description = match List.assoc_opt "description" fm with Some d -> d | None -> "" in
     (* Skip skills explicitly opted out of model invocation. *)
-    (match List.assoc_opt "disable-model-invocation" fm with
+    (match Option.map String.lowercase_ascii (List.assoc_opt "disable-model-invocation" fm) with
      | Some ("true" | "yes" | "1") -> None
      | _ -> Some { name; description; location = path })
 

@@ -645,16 +645,26 @@ let hotkeys () =
       "  /                  slash commands" ]
   ^ if extension_shortcuts = [] then "" else "\n" ^ String.concat "\n" extension_shortcuts
 
+(* Clipboard utilities to try, in order, across macOS / X11 / Wayland. *)
+let clipboard_commands = [ "pbcopy"; "xclip -selection clipboard"; "xsel --clipboard --input"; "wl-copy" ]
+
+let command_exists cmd =
+  let bin = match String.split_on_char ' ' cmd with b :: _ -> b | [] -> cmd in
+  Sys.command (Printf.sprintf "command -v %s >/dev/null 2>&1" (Filename.quote bin)) = 0
+
 let copy agent =
   match last_assistant_text agent with
   | None -> "Nothing to copy."
   | Some text -> (
-    try
-      let oc = Unix.open_process_out "pbcopy" in
-      Fun.protect
-        ~finally:(fun () -> ignore (Unix.close_process_out oc))
-        (fun () -> output_string oc text);
-      "Copied last reply to clipboard."
-    with
-    | Sys.Break as e -> raise e
-    | _ -> "Clipboard copy failed (is pbcopy available?).")
+    match List.find_opt command_exists clipboard_commands with
+    | None -> "Clipboard copy failed (no clipboard tool found; install pbcopy, xclip, xsel, or wl-copy)."
+    | Some cmd -> (
+      try
+        let oc = Unix.open_process_out cmd in
+        Fun.protect
+          ~finally:(fun () -> ignore (Unix.close_process_out oc))
+          (fun () -> output_string oc text);
+        "Copied last reply to clipboard."
+      with
+      | Sys.Break as e -> raise e
+      | _ -> Printf.sprintf "Clipboard copy failed (%s)." cmd))

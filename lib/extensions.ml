@@ -883,7 +883,7 @@ function makeApi(registry) {
       registry.activeTools = Array.isArray(names) ? names.map(normalizeToolName).filter(Boolean) : [];
       registry.activeToolsChanged = true;
     },
-    getCommands: () => commandPayload({ commands }),
+    getCommands: () => commandPayload(registry),
     setModel: async (model) => {
       const spec = normalizeModelSpec(model);
       if (!spec || !(spec.provider || spec.model)) return false;
@@ -921,6 +921,7 @@ async function loadTools(extensionPath, flagValues = {}, context = {}) {
     renderers: new Map(),
     messages: [],
     externalTools: Array.isArray(context.allTools) ? context.allTools : [],
+    externalCommands: Array.isArray(context.commands) ? context.commands : [],
     activeTools: Array.isArray(context.activeTools) ? context.activeTools.map(normalizeToolName).filter(Boolean) : null,
     activeToolsChanged: false,
     model: normalizeModelSpec(context.model),
@@ -1022,13 +1023,41 @@ function activeToolState(registry) {
   };
 }
 
-function commandPayload(registry) {
-  return [...registry.commands.entries()].map(([name, command]) => ({
+function normalizeCommandInfo(command) {
+  if (!command || typeof command !== "object") return null;
+  const name = String(command.name || command.command || command.slashCommand || "").replace(/^\//, "").trim();
+  if (!name) return null;
+  const source = String(command.source || "extension").trim() || "extension";
+  const sourceInfo = command.sourceInfo && typeof command.sourceInfo === "object" ? safeSerializable(command.sourceInfo) : {};
+  return {
     name,
+    slashCommand: command.slashCommand || `/${name}`,
+    description: command.description ? String(command.description) : "",
+    source,
+    sourceInfo: {
+      path: command.path || sourceInfo.path || "",
+      source: sourceInfo.source || source,
+      scope: sourceInfo.scope || "temporary",
+      origin: sourceInfo.origin || "top-level",
+      ...sourceInfo,
+    },
+  };
+}
+
+function commandPayload(registry) {
+  const extensionCommands = [...registry.commands.entries()].map(([name, command]) => ({
+    name,
+    slashCommand: `/${name}`,
     description: command.description || "",
     argumentHint: command.argumentHint || command.argument_hint || "",
     hasArgumentCompletions: typeof command.getArgumentCompletions === "function",
+    source: command.source || "extension",
+    sourceInfo: command.sourceInfo || { path: `<extension-command:${name}>`, source: "extension", scope: "temporary", origin: "top-level" },
   }));
+  const externalCommands = Array.isArray(registry.externalCommands)
+    ? registry.externalCommands.map(normalizeCommandInfo).filter(Boolean)
+    : [];
+  return [...extensionCommands, ...externalCommands];
 }
 
 function autocompleteItemsPayload(items) {
@@ -3405,7 +3434,7 @@ let merge_ui left right =
     surfaces = left.surfaces @ right.surfaces;
     messages = left.messages @ right.messages }
 
-let add_runtime_context ?session_name ?session_context ?themes ?theme_name ?model ?models ?context_usage ?system_prompt
+let add_runtime_context ?session_name ?session_context ?themes ?theme_name ?model ?models ?commands ?context_usage ?system_prompt
     ?(has_ui = false) ?(is_idle = true) ?(has_pending_messages = false) ?(tools_expanded = false) fields =
   fields
   @ (match session_name with Some name -> [ ("sessionName", `String name) ] | None -> [])
@@ -3414,6 +3443,7 @@ let add_runtime_context ?session_name ?session_context ?themes ?theme_name ?mode
   @ (match theme_name with Some name -> [ ("themeName", `String name) ] | None -> [])
   @ (match model with Some value -> [ ("model", value) ] | None -> [])
   @ (match models with Some values -> [ ("models", `List values) ] | None -> [])
+  @ (match commands with Some values -> [ ("commands", `List values) ] | None -> [])
   @ (match context_usage with Some value -> [ ("contextUsage", value) ] | None -> [])
   @ (match system_prompt with Some value -> [ ("systemPrompt", `String value) ] | None -> [])
   @
@@ -3422,7 +3452,7 @@ let add_runtime_context ?session_name ?session_context ?themes ?theme_name ?mode
     ("hasPendingMessages", `Bool has_pending_messages);
     ("toolsExpanded", `Bool tools_expanded) ]
 
-let execute_command_response ?session_name ?session_context ?themes ?theme_name ?model ?models ?context_usage ?system_prompt ?has_ui
+let execute_command_response ?session_name ?session_context ?themes ?theme_name ?model ?models ?commands ?context_usage ?system_prompt ?has_ui
     ?is_idle ?has_pending_messages ?tools_expanded line =
   let line = String.trim line in
   if line = "" || line.[0] <> '/' then None
@@ -3439,7 +3469,7 @@ let execute_command_response ?session_name ?session_context ?themes ?theme_name 
     | Some c ->
       let request =
         `Assoc
-          (add_runtime_context ?session_name ?session_context ?themes ?theme_name ?model ?models ?context_usage ?system_prompt ?has_ui
+          (add_runtime_context ?session_name ?session_context ?themes ?theme_name ?model ?models ?commands ?context_usage ?system_prompt ?has_ui
              ?is_idle ?has_pending_messages ?tools_expanded
              [ ("mode", `String "command");
                ("path", `String c.path);
@@ -3453,7 +3483,7 @@ let execute_command_response ?session_name ?session_context ?themes ?theme_name 
 
 let execute_command line = Option.map (fun (response : command_response) -> response.text) (execute_command_response line)
 
-let execute_shortcut_response ?session_name ?session_context ?themes ?theme_name ?model ?models ?context_usage ?system_prompt ?has_ui
+let execute_shortcut_response ?session_name ?session_context ?themes ?theme_name ?model ?models ?commands ?context_usage ?system_prompt ?has_ui
     ?is_idle ?has_pending_messages ?tools_expanded spec =
   let spec = normalize_shortcut_spec spec in
   match List.find_opt (fun s -> s.spec = spec) !shortcut_registry with
@@ -3461,7 +3491,7 @@ let execute_shortcut_response ?session_name ?session_context ?themes ?theme_name
   | Some shortcut ->
     let request =
       `Assoc
-        (add_runtime_context ?session_name ?session_context ?themes ?theme_name ?model ?models ?context_usage ?system_prompt ?has_ui
+        (add_runtime_context ?session_name ?session_context ?themes ?theme_name ?model ?models ?commands ?context_usage ?system_prompt ?has_ui
            ?is_idle ?has_pending_messages ?tools_expanded
            [ ("mode", `String "shortcut");
              ("path", `String shortcut.path);

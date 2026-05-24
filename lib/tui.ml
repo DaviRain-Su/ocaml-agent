@@ -100,6 +100,30 @@ let extension_session_context agent =
   | Some session -> Extensions.session_context_json ~entries:session.Session.entries ~info:(Session.info_of session) (Agent.turns agent)
   | None -> Extensions.session_context_json (Agent.turns agent)
 
+let extension_command_info name description source path =
+  `Assoc
+    [ ("name", `String name);
+      ("slashCommand", `String ("/" ^ name));
+      ("description", `String description);
+      ("source", `String source);
+      ( "sourceInfo",
+        `Assoc
+          [ ("path", `String path);
+            ("source", `String source);
+            ("scope", `String "temporary");
+            ("origin", `String "top-level") ] ) ]
+
+let extension_command_context () =
+  let prompts =
+    Prompts.discover ()
+    |> List.map (fun (p : Prompts.t) -> extension_command_info p.name p.description "prompt" p.location)
+  in
+  let skills =
+    Skills.discover ()
+    |> List.map (fun (s : Skills.t) -> extension_command_info ("skill:" ^ s.name) s.description "skill" s.location)
+  in
+  prompts @ skills
+
 (* --- UTF-8 cursor helpers --- *)
 let is_cont c = Char.code c land 0xC0 = 0x80
 let prev_cp_start s i = let j = ref (i - 1) in while !j > 0 && is_cont s.[!j] do decr j done; max 0 !j
@@ -107,6 +131,9 @@ let next_cp_start s i = let n = String.length s in let j = ref (i + 1) in while 
 let cp_count s upto = let c = ref 0 in String.iteri (fun i ch -> if i < upto && not (is_cont ch) then incr c) s; !c
 
 (* --- scrollback --- *)
+(* Mutates ui.lines without holding ui.mtx. Safe because OCaml's runtime lock
+   serializes these threads (no true parallelism under threads.posix); revisit
+   if this ever moves to OCaml 5 Domains. *)
 let push_segs ui (segs : (A.t * string) list) =
   ui.lines <- ui.lines @ [ segs ];
   let len = List.length ui.lines in
@@ -802,6 +829,7 @@ let rec cmd ui line =
         Extensions.execute_command_response ?session_name:(Agent.session_name ui.agent) ~themes ~theme_name
           ~session_context:(extension_session_context ui.agent)
           ~model:(extension_model_json (Agent.config ui.agent)) ~models:(Extensions.model_catalog_json ())
+          ~commands:(extension_command_context ())
           ~context_usage:(extension_context_usage ui.agent)
           ~system_prompt:(Agent.system_prompt ui.agent) ~has_ui:true ~is_idle:(not ui.turn_active)
           ~tools_expanded:ui.tools_expanded line
