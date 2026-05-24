@@ -15,17 +15,20 @@ let run name input =
   | Some t -> t.execute (j input)
   | None -> failwith ("no tool " ^ name)
 
+let contains0 hay needle =
+  try ignore (Str.search_forward (Str.regexp_string needle) hay 0); true with Not_found -> false
+
 let () =
-  (* Work in an isolated temp directory. *)
-  let dir = Filename.temp_dir "agent_test" "" in
+  let dir = Filename.temp_dir "agent_extension_session_actions_test" "" in
   Sys.chdir dir;
   Unix.putenv "AGENT_SESSION_DIR" "";
   Unix.putenv "AGENT_SCOPED_MODELS" "";
   Unix.putenv "PI_CODING_AGENT_DIR" (Filename.concat dir "pi-agent");
   Unix.putenv "PI_CODING_AGENT_SESSION_DIR" (Filename.concat dir "pi-agent/sessions");
 
-  let contains0 hay needle =
-    try ignore (Str.search_forward (Str.regexp_string needle) hay 0); true with Not_found -> false
+  let session_context_leaf session turns =
+    Extensions.session_context_json ?info:(Some (Session.info_of session)) ~entries:session.Session.entries turns
+    |> Yojson.Safe.Util.member "leafId"
   in
   let cfg_for_reset =
     { Llm.provider = Llm.Openai;
@@ -36,6 +39,16 @@ let () =
       extra_headers = [];
       runtime = None;
       thinking = "off" }
+  in
+  let rpc_field json key =
+    match json with `Assoc fields -> List.assoc_opt key fields | _ -> None
+  in
+  let rpc_last out = match List.rev out with last :: _ -> last | [] -> `Null in
+  let rpc_success out command =
+    let r = rpc_last out in
+    rpc_field r "type" = Some (`String "response")
+    && rpc_field r "command" = Some (`String command)
+    && rpc_field r "success" = Some (`Bool true)
   in
   let node_available = Sys.command "command -v node >/dev/null 2>&1" = 0 in
   let _ =
@@ -211,312 +224,381 @@ let () =
       {|{"path":".pi/extensions/rich-renderer.ts","content":"export default function(pi) {\n  pi.registerRenderer(\"richbox\", {\n    description: \"Rich renderer fallback\",\n    target: \"rich_component\",\n    render: async (event) => ({\n      type: \"panel\",\n      children: [\n        { type: \"markdown\", markdown: `**Rich** ${event.text}` },\n        { type: \"text\", text: \"tail\" },\n      ],\n    }),\n  });\n}\n"}|}
   in
   ignore (Extensions.load ());
-  check "TypeScript extension tool ctx.ui fallback returns defaults"
+  check "rpc Pi execute_command exposes readonly sessionManager snapshot"
     ((not node_available)
      ||
-     match Tools.find "ui_tool" with
-     | Some t ->
-       let output = t.Tools.execute (`Assoc []) in
-       contains0 output "tool notice" && contains0 output "tool false:anon:two"
-     | None -> false);
-  check "TypeScript extension registerProvider appears in provider status"
-    ((not node_available) || List.mem_assoc "localai" (Llm.provider_status ()));
-  check "TypeScript extension registerProvider adds models"
-    ((not node_available)
-     ||
-     Models.context_window "local-large" = Some 4242
-     && List.exists
-          (fun (e : Models.entry) -> e.provider = "localai" && e.id = "local-small")
-          (Models.list ~pat:"localai" ()));
-  Unix.putenv "LOCALAI_API_KEY" "local-key";
-  check "TypeScript extension registerProvider configures LLM provider"
-    ((not node_available)
-     ||
-     let cfg = Llm.config_for "local" in
-     cfg.Llm.provider = Llm.Openai && cfg.base_url = "https://local.invalid/v1"
-     && cfg.api_key = "local-key" && cfg.model = "local-large"
-     && List.mem "X-Local: 1" cfg.extra_headers);
-  Unix.putenv "LOCALAI_API_KEY" "";
-  check "TypeScript extension registerProvider runtime executes without API key"
-    ((not node_available)
-     ||
-     let cfg = Llm.config_for "runtime" in
-     let streamed = Buffer.create 32 in
-     let blocks, usage =
-       Llm.complete cfg ~system:"sys" ~tools_enabled:false
-         ~on_text:(fun text -> Buffer.add_string streamed text)
-         [ { Llm.role = Llm.User; content = [ Llm.Text "hi" ] } ]
+     let session = Session.create_new ~name:"Rpc Session" () in
+     let agent =
+       Agent.create ~session ~initial_turns:[ { Llm.role = Llm.User; content = [ Llm.Text "hello" ] } ] cfg_for_reset
      in
-     cfg.Llm.runtime <> None && cfg.api_key = "" && usage.Llm.input_tokens = 12
-     && usage.Llm.output_tokens = 3
-     &&
-     match blocks with
-     | [ Llm.Text text ] -> text = "runtime runtime-small:sys:1:false" && Buffer.contents streamed = text
-     | _ -> false);
-  check "TypeScript extension runtime registerProvider updates provider registry"
-    ((not node_available)
-     ||
-     match Extensions.execute_command "/provideradd" with
-     | Some output ->
-       output = "added"
-       && List.mem_assoc "lateai" (Llm.provider_status ())
-       && Models.context_window "late-small" = Some 777
-     | None -> false);
-  Unix.putenv "LATEAI_API_KEY" "late-key";
-  check "TypeScript extension runtime registerProvider configures LLM provider"
-    ((not node_available)
-     ||
-     let cfg = Llm.config_for "lateai" in
-     cfg.Llm.provider = Llm.Openai && cfg.base_url = "https://late.invalid/v1"
-     && cfg.api_key = "late-key" && cfg.model = "late-small");
-  Unix.putenv "LATEAI_API_KEY" "";
-  check "TypeScript extension unregisterProvider removes provider and models"
-    ((not node_available)
-     ||
-     match Extensions.execute_command "/providerdrop" with
-     | Some output ->
-       output = "dropped"
-       && not (List.mem_assoc "localai" (Llm.provider_status ()))
-       && not
-            (List.exists
-               (fun (e : Models.entry) -> e.provider = "localai")
-               (Models.list ~pat:"localai" ()))
-     | None -> false);
-  check "TypeScript extension registerFlag/getFlag uses default values"
-    ((not node_available)
-     ||
-     match Extensions.execute_command "/flagshow" with
-     | Some output -> output = "calm:false"
-     | None -> false);
-  Unix.putenv "PI_FLAG_VOICE" "loud";
-  Unix.putenv "PI_FLAG_DRY_RUN" "true";
-  check "TypeScript extension getFlag reads Pi env overrides"
-    ((not node_available)
-     ||
-     match Extensions.execute_command "/flagshow" with
-     | Some output -> output = "loud:true"
-     | None -> false);
-  Unix.putenv "PI_FLAG_VOICE" "";
-  Unix.putenv "PI_FLAG_DRY_RUN" "";
-  check "TypeScript extension registerShortcut exposes handler output"
-    ((not node_available)
-     ||
-     match Extensions.execute_shortcut "ctrl+g" with
-     | Some (Extensions.Shortcut_output output) -> output = "shortcut calm"
-     | _ -> false);
-  check "TypeScript extension registerShortcut exposes command action"
-    ((not node_available)
-     ||
-     match Extensions.execute_shortcut "C-h" with
-     | Some (Extensions.Shortcut_command command) -> command = "/tshello Shortcut"
-     | _ -> false);
-  check "TypeScript extension shortcut ctx.ui fallback returns defaults"
-    ((not node_available)
-     ||
-     match Extensions.execute_shortcut "C-u" with
-     | Some (Extensions.Shortcut_output output) -> contains0 output "shortcut notice" && contains0 output "fallback"
-     | _ -> false);
-  check "TypeScript extension shortcut exposes structured UI requests"
-    ((not node_available)
-     ||
-     match Extensions.execute_shortcut_response "C-u" with
-     | Some (Extensions.Shortcut_response_output response) ->
-       let ui : Extensions.ui_capture = response.ui in
-       let kinds =
-         ui.requests
-         |> List.filter_map (fun request ->
-                match Yojson.Safe.Util.member "kind" request with
-                | `String kind -> Some kind
-                | _ -> None)
-       in
-       contains0 response.text "fallback" && List.mem "notify" kinds && List.mem "input" kinds
-     | _ -> false);
-  check "hotkeys include extension shortcuts"
-    ((not node_available) || (contains0 (Commands.hotkeys ()) "ctrl+g" && contains0 (Commands.hotkeys ()) "Show voice shortcut"));
-  check "TypeScript extension registerMessageRenderer transforms assistant display text"
-    ((not node_available)
-     ||
-     Extensions.render_text ~kind:"message" ~role:"assistant" "hello" = "[message:assistant] hello");
-  check "TypeScript extension registerMessageRenderer transforms tool display text"
-    ((not node_available)
-     ||
-     Extensions.render_text ~kind:"tool_result" ~role:"tool" ~tool_name:"bash" "done" = "[tool_result:bash] done");
-  check "TypeScript extension rich renderer object falls back to text"
-    ((not node_available)
-     ||
-     let output = Extensions.render_text ~kind:"rich_component" ~role:"assistant" "hello" in
-     contains0 output "Rich" && contains0 output "hello" && contains0 output "tail");
-  check "TypeScript extension rich renderer exposes structured components"
-    ((not node_available)
-     ||
-     let response = Extensions.render_response ~kind:"rich_component" ~role:"assistant" "hello" in
-     response.components <> []
-     && contains0 response.rendered "+--"
-     && contains0 response.rendered "Rich"
-     && contains0 response.rendered "tail");
-  check "TypeScript extension session_start can register tool"
-    ((not node_available)
-     ||
-     match Tools.find "session_dynamic" with
-     | Some t -> contains0 (t.Tools.execute (`Assoc [])) "session startup"
-     | None -> false);
-  check "TypeScript extension session_start can register command"
-    ((not node_available)
-     ||
-     List.mem_assoc "/sessioncmd" (Complete.menu "/sessionc")
-     &&
-     match Extensions.execute_command "/sessioncmd" with
-     | Some output -> contains0 output "session command startup"
-     | None -> false);
-  let lifecycle_ok, message_replace_ok, user_message_preserved_ok, turn_message_tool_ok, before_context_ok =
-    if not node_available then (true, true, true, true, true)
-    else begin
-      let before_agent = Extensions.emit_before_agent_start ~prompt:"ask" ~system_prompt:"system base" in
-      let context_messages =
-        Extensions.emit_context [ { Llm.role = Llm.User; content = [ Llm.Text "context base" ] } ]
-      in
-      Extensions.emit_agent_start ();
-      Extensions.emit_turn_start ~turn_index:3;
-      Extensions.emit_message_start { Llm.role = Llm.User; content = [ Llm.Text "plain user" ] };
-      Extensions.emit_message_update ~delta:"delta" { Llm.role = Llm.Assistant; content = [ Llm.Text "delta" ] };
-      let user_message =
-        Extensions.emit_message_end { Llm.role = Llm.User; content = [ Llm.Text "plain user" ] }
-      in
-      let assistant_message =
-        Extensions.emit_message_end { Llm.role = Llm.Assistant; content = [ Llm.Text "raw assistant" ] }
-      in
-      Extensions.emit_tool_execution_start ~tool_call_id:"tool-1" ~tool_name:"ts_greet"
-        ~input:(`Assoc [ ("name", `String "Pi") ]);
-      Extensions.emit_tool_execution_update ~tool_call_id:"tool-1" ~tool_name:"ts_greet"
-        ~input:(`Assoc [ ("name", `String "Pi") ])
-        (`Assoc [ ("content", `List [ `Assoc [ ("type", `String "text"); ("text", `String "partial") ] ]) ]);
-      Extensions.emit_tool_execution_end ~tool_call_id:"tool-1" ~tool_name:"ts_greet" ~result:"done" ~is_error:false;
-      Extensions.emit_turn_end ~turn_index:3 ~message:assistant_message
-        ~tool_results:[ Llm.Tool_result { id = "tool-1"; content = "done" } ];
-      Extensions.emit_agent_end ~messages:[ user_message; assistant_message ];
-      let log = Tools.read_file_contents "lifecycle.log" in
-      let lifecycle_ok = contains0 log "agent_start" && contains0 log "agent_end 2" in
-      let message_replace_ok =
-        match assistant_message with
-        | { Llm.content = [ Llm.Text text ]; _ } -> text = "rewritten assistant"
-        | _ -> false
-      in
-      let user_message_preserved_ok =
-        match user_message with
-        | { Llm.content = [ Llm.Text text ]; _ } -> text = "plain user"
-        | _ -> false
-      in
-      let turn_message_tool_ok =
-        contains0 log "turn_start 3" && contains0 log "turn_end 3 1"
-        && contains0 log "message_start user" && contains0 log "message_update delta"
-        && contains0 log "tool_start ts_greet" && contains0 log "tool_update ts_greet"
-        && contains0 log "tool_end ts_greet false"
-      in
-      let before_context_ok =
-        contains0 log "before_agent_start ask" && contains0 log "context 1"
-        && before_agent.Extensions.system_prompt = Some "system base\nBEFORE:ask"
-        && (match before_agent.Extensions.injected_messages with
-            | [ { Llm.content = [ Llm.Text text ]; _ } ] -> text = "injected ask"
-            | _ -> false)
-        && List.length context_messages = 2
-        &&
-        match List.rev context_messages with
-        | { Llm.content = [ Llm.Text "context extra" ]; _ } :: _ -> true
-        | _ -> false
-      in
-      (lifecycle_ok, message_replace_ok, user_message_preserved_ok, turn_message_tool_ok, before_context_ok)
-    end
-  in
-  check "TypeScript extension agent_start/agent_end fire" lifecycle_ok;
-  check "TypeScript extension message_end can replace assistant" message_replace_ok;
-  check "TypeScript extension message_end preserves unchanged user" user_message_preserved_ok;
-  check "TypeScript extension turn/message/tool lifecycle events fire" turn_message_tool_ok;
-  check "TypeScript extension before_agent_start/context can mutate prompt context" before_context_ok;
-  check "TypeScript extension model/thinking selection events fire"
-    ((not node_available)
-     ||
-     let event_agent = Agent.create cfg_for_reset in
-     Agent.set_config event_agent { cfg_for_reset with Llm.model = "event-model"; thinking = "high" };
-     Agent.set_thinking event_agent "low";
-     let log = Tools.read_file_contents "lifecycle.log" in
-     contains0 log "thinking_level_select off high"
-     && contains0 log "model_select set test-model event-model"
-     && contains0 log "thinking_level_select high low");
-  let session_events_ok, switch_cancel_ok, fork_cancel_ok, compact_cancel_ok, command_new_ok =
-    if not node_available then (true, true, true, true, true)
-    else begin
-      let switch_ok =
-        match Extensions.emit_session_before_switch ~reason:"manual" ~target_session_file:"next.jsonl" () with
-        | Extensions.Session_continue -> true
-        | Extensions.Session_cancel _ -> false
-      in
-      let switch_cancel =
-        match Extensions.emit_session_before_switch ~reason:"blocked" () with
-        | Extensions.Session_cancel reason -> contains0 reason "no switch"
-        | Extensions.Session_continue -> false
-      in
-      let fork_cancel =
-        match Extensions.emit_session_before_fork ~reason:"fork" ~entry_id:"blocked-fork" () with
-        | Extensions.Session_cancel reason -> contains0 reason "no fork"
-        | Extensions.Session_continue -> false
-      in
-      let compact_cancel =
-        match Extensions.emit_session_before_compact ~turn_count:99 () with
-        | Extensions.Session_cancel reason -> contains0 reason "no compact"
-        | Extensions.Session_continue -> false
-      in
-      ignore (Extensions.emit_session_start ~reason:"manual" ~session_file:"manual.jsonl" ~session_id:"manual-id" ());
-      Extensions.emit_session_shutdown ~reason:"manual" ~session_file:"manual.jsonl" ~session_id:"manual-id" ();
-      Extensions.emit_session_compact ~session_file:"manual.jsonl" ~session_id:"manual-id" ~before_turn_count:12
-        ~after_turn_count:7 ();
-      let command_session = Session.create_new ~name:"command-new" () in
-      let command_agent = Agent.create ~session:command_session cfg_for_reset in
-      let command_msg = Commands.new_session command_agent in
-      let command_new =
-        contains0 command_msg "Started new session"
-        &&
-        match Agent.session command_agent with
-        | Some session -> session.Session.path <> command_session.Session.path
-        | None -> false
-      in
-      Option.iter Session.close (Agent.session command_agent);
-      let log = Tools.read_file_contents "lifecycle.log" in
-      let session_events =
-        switch_ok && contains0 log "session_before_switch manual next.jsonl"
-        && contains0 log "session_before_fork fork blocked-fork"
-        && contains0 log "session_before_compact 99" && contains0 log "session_start manual manual-id"
-        && contains0 log "session_shutdown manual manual-id" && contains0 log "session_compact 12 7"
-        && contains0 log "session_before_switch new" && contains0 log "session_shutdown new"
-        && contains0 log "session_start new"
-      in
-      (session_events, switch_cancel, fork_cancel, compact_cancel, command_new)
-    end
-  in
-  check "TypeScript extension session lifecycle events fire" session_events_ok;
-  check "TypeScript extension session_before_switch can cancel" switch_cancel_ok;
-  check "TypeScript extension session_before_fork can cancel" fork_cancel_ok;
-  check "TypeScript extension session_before_compact can cancel" compact_cancel_ok;
-  check "slash new starts a new persisted session" command_new_ok;
-  check "rpc Pi navigateTree uses default branch summarizer when hook omits summary"
-    ((not node_available)
-     ||
-     let _ =
-       run "write_file"
-         {|{"path":".pi/extensions/session-hooks.ts","content":"const fs = require(\"node:fs\");\nexport default function(pi) {\n  pi.on(\"session_before_tree\", async (event) => {\n    const prep = event.preparation || {};\n    fs.appendFileSync(\"lifecycle.log\", `session_before_tree_default ${prep.targetId || \"\"} ${prep.userWantsSummary} ${prep.customInstructions || \"\"} ${prep.replaceInstructions}\\n`);\n    return { label: \"default-summary-label\", customInstructions: \"Hook focus\", replaceInstructions: false };\n  });\n  pi.on(\"session_tree\", async (event) => {\n    fs.appendFileSync(\"lifecycle.log\", `session_tree_default ${event.newLeafId || \"\"} ${event.summaryEntry ? event.summaryEntry.type : \"\"} ${event.fromExtension}\\n`);\n  });\n}\n"}|}
+     let out = Rpc.handle_command_for_test agent (j {|{"type":"execute_command","command":"/sessionview"}|}) in
+     let ok =
+       match rpc_field (rpc_last out) "data" with
+       | Some (`Assoc fields) -> (
+         match List.assoc_opt "text" fields with
+         | Some (`String text) ->
+           let parts = String.split_on_char ':' text in
+           rpc_success out "execute_command"
+           && List.length parts = 14
+           && List.nth parts 1 = "Rpc Session"
+           && List.nth parts 2 = "true"
+           && List.nth parts 3 = "true"
+           && List.nth parts 4 = "1"
+           && List.nth parts 5 = "turn-0"
+           && List.nth parts 6 = "message"
+           && List.nth parts 7 = "user"
+           && List.nth parts 9 = "turn-0"
+           && List.nth parts 11 = "1"
+           && List.nth parts 12 = ""
+           && List.nth parts 13 = "true"
+         | _ -> false)
+       | _ -> false
      in
-     Tools.write_file_contents "runtime-request.log" "";
+     Session.close session;
+     ok);
+  check "rpc Pi execute_command exposes readonly modelRegistry snapshot"
+    ((not node_available)
+     ||
+     let out = Rpc.handle_command_for_test (Agent.create cfg_for_reset) (j {|{"type":"execute_command","command":"/modelregistry"}|}) in
+     match rpc_field (rpc_last out) "data" with
+     | Some (`Assoc fields) -> (
+       match List.assoc_opt "text" fields with
+       | Some (`String text) ->
+         let parts = String.split_on_char ':' text in
+         rpc_success out "execute_command"
+         && List.length parts = 8
+         && Option.value (int_of_string_opt (List.nth parts 0)) ~default:0 > 0
+         && Option.value (int_of_string_opt (List.nth parts 1)) ~default:0 > 0
+         && List.nth parts 2 = "test-model"
+         && List.nth parts 3 = "true"
+         && List.nth parts 4 = "true"
+         && List.nth parts 5 = "openai"
+         && List.nth parts 6 = "true"
+         && List.nth parts 7 = "none"
+       | _ -> false)
+     | _ -> false);
+  check "rpc Pi execute_command applies extension newSession action"
+    ((not node_available)
+     ||
+     let session = Session.create_new ~name:"before-action" () in
+     let agent =
+       Agent.create ~session ~initial_turns:[ { Llm.role = Llm.User; content = [ Llm.Text "hello" ] } ] cfg_for_reset
+     in
+     let before_id = session.Session.id in
+     let out = Rpc.handle_command_for_test agent (j {|{"type":"execute_command","command":"/sessionaction new"}|}) in
+     let current_id = match Agent.session agent with Some s -> s.Session.id | None -> "" in
+     let ok =
+       match rpc_field (rpc_last out) "data" with
+       | Some (`Assoc fields) ->
+         let result_ok =
+           match List.assoc_opt "sessionActionResults" fields with
+           | Some (`List [ `Assoc result_fields ]) ->
+             List.assoc_opt "kind" result_fields = Some (`String "new_session")
+             &&
+             (match List.assoc_opt "text" result_fields with
+              | Some (`String text) -> contains0 text "Started new session"
+              | _ -> false)
+           | _ -> false
+         in
+         rpc_success out "execute_command"
+         && List.assoc_opt "text" fields = Some (`String "new:false")
+         && result_ok
+         && current_id <> "" && current_id <> before_id
+         && Agent.turn_count agent = 0
+       | _ -> false
+     in
+     Option.iter Session.close (Agent.session agent);
+     ok);
+  check "rpc Pi execute_command applies extension fork withSession action"
+    ((not node_available)
+     ||
      let turns =
        [ { Llm.role = Llm.User; content = [ Llm.Text "one" ] };
          { Llm.role = Llm.Assistant; content = [ Llm.Text "two" ] } ]
      in
-     let session = Session.create_new ~name:"nav-default-summary" () in
+     let session = Session.create_new ~name:"before-fork-with" () in
      List.iter (Session.append session) turns;
+     let agent = Agent.create ~session ~initial_turns:turns cfg_for_reset in
+     let out = Rpc.handle_command_for_test agent (j {|{"type":"execute_command","command":"/sessionaction forkwith turn-0"}|}) in
+     let current = Agent.session agent in
+     let entries = match current with Some s -> s.Session.entries | None -> [] in
+     let has_fork_note =
+       List.exists
+         (function
+           | `Assoc fields ->
+             List.assoc_opt "type" fields = Some (`String "custom_message")
+             && List.assoc_opt "id" fields = Some (`String "message-1")
+             && List.assoc_opt "parentId" fields = Some (`String "turn-0")
+             && List.assoc_opt "customType" fields = Some (`String "fork-note")
+           | _ -> false)
+         entries
+     in
+     let ok =
+       match rpc_field (rpc_last out) "data", current with
+       | Some (`Assoc fields), Some _ ->
+         let result_ok =
+           match List.assoc_opt "sessionActionResults" fields with
+           | Some (`List [ `Assoc result_fields ]) ->
+             List.assoc_opt "kind" result_fields = Some (`String "fork")
+             &&
+             (match List.assoc_opt "text" result_fields with
+              | Some (`String text) -> contains0 text "Forked turn-0"
+              | _ -> false)
+           | _ -> false
+         in
+         rpc_success out "execute_command"
+         && List.assoc_opt "text" fields = Some (`String "forkwith:false")
+         && result_ok && Agent.turn_count agent = 1 && has_fork_note
+       | _ -> false
+     in
+     Option.iter Session.close current;
+     ok);
+  check "rpc Pi execute_command applies extension navigateTree action"
+    ((not node_available)
+     ||
+     let turns =
+       [ { Llm.role = Llm.User; content = [ Llm.Text "one" ] };
+         { Llm.role = Llm.Assistant; content = [ Llm.Text "two" ] } ]
+     in
+     let session = Session.create_new ~name:"nav-action" () in
+     List.iter (Session.append session) turns;
+     let agent = Agent.create ~session ~initial_turns:turns cfg_for_reset in
+     let out = Rpc.handle_command_for_test agent (j {|{"type":"execute_command","command":"/sessionaction nav turn-0"}|}) in
+     let has_leaf_reset =
+       List.exists
+         (function
+           | `Assoc entry_fields ->
+             List.assoc_opt "type" entry_fields = Some (`String "leaf")
+             && List.assoc_opt "parentId" entry_fields = Some (`String "turn-1")
+             && List.assoc_opt "targetId" entry_fields = Some (`Null)
+           | _ -> false)
+         session.Session.entries
+     in
+     let ok =
+       match rpc_field (rpc_last out) "data" with
+       | Some (`Assoc fields) ->
+         let result_ok =
+           match List.assoc_opt "sessionActionResults" fields with
+           | Some (`List [ `Assoc result_fields ]) ->
+             List.assoc_opt "kind" result_fields = Some (`String "navigate_tree")
+             && List.assoc_opt "editorText" result_fields = Some (`String "one")
+             &&
+             (match List.assoc_opt "text" result_fields with
+              | Some (`String text) -> contains0 text "Navigated to turn-0"
+              | _ -> false)
+           | _ -> false
+         in
+         rpc_success out "execute_command"
+         && List.assoc_opt "text" fields = Some (`String "nav:false")
+         && result_ok && Agent.turn_count agent = 0
+         && session_context_leaf session (Agent.turns agent) = `Null
+         && has_leaf_reset
+         && contains0 (Tools.read_file_contents "lifecycle.log") "session_tree  turn-1"
+         &&
+         List.exists
+           (function
+             | `Assoc entry_fields ->
+               List.assoc_opt "type" entry_fields = Some (`String "label")
+               && List.assoc_opt "targetId" entry_fields = Some (`String "turn-0")
+               && List.assoc_opt "label" entry_fields = Some (`String "from-extension")
+             | _ -> false)
+           session.Session.entries
+       | _ -> false
+     in
+     Option.iter Session.close (Agent.session agent);
+     ok);
+  check "rpc Pi execute_command keeps assistant navigateTree target in context"
+    ((not node_available)
+     ||
+     let turns =
+       [ { Llm.role = Llm.User; content = [ Llm.Text "one" ] };
+         { Llm.role = Llm.Assistant; content = [ Llm.Text "two" ] } ]
+     in
+     let session = Session.create_new ~name:"nav-assistant-action" () in
+     List.iter (Session.append session) turns;
+     let agent = Agent.create ~session ~initial_turns:turns cfg_for_reset in
+     let out = Rpc.handle_command_for_test agent (j {|{"type":"execute_command","command":"/sessionaction nav turn-1"}|}) in
+     let ok =
+       match rpc_field (rpc_last out) "data" with
+       | Some (`Assoc fields) ->
+         let result_ok =
+           match List.assoc_opt "sessionActionResults" fields with
+           | Some (`List [ `Assoc result_fields ]) ->
+             List.assoc_opt "kind" result_fields = Some (`String "navigate_tree")
+             && List.assoc_opt "editorText" result_fields = None
+             &&
+             (match List.assoc_opt "text" result_fields with
+              | Some (`String text) -> contains0 text "Navigated to turn-1"
+              | _ -> false)
+           | _ -> false
+         in
+         rpc_success out "execute_command"
+         && List.assoc_opt "text" fields = Some (`String "nav:false")
+         && result_ok && Agent.turn_count agent = 2
+       | _ -> false
+     in
+     Option.iter Session.close (Agent.session agent);
+     ok);
+  check "rpc Pi navigateTree custom_message target returns editor text"
+    (let turns =
+       [ { Llm.role = Llm.User; content = [ Llm.Text "one" ] };
+         { Llm.role = Llm.Assistant; content = [ Llm.Text "two" ] } ]
+     in
+     let session = Session.create_new ~name:"nav-custom-message" () in
+     List.iter (Session.append session) turns;
+     Session.append_entry session
+       (`Assoc
+         [ ("type", `String "custom_message");
+           ("id", `String "custom-1");
+           ("parentId", `String "turn-0");
+           ("timestamp", `String "");
+           ("customType", `String "note");
+           ("content", `String "custom body");
+           ("display", `Bool true) ]);
+     let agent = Agent.create ~session ~initial_turns:turns cfg_for_reset in
+     let results =
+       Commands.apply_extension_session_actions agent
+         [ j {|{"kind":"navigate_tree","targetId":"custom-1","options":{"label":"custom-label"}}|} ]
+     in
+     let result_ok =
+       match results with
+       | [ `Assoc fields ] ->
+         List.assoc_opt "kind" fields = Some (`String "navigate_tree")
+         && List.assoc_opt "editorText" fields = Some (`String "custom body")
+         && List.assoc_opt "cancelled" fields = Some (`Bool false)
+       | _ -> false
+     in
+     let has_label =
+       List.exists
+         (function
+           | `Assoc fields ->
+             List.assoc_opt "type" fields = Some (`String "label")
+             && List.assoc_opt "targetId" fields = Some (`String "custom-1")
+             && List.assoc_opt "label" fields = Some (`String "custom-label")
+           | _ -> false)
+         session.Session.entries
+     in
+     let ok = result_ok && Agent.turn_count agent = 1 && has_label in
+     Option.iter Session.close (Agent.session agent);
+     ok);
+  check "rpc Pi navigateTree branch_summary target becomes model context leaf"
+    ((not node_available)
+     ||
+     let turns =
+       [ { Llm.role = Llm.User; content = [ Llm.Text "one" ] };
+         { Llm.role = Llm.Assistant; content = [ Llm.Text "two" ] };
+         { Llm.role = Llm.User; content = [ Llm.Text "three" ] } ]
+     in
+     let session = Session.create_new ~name:"nav-branch-summary-target" () in
+     List.iter (Session.append session) turns;
+     let summary =
+       Session.append_branch_summary session ~parent_id:"turn-0" ~from_hook:false ~from_id:"turn-0"
+         "branch leaf summary"
+     in
+     let summary_id =
+       match summary with
+       | `Assoc fields -> (
+         match List.assoc_opt "id" fields with
+         | Some (`String id) -> id
+         | _ -> "missing")
+       | _ -> "missing"
+     in
+     Tools.write_file_contents "runtime-request.log" "";
      let agent = Agent.create ~session ~initial_turns:turns (Llm.config_for "runtime") in
      let results =
        Commands.apply_extension_session_actions agent
-         [ j
-             {|{"kind":"navigate_tree","targetId":"turn-0","options":{"summarize":true,"label":"default-summary","customInstructions":"Original focus","replaceInstructions":true}}|} ]
+         [ `Assoc
+             [ ("kind", `String "navigate_tree");
+               ("targetId", `String summary_id);
+               ("options", `Assoc [ ("label", `String "summary-leaf") ]) ] ]
      in
+     let leaf_after_nav = session_context_leaf session (Agent.turns agent) in
+     let has_leaf_move =
+       List.exists
+         (function
+           | `Assoc fields ->
+             List.assoc_opt "type" fields = Some (`String "leaf")
+             && List.assoc_opt "targetId" fields = Some (`String summary_id)
+           | _ -> false)
+         session.Session.entries
+     in
+     ignore (Agent.send agent "continue from branch summary");
+     let log = Tools.read_file_contents "runtime-request.log" in
+     let result_ok =
+       match results with
+       | [ `Assoc fields ] ->
+         List.assoc_opt "kind" fields = Some (`String "navigate_tree")
+         && List.assoc_opt "editorText" fields = None
+         && List.assoc_opt "cancelled" fields = Some (`Bool false)
+       | _ -> false
+     in
+     let has_label =
+       List.exists
+         (function
+           | `Assoc fields ->
+             List.assoc_opt "type" fields = Some (`String "label")
+             && List.assoc_opt "targetId" fields = Some (`String summary_id)
+             && List.assoc_opt "label" fields = Some (`String "summary-leaf")
+           | _ -> false)
+         session.Session.entries
+     in
+     let ok =
+       result_ok && has_label && has_leaf_move
+       && leaf_after_nav = `String summary_id
+       && Agent.turn_count agent = 4
+       && contains0 log "branch leaf summary"
+       && contains0 log "continue from branch summary"
+     in
+     Option.iter Session.close (Agent.session agent);
+     ok);
+  check "rpc Pi execute_command applies extension session_before_tree label override"
+    ((not node_available)
+     ||
+     let turns =
+       [ { Llm.role = Llm.User; content = [ Llm.Text "one" ] };
+         { Llm.role = Llm.Assistant; content = [ Llm.Text "two" ] } ]
+     in
+     let session = Session.create_new ~name:"nav-hook-action" () in
+     List.iter (Session.append session) turns;
+     let agent = Agent.create ~session ~initial_turns:turns cfg_for_reset in
+     let out = Rpc.handle_command_for_test agent (j {|{"type":"execute_command","command":"/sessionaction navhook turn-0"}|}) in
+     let ok =
+       match rpc_field (rpc_last out) "data" with
+       | Some (`Assoc fields) ->
+         let result_ok =
+           match List.assoc_opt "sessionActionResults" fields with
+           | Some (`List [ `Assoc result_fields ]) ->
+             List.assoc_opt "kind" result_fields = Some (`String "navigate_tree")
+             && List.assoc_opt "cancelled" result_fields = Some (`Bool false)
+           | _ -> false
+         in
+         rpc_success out "execute_command"
+         && List.assoc_opt "text" fields = Some (`String "navhook:false")
+         && result_ok && Agent.turn_count agent = 0
+         &&
+         List.exists
+           (function
+             | `Assoc entry_fields ->
+               List.assoc_opt "type" entry_fields = Some (`String "label")
+               && List.assoc_opt "targetId" entry_fields = Some (`String "turn-0")
+               && List.assoc_opt "label" entry_fields = Some (`String "hook-label")
+             | _ -> false)
+           session.Session.entries
+       | _ -> false
+     in
+     Option.iter Session.close (Agent.session agent);
+     ok);
+  check "rpc Pi execute_command persists extension branch summary from navigateTree"
+    ((not node_available)
+     ||
+     let turns =
+       [ { Llm.role = Llm.User; content = [ Llm.Text "one" ] };
+         { Llm.role = Llm.Assistant; content = [ Llm.Text "two" ] } ]
+     in
+     let session = Session.create_new ~name:"nav-summary-action" () in
+     List.iter (Session.append session) turns;
+     let agent = Agent.create ~session ~initial_turns:turns cfg_for_reset in
+     let out = Rpc.handle_command_for_test agent (j {|{"type":"execute_command","command":"/sessionaction navsummary turn-0"}|}) in
      let summary_entry =
        session.Session.entries
        |> List.find_map (function
@@ -536,109 +618,540 @@ let () =
        | Some fields ->
          List.assoc_opt "parentId" fields = Some `Null
          && List.assoc_opt "fromId" fields = Some (`String "root")
-         && List.assoc_opt "fromHook" fields = Some (`Bool false)
+         && List.assoc_opt "summary" fields = Some (`String "summary from tree 1")
+         && List.assoc_opt "fromHook" fields = Some (`Bool true)
          &&
-         (match List.assoc_opt "summary" fields with
-          | Some (`String summary) -> contains0 summary "runtime runtime-small:"
+         (match List.assoc_opt "details" fields with
+          | Some (`Assoc detail_fields) -> List.assoc_opt "source" detail_fields = Some (`String "hook")
           | _ -> false)
        | None -> false
      in
      let has_label =
        match summary_id with
+       | None -> false
        | Some id ->
          List.exists
            (function
-             | `Assoc fields ->
-               List.assoc_opt "type" fields = Some (`String "label")
-               && List.assoc_opt "targetId" fields = Some (`String id)
-               && List.assoc_opt "label" fields = Some (`String "default-summary-label")
+             | `Assoc entry_fields ->
+               List.assoc_opt "type" entry_fields = Some (`String "label")
+               && List.assoc_opt "targetId" entry_fields = Some (`String id)
+               && List.assoc_opt "label" entry_fields = Some (`String "summary-hook-label")
              | _ -> false)
            session.Session.entries
+     in
+     let summary_is_leaf =
+       match summary_id with
+       | Some id -> session_context_leaf session (Agent.turns agent) = `String id
        | None -> false
      in
-     let log = Tools.read_file_contents "runtime-request.log" in
-     let lifecycle = Tools.read_file_contents "lifecycle.log" in
-     let result_ok =
-       match results with
-       | [ `Assoc fields ] ->
-         List.assoc_opt "kind" fields = Some (`String "navigate_tree")
-         && List.assoc_opt "cancelled" fields = Some (`Bool false)
-       | _ -> false
-     in
      let ok =
-       result_ok && has_summary && has_label && Agent.turn_count agent = 0
-       && contains0 log "Hook focus" && not (contains0 log "Original focus")
-       && contains0 lifecycle "session_tree_default"
-       && contains0 lifecycle "branch_summary false"
+       match rpc_field (rpc_last out) "data" with
+       | Some (`Assoc fields) ->
+         let result_ok =
+           match List.assoc_opt "sessionActionResults" fields with
+           | Some (`List [ `Assoc result_fields ]) ->
+             List.assoc_opt "kind" result_fields = Some (`String "navigate_tree")
+             && List.assoc_opt "cancelled" result_fields = Some (`Bool false)
+           | _ -> false
+         in
+         rpc_success out "execute_command"
+         && List.assoc_opt "text" fields = Some (`String "navsummary:false")
+         && result_ok && Agent.turn_count agent = 0 && has_summary && has_label && summary_is_leaf
+         && contains0 (Tools.read_file_contents "lifecycle.log") "turn-1 branch_summary"
+       | _ -> false
      in
      Option.iter Session.close (Agent.session agent);
      ok);
-  check "TypeScript extension tool_call mutates input"
+  check "rpc Pi navigateTree branch summary feeds next model context"
     ((not node_available)
      ||
-     match Extensions.emit_tool_call ~tool_call_id:"call-1" ~tool_name:"ts_greet" (`Assoc [ ("name", `String "Pi") ]) with
-     | Extensions.Tool_continue (`Assoc fields) -> List.assoc_opt "name" fields = Some (`String "Pi!")
+     let turns =
+       [ { Llm.role = Llm.User; content = [ Llm.Text "one" ] };
+         { Llm.role = Llm.Assistant; content = [ Llm.Text "two" ] } ]
+     in
+     let session = Session.create_new ~name:"nav-summary-context" () in
+     List.iter (Session.append session) turns;
+     let agent = Agent.create ~session ~initial_turns:turns cfg_for_reset in
+     let _ = Rpc.handle_command_for_test agent (j {|{"type":"execute_command","command":"/sessionaction navsummary turn-0"}|}) in
+     Tools.write_file_contents "runtime-request.log" "";
+     Agent.set_config agent (Llm.config_for "runtime");
+     ignore (Agent.send agent "next question");
+     let log = Tools.read_file_contents "runtime-request.log" in
+     let ok =
+       Agent.turn_count agent = 3
+       && contains0 log "The following is a summary of a branch that this conversation came back from"
+       && contains0 log "summary from tree 1"
+       && contains0 log "next question"
+     in
+     Option.iter Session.close (Agent.session agent);
+     ok);
+  check "rpc Pi execute_command cancels extension navigateTree action via session_before_tree"
+    ((not node_available)
+     ||
+     let turns =
+       [ { Llm.role = Llm.User; content = [ Llm.Text "one" ] };
+         { Llm.role = Llm.Assistant; content = [ Llm.Text "two" ] } ]
+     in
+     let session = Session.create_new ~name:"nav-cancel-action" () in
+     List.iter (Session.append session) turns;
+     let agent = Agent.create ~session ~initial_turns:turns cfg_for_reset in
+     let out = Rpc.handle_command_for_test agent (j {|{"type":"execute_command","command":"/sessionaction navcancel turn-0"}|}) in
+     let ok =
+       match rpc_field (rpc_last out) "data" with
+       | Some (`Assoc fields) ->
+         let result_ok =
+           match List.assoc_opt "sessionActionResults" fields with
+           | Some (`List [ `Assoc result_fields ]) ->
+             List.assoc_opt "kind" result_fields = Some (`String "navigate_tree")
+             && List.assoc_opt "cancelled" result_fields = Some (`Bool true)
+             &&
+             (match List.assoc_opt "text" result_fields with
+              | Some (`String text) -> contains0 text "no tree"
+              | _ -> false)
+           | _ -> false
+         in
+         rpc_success out "execute_command"
+         && List.assoc_opt "text" fields = Some (`String "navcancel:false")
+         && result_ok && Agent.turn_count agent = 2
+         && not
+              (List.exists
+                 (function
+                   | `Assoc entry_fields ->
+                     List.assoc_opt "type" entry_fields = Some (`String "label")
+                     && List.assoc_opt "label" entry_fields = Some (`String "cancel-tree")
+                   | _ -> false)
+                 session.Session.entries)
+       | _ -> false
+     in
+     Option.iter Session.close (Agent.session agent);
+     ok);
+  check "rpc Pi execute_command marks cancelled session switch action"
+    ((not node_available)
+     ||
+     let target = Session.open_file (Filename.concat (Session.default_dir ()) "cancel-target.jsonl") in
+     Session.close target;
+     let session = Session.create_new ~name:"before-cancel-switch" () in
+     let agent = Agent.create ~session cfg_for_reset in
+     let before_id = session.Session.id in
+     let out =
+       Rpc.handle_command_for_test agent (j {|{"type":"execute_command","command":"/sessionaction switch cancel-target"}|})
+     in
+     let current_id = match Agent.session agent with Some s -> s.Session.id | None -> "" in
+     let ok =
+       match rpc_field (rpc_last out) "data" with
+       | Some (`Assoc fields) ->
+         let result_ok =
+           match List.assoc_opt "sessionActionResults" fields with
+           | Some (`List [ `Assoc result_fields ]) ->
+             List.assoc_opt "kind" result_fields = Some (`String "switch_session")
+             && List.assoc_opt "cancelled" result_fields = Some (`Bool true)
+             &&
+             (match List.assoc_opt "text" result_fields with
+              | Some (`String text) -> contains0 text "Session switch cancelled"
+              | _ -> false)
+           | _ -> false
+         in
+         rpc_success out "execute_command"
+         && List.assoc_opt "text" fields = Some (`String "switch:false")
+         && result_ok && current_id = before_id
+       | _ -> false
+     in
+     Option.iter Session.close (Agent.session agent);
+     ok);
+  check "rpc Pi execute_command applies extension withSession side effects"
+    ((not node_available)
+     ||
+     let session = Session.create_new ~name:"before-with" () in
+     let agent =
+       Agent.create ~session ~initial_turns:[ { Llm.role = Llm.User; content = [ Llm.Text "hello" ] } ] cfg_for_reset
+     in
+     let out = Rpc.handle_command_for_test agent (j {|{"type":"execute_command","command":"/sessionaction with"}|}) in
+     let current = Agent.session agent in
+     let entries = match current with Some s -> s.Session.entries | None -> [] in
+     let has_entry typ =
+       List.exists
+         (function
+           | `Assoc fields -> List.assoc_opt "type" fields = Some (`String typ)
+           | _ -> false)
+         entries
+     in
+     let entry_has expected =
+       List.exists
+         (function
+           | `Assoc fields ->
+             List.for_all
+               (fun (key, value) -> List.assoc_opt key fields = Some value)
+               expected
+           | _ -> false)
+         entries
+     in
+     let has_custom_message custom_type =
+       List.exists
+         (function
+           | `Assoc fields ->
+             List.assoc_opt "type" fields = Some (`String "custom_message")
+             && List.assoc_opt "customType" fields = Some (`String custom_type)
+           | _ -> false)
+         entries
+     in
+     let context_contains_setup_message =
+       Agent.context_turns agent
+       |> List.exists (fun turn ->
+              List.exists
+                (function
+                  | Llm.Text text -> contains0 text "setup user"
+                  | _ -> false)
+                turn.Llm.content)
+     in
+     let ok =
+       match rpc_field (rpc_last out) "data", current with
+       | Some (`Assoc fields), Some s ->
+         let result_ok =
+           match List.assoc_opt "sessionActionResults" fields with
+           | Some (`List [ `Assoc result_fields ]) ->
+             List.assoc_opt "kind" result_fields = Some (`String "new_session")
+             &&
+             (match List.assoc_opt "text" result_fields with
+              | Some (`String text) -> contains0 text "Started new session"
+              | _ -> false)
+           | _ -> false
+         in
+         rpc_success out "execute_command"
+         && List.assoc_opt "text" fields = Some (`String "with:false")
+         && result_ok && s.Session.name = "with-session-name"
+         && Agent.turn_count agent = 0
+         && has_entry "custom" && has_entry "session_info" && has_entry "label"
+         && entry_has
+              [ ("type", `String "custom");
+                ("id", `String "callback-entry-1");
+                ("parentId", `Null);
+                ("customType", `String "setup-note") ]
+         && entry_has
+              [ ("type", `String "label");
+                ("id", `String "callback-label-4");
+                ("parentId", `String "callback-message-3");
+                ("targetId", `String "callback-message-3");
+                ("label", `String "setup-label") ]
+         && has_entry "message" && context_contains_setup_message
+         && has_entry "thinking_level_change" && has_entry "model_change"
+         && has_entry "compaction"
+         && has_custom_message "setup-message" && has_custom_message "with-note"
+       | _ -> false
+     in
+     Option.iter Session.close current;
+     ok);
+  check "rpc Pi execute_command applies setup session tree branch writes"
+    ((not node_available)
+     ||
+     let agent = Agent.create cfg_for_reset in
+     let out = Rpc.handle_command_for_test agent (j {|{"type":"execute_command","command":"/sessionbranch"}|}) in
+     let current = Agent.session agent in
+     let entries = match current with Some s -> s.Session.entries | None -> [] in
+     let entry_has expected =
+       List.exists
+         (function
+           | `Assoc fields ->
+             List.for_all
+               (fun (key, value) -> List.assoc_opt key fields = Some value)
+               expected
+           | _ -> false)
+         entries
+     in
+     let context_contains text =
+       Agent.context_turns agent
+       |> List.exists (fun turn ->
+              List.exists
+                (function
+                  | Llm.Text value -> contains0 value text
+                  | _ -> false)
+                turn.Llm.content)
+     in
+     let ok =
+       match rpc_field (rpc_last out) "data", current with
+       | Some (`Assoc fields), Some _ ->
+         let result_ok =
+           match List.assoc_opt "sessionActionResults" fields with
+           | Some (`List [ `Assoc result_fields ]) ->
+             List.assoc_opt "kind" result_fields = Some (`String "new_session")
+             &&
+             (match List.assoc_opt "text" result_fields with
+              | Some (`String text) -> contains0 text "Started new session"
+              | _ -> false)
+           | _ -> false
+         in
+         rpc_success out "execute_command"
+         && List.assoc_opt "text" fields = Some (`String "branch:false")
+         && result_ok && Agent.turn_count agent = 0
+         && entry_has
+              [ ("type", `String "leaf");
+                ("id", `String "callback-leaf-3");
+                ("parentId", `String "callback-message-2");
+                ("targetId", `String "callback-message-1") ]
+         && entry_has
+              [ ("type", `String "message");
+                ("id", `String "callback-message-4");
+                ("parentId", `String "callback-message-1") ]
+         && entry_has
+              [ ("type", `String "branch_summary");
+                ("id", `String "callback-branch-summary-5");
+                ("parentId", `String "callback-message-1");
+                ("fromId", `String "callback-message-1");
+                ("summary", `String "setup branch summary");
+                ("fromHook", `Bool true) ]
+         && context_contains "branch child" && context_contains "setup branch summary"
+       | _ -> false
+     in
+     Option.iter Session.close current;
+     ok);
+  check "rpc Pi execute_command applies setup session manager aliases"
+    ((not node_available)
+     ||
+     let agent = Agent.create cfg_for_reset in
+     let out = Rpc.handle_command_for_test agent (j {|{"type":"execute_command","command":"/sessionalias"}|}) in
+     let current = Agent.session agent in
+     let entries = match current with Some s -> s.Session.entries | None -> [] in
+     let entry_has expected =
+       List.exists
+         (function
+           | `Assoc fields ->
+             List.for_all
+               (fun (key, value) -> List.assoc_opt key fields = Some value)
+               expected
+           | _ -> false)
+         entries
+     in
+     let context_contains_alias_root =
+       Agent.context_turns agent
+       |> List.exists (fun turn ->
+              List.exists
+                (function
+                  | Llm.Text value -> contains0 value "alias root"
+                  | _ -> false)
+                turn.Llm.content)
+     in
+     let ok =
+       match rpc_field (rpc_last out) "data", current with
+       | Some (`Assoc fields), Some s ->
+         let result_ok =
+           match List.assoc_opt "sessionActionResults" fields with
+           | Some (`List [ `Assoc result_fields ]) ->
+             List.assoc_opt "kind" result_fields = Some (`String "new_session")
+             &&
+             (match List.assoc_opt "text" result_fields with
+              | Some (`String text) -> contains0 text "Started new session"
+              | _ -> false)
+           | _ -> false
+         in
+         rpc_success out "execute_command"
+         && List.assoc_opt "text" fields = Some (`String "alias:false")
+         && result_ok && s.Session.name = "alias-session"
+         && entry_has
+              [ ("type", `String "session_info");
+                ("id", `String "callback-session-info-2");
+                ("parentId", `String "callback-message-1");
+                ("name", `String "alias-session") ]
+         && entry_has
+              [ ("type", `String "label");
+                ("id", `String "callback-label-3");
+                ("parentId", `String "callback-session-info-2");
+                ("targetId", `String "callback-message-1");
+                ("label", `String "alias-label") ]
+         && context_contains_alias_root
+       | _ -> false
+     in
+     Option.iter Session.close current;
+     ok);
+  check "rpc Pi execute_command emits extension UI request events"
+    ((not node_available)
+     ||
+     let out =
+       Rpc.handle_command_for_test (Agent.create cfg_for_reset)
+         (j {|{"type":"execute_command","command":"/uicmd"}|})
+     in
+     let methods =
+       out
+       |> List.filter_map (fun event ->
+              match rpc_field event "type", rpc_field event "method" with
+              | Some (`String "extension_ui_request"), Some (`String method_) -> Some method_
+              | _ -> None)
+     in
+     rpc_success out "execute_command"
+     && List.mem "notify" methods && List.mem "confirm" methods
+     && List.mem "input" methods && List.mem "select" methods);
+  check "rpc Pi execute_command exposes extension UI surfaces"
+    ((not node_available)
+     ||
+     let out =
+       Rpc.handle_command_for_test (Agent.create cfg_for_reset)
+         (j {|{"type":"execute_command","command":"/surfacecmd"}|})
+     in
+     rpc_success out "execute_command"
+     &&
+     match rpc_field (rpc_last out) "data" with
+     | Some (`Assoc fields) -> (
+       match List.assoc_opt "text" fields, List.assoc_opt "ui" fields with
+       | Some (`String text), Some (`Assoc ui_fields) -> (
+         match List.assoc_opt "surfaces" ui_fields with
+         | Some (`List surfaces) ->
+           let kinds =
+             List.filter_map
+               (fun surface ->
+                 match Yojson.Safe.Util.member "kind" surface with
+                 | `String kind -> Some kind
+                 | _ -> None)
+               surfaces
+           in
+           contains0 text "surface editor body:prefill"
+           && List.mem "status" kinds && List.mem "widget" kinds
+           && List.mem "title" kinds && List.mem "editor_text" kinds
+         | _ -> false)
+       | _ -> false)
      | _ -> false);
-  check "TypeScript extension tool_call can block"
+  check "rpc Pi execute_command emits extension UI surface events"
     ((not node_available)
      ||
-     match Extensions.emit_tool_call ~tool_call_id:"call-2" ~tool_name:"bash" (`Assoc [ ("command", `String "blocked") ]) with
-     | Extensions.Tool_block reason -> contains0 reason "blocked by ts"
+     let out =
+       Rpc.handle_command_for_test (Agent.create cfg_for_reset)
+         (j {|{"type":"execute_command","command":"/surfacecmd"}|})
+     in
+     let methods =
+       out
+       |> List.filter_map (fun event ->
+              match rpc_field event "type", rpc_field event "method" with
+              | Some (`String "extension_ui_request"), Some (`String method_) -> Some method_
+              | _ -> None)
+     in
+     rpc_success out "execute_command"
+     && List.mem "setStatus" methods && List.mem "setWidget" methods
+     && List.mem "setTitle" methods && List.mem "set_editor_text" methods);
+  check "rpc Pi execute_command exposes component factory lines"
+    ((not node_available)
+     ||
+     let out =
+       Rpc.handle_command_for_test (Agent.create cfg_for_reset)
+         (j {|{"type":"execute_command","command":"/componentcmd"}|})
+     in
+     rpc_success out "execute_command"
+     &&
+     match rpc_field (rpc_last out) "data" with
+     | Some (`Assoc fields) -> (
+       match List.assoc_opt "text" fields, List.assoc_opt "ui" fields with
+       | Some (`String text), Some (`Assoc ui_fields) -> (
+         match List.assoc_opt "surfaces" ui_fields with
+         | Some (`List surfaces) ->
+           let lines_for kind =
+             surfaces
+             |> List.find_map (fun surface ->
+                    match Yojson.Safe.Util.member "kind" surface with
+                    | `String got when got = kind -> (
+                      match Yojson.Safe.Util.member "lines" surface with
+                      | `List lines ->
+                        Some
+                          (List.filter_map
+                             (function `String line -> Some line | _ -> None)
+                             lines)
+                      | _ -> Some [])
+                    | _ -> None)
+             |> Option.value ~default:[]
+           in
+           contains0 text "component done-value:true"
+           && List.mem "factory widget" (lines_for "widget")
+           && List.mem "custom component" (lines_for "custom")
+	       | _ -> false)
+	     | _ -> false)
+	 | _ -> false);
+  check "rpc Pi execute_command exposes custom overlay handle surfaces"
+    ((not node_available)
+     ||
+     let out =
+       Rpc.handle_command_for_test (Agent.create cfg_for_reset)
+         (j {|{"type":"execute_command","command":"/overlaycmd"}|})
+     in
+     rpc_success out "execute_command"
+     &&
+     match rpc_field (rpc_last out) "data" with
+     | Some (`Assoc fields) -> (
+       match List.assoc_opt "text" fields, List.assoc_opt "ui" fields with
+       | Some (`String text), Some (`Assoc ui_fields) -> (
+         match List.assoc_opt "surfaces" ui_fields with
+         | Some (`List surfaces) ->
+           let lines_contain expected surface =
+             match Yojson.Safe.Util.member "lines" surface with
+             | `List lines -> List.exists (function `String line -> line = expected | _ -> false) lines
+             | _ -> false
+           in
+           let custom_overlay =
+             surfaces
+             |> List.exists (fun surface ->
+                    Yojson.Safe.Util.member "kind" surface = `String "custom"
+                    && Yojson.Safe.Util.member "overlay" surface = `Bool true
+                    && lines_contain "overlay component" surface)
+           in
+           let custom_methods =
+             surfaces
+             |> List.filter_map (fun surface ->
+                    match Yojson.Safe.Util.member "kind" surface, Yojson.Safe.Util.member "overlayId" surface with
+                    | `String "overlay_handle", `String "custom-overlay-1" -> (
+                      match Yojson.Safe.Util.member "method" surface with
+                      | `String method_ -> Some method_
+                      | _ -> None)
+                    | _ -> None)
+           in
+           contains0 text "overlay overlay-done"
+           && custom_overlay
+           && List.mem "focus" custom_methods
+           && List.mem "setHidden" custom_methods
+           && List.mem "hide" custom_methods
+         | _ -> false)
+       | _ -> false)
      | _ -> false);
-  check "TypeScript extension tool_result can replace text"
+  check "rpc Pi execute_command emits component widget lines"
     ((not node_available)
      ||
-     contains0
-       (Extensions.emit_tool_result ~tool_call_id:"call-3" ~tool_name:"ts_greet"
-          ~input:(`Assoc [ ("name", `String "Pi") ]) "Hello Pi")
-       "hooked");
-  check "TypeScript extension input event transforms text"
+     let out =
+       Rpc.handle_command_for_test (Agent.create cfg_for_reset)
+         (j {|{"type":"execute_command","command":"/componentcmd"}|})
+     in
+     let widget_lines =
+       out
+       |> List.find_map (fun event ->
+              match rpc_field event "type", rpc_field event "method", rpc_field event "widgetKey" with
+              | Some (`String "extension_ui_request"), Some (`String "setWidget"), Some (`String "factory") -> (
+                match rpc_field event "widgetLines" with
+                | Some (`List lines) ->
+                  Some (List.filter_map (function `String line -> Some line | _ -> None) lines)
+                | _ -> Some [])
+              | _ -> None)
+       |> Option.value ~default:[]
+     in
+     rpc_success out "execute_command" && List.mem "factory widget" widget_lines);
+  check "rpc Pi execute_command emits custom message events"
     ((not node_available)
      ||
-     match Extensions.emit_input "brief: explain pi" with
-     | Extensions.Input_continue text -> text = "Respond briefly: explain pi"
-     | Extensions.Input_handled -> false);
-  check "TypeScript extension input event can handle text"
-    ((not node_available)
-     ||
-     match Extensions.emit_input "handled" with
-     | Extensions.Input_handled -> true
-     | Extensions.Input_continue _ -> false);
-  let user_bash_replace_ok, user_bash_context_ok, user_bash_hidden_ok =
-    if not node_available then (true, true, true)
-    else
-      let user_bash_agent = Agent.create cfg_for_reset in
-      let intercepted = Agent.run_user_bash user_bash_agent "virtual" in
-      let replace_ok = contains0 intercepted "(exit 7)" && contains0 intercepted "virtual false" in
-      let context_ok = Agent.turn_count user_bash_agent = 1 in
-      let before_hidden = Agent.turn_count user_bash_agent in
-      let hidden = Agent.run_user_bash ~exclude_from_context:true user_bash_agent "virtual" in
-      let hidden_ok =
-        contains0 hidden "(exit 7)" && contains0 hidden "virtual true" && Agent.turn_count user_bash_agent = before_hidden
-      in
-      (replace_ok, context_ok, hidden_ok)
-  in
-  check "TypeScript extension user_bash can replace result" user_bash_replace_ok;
-  check "TypeScript extension user_bash records replacement context" user_bash_context_ok;
-  check "TypeScript extension user_bash honors excludeFromContext" user_bash_hidden_ok;
-  check "TypeScript extension user_bash can provide BashOperations"
-    ((not node_available)
-     ||
-     let ops_agent = Agent.create cfg_for_reset in
-     let result = Agent.run_user_bash ops_agent "ops" in
-     contains0 result "(exit 9)" && contains0 result "ops ops");
-  check "TypeScript extension createLocalBashOperations is exported"
-    ((not node_available)
-     ||
-     let ops_agent = Agent.create cfg_for_reset in
-     let result = Agent.run_user_bash ops_agent "localops" in
-     contains0 result "(exit 0)" && contains0 result "wrapped" && contains0 result "localops");
-  check "TypeScript extension createLocalFileOperations is exported"
-    ((not node_available)
-     ||
-     let ops_agent = Agent.create cfg_for_reset in
-     let result = Agent.run_user_bash ops_agent "fileops" in
-     contains0 result "(exit 0)" && contains0 result "fileops");
-
-  Printf.printf "\n%s\n" (if !failures = 0 then "All tests passed." else "FAILURES present.");
+     let out =
+       Rpc.handle_command_for_test (Agent.create cfg_for_reset)
+         (j {|{"type":"execute_command","command":"/messagecmd"}|})
+     in
+     let custom_types =
+       out
+       |> List.filter_map (fun event ->
+              match rpc_field event "type", rpc_field event "customType" with
+              | Some (`String "custom_message"), Some (`String custom_type) -> Some custom_type
+              | _ -> None)
+     in
+     let notice_rendered =
+       out
+       |> List.find_map (fun event ->
+              match rpc_field event "type", rpc_field event "customType", rpc_field event "rendered" with
+              | Some (`String "custom_message"), Some (`String "notice"), Some (`String rendered) -> Some rendered
+              | _ -> None)
+       |> Option.value ~default:""
+     in
+     rpc_success out "execute_command"
+     && List.mem "notice" custom_types
+     && contains0 notice_rendered "NOTICE message body"
+     && List.mem "user" custom_types
+     && List.mem "api-note" custom_types
+     && List.mem "state-note" custom_types);
+  Printf.printf "\n%s\n" (if !failures = 0 then "All extension session action tests passed." else "FAILURES present.");
   exit (if !failures = 0 then 0 else 1)
