@@ -1,9 +1,4 @@
 (test
- (name test_tools)
- (libraries agent_lib notty)
- (deps ocaml_sdk_extension.exe))
-
-(test
  (name test_misc)
  (libraries agent_lib notty))
 
@@ -67,6 +62,10 @@
 
 (test
  (name test_extension_lifecycle_hooks)
+ (libraries agent_lib))
+
+(test
+ (name test_extension_sdk_runtime_programmatic)
  (libraries agent_lib))
 
 (executable
