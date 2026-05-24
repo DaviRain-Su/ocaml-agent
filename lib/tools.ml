@@ -1118,39 +1118,45 @@ let canonical_names names =
 
 let is_builtin_name name = List.mem (canonical_name name) builtin_names
 
-let registry = ref builtin
-let extension_registered_names : string list ref = ref []
+(* A tool registry: the set of available tools plus the names that were
+   registered by extensions (so we can label/override them). Bundled into a
+   record so a process can hold several independent registries; [default_registry]
+   is the ambient one used when no [reg] is supplied. *)
+type registry = { mutable tools : tool list; mutable ext_names : string list }
 
-let reset_extensions () =
-  registry := builtin;
-  extension_registered_names := []
+let create_registry () = { tools = builtin; ext_names = [] }
+let default_registry = create_registry ()
+
+let reset_extensions ?(reg = default_registry) () =
+  reg.tools <- builtin;
+  reg.ext_names <- []
 
 (* Register an extension-provided tool. Pi lets extensions override built-ins. *)
-let register (t : tool) =
+let register ?(reg = default_registry) (t : tool) =
   let name = canonical_name t.name in
   if is_builtin_name name then
     Printf.eprintf "warning: extension tool %S shadows the built-in tool of the same name\n%!" (wire_name name);
   let t = { t with name } in
-  registry := List.filter (fun x -> x.name <> name) !registry @ [ t ];
-  extension_registered_names := name :: List.filter (fun existing -> existing <> name) !extension_registered_names;
+  reg.tools <- List.filter (fun x -> x.name <> name) reg.tools @ [ t ];
+  reg.ext_names <- name :: List.filter (fun existing -> existing <> name) reg.ext_names;
   true
 
-let all ?allowed () =
+let all ?(reg = default_registry) ?allowed () =
   match allowed with
-  | None -> !registry
+  | None -> reg.tools
   | Some names ->
     let names = canonical_names names in
-    List.filter (fun t -> List.mem t.name names) !registry
+    List.filter (fun t -> List.mem t.name names) reg.tools
 
-let extension_names () =
-  !extension_registered_names
-  |> List.filter (fun name -> List.exists (fun t -> t.name = name) !registry)
+let extension_names ?(reg = default_registry) () =
+  reg.ext_names
+  |> List.filter (fun name -> List.exists (fun t -> t.name = name) reg.tools)
   |> List.map wire_name
   |> List.sort_uniq String.compare
 
-let tool_info_json t =
+let tool_info_json ?(reg = default_registry) t =
   let source =
-    if List.mem t.name !extension_registered_names then "extension"
+    if List.mem t.name reg.ext_names then "extension"
     else if is_builtin_name t.name then "builtin"
     else "extension"
   in
@@ -1165,9 +1171,9 @@ let tool_info_json t =
             ("scope", `String "temporary");
             ("origin", `String "top-level") ] ) ]
 
-let tool_infos ?allowed () = List.map tool_info_json (all ?allowed ())
+let tool_infos ?(reg = default_registry) ?allowed () = List.map (tool_info_json ~reg) (all ~reg ?allowed ())
 
-let names ?allowed () = all ?allowed () |> List.map (fun t -> wire_name t.name)
+let names ?(reg = default_registry) ?allowed () = all ~reg ?allowed () |> List.map (fun t -> wire_name t.name)
 
 (* Anthropic tool schema: {name, description, input_schema}. *)
 let anthropic_schema t =
@@ -1186,9 +1192,9 @@ let openai_schema t =
             ("description", `String t.description);
             ("parameters", t.parameters) ] ) ]
 
-let anthropic_schemas ?allowed () = List.map anthropic_schema (all ?allowed ())
-let openai_schemas ?allowed () = List.map openai_schema (all ?allowed ())
+let anthropic_schemas ?(reg = default_registry) ?allowed () = List.map anthropic_schema (all ~reg ?allowed ())
+let openai_schemas ?(reg = default_registry) ?allowed () = List.map openai_schema (all ~reg ?allowed ())
 
-let find name =
+let find ?(reg = default_registry) name =
   let name = canonical_name name in
-  List.find_opt (fun t -> t.name = name) !registry
+  List.find_opt (fun t -> t.name = name) reg.tools

@@ -95,8 +95,6 @@ let builtin_registry : known list =
     mk [ "gemini"; "google" ] Openai "https://generativelanguage.googleapis.com/v1beta/openai"
       [ "GEMINI_API_KEY"; "GOOGLE_API_KEY" ] "gemini-2.0-flash" ]
 
-let extension_registry : known list ref = ref []
-
 type runtime_complete =
   config ->
   system:string ->
@@ -106,69 +104,91 @@ type runtime_complete =
   turn list ->
   content list * usage
 
-let extension_runtimes : (string, runtime_complete) Hashtbl.t = Hashtbl.create 8
+(* Provider/transport state for one client: the extension-registered provider
+   list (searched before builtins), provider runtimes, request/response hooks,
+   and the HTTP transport (curl by default). *)
+type providers =
+  { mutable registry : known list;
+    runtimes : (string, runtime_complete) Hashtbl.t;
+    mutable request_hook : Yojson.Safe.t -> Yojson.Safe.t;
+    mutable response_hook : status:int -> headers:(string * string) list -> unit;
+    mutable transport : Transport.t }
 
-let provider_request_hook : (Yojson.Safe.t -> Yojson.Safe.t) ref = ref (fun payload -> payload)
+let create_providers () =
+  { registry = [];
+    runtimes = Hashtbl.create 8;
+    request_hook = (fun payload -> payload);
+    response_hook = (fun ~status:_ ~headers:_ -> ());
+    transport = Http.transport }
 
-let provider_response_hook : (status:int -> headers:(string * string) list -> unit) ref =
-  ref (fun ~status:_ ~headers:_ -> ())
+let default_providers = create_providers ()
 
-let set_provider_request_hook hook = provider_request_hook := hook
-let set_provider_response_hook hook = provider_response_hook := hook
-let apply_provider_request_hooks payload = !provider_request_hook payload
-let emit_provider_response_hooks ~status ~headers = !provider_response_hook ~status ~headers
+(* A client pairs provider/transport state with a tool registry, so a single
+   process can host fully-independent SDK clients. The ambient [default_client]
+   backs the legacy global API (no ?client argument); pass ?client to isolate. *)
+type client = { providers : providers; tools : Tools.registry }
 
-(* The HTTP transport used to reach providers. Defaults to the curl-based
-   [Http] implementation; swap in a native OCaml client with [set_transport],
-   or pass one per call to [complete]. *)
-let default_transport : Transport.t ref = ref Http.transport
-let set_transport t = default_transport := t
-let transport () = !default_transport
+let create_client () = { providers = create_providers (); tools = Tools.create_registry () }
+let default_client = { providers = default_providers; tools = Tools.default_registry }
 
-let registry () = !extension_registry @ builtin_registry
+let pstate = function Some c -> c.providers | None -> default_providers
 
 let normalize_name name = String.lowercase_ascii (String.trim name)
 
 let uniq xs =
   List.fold_left (fun acc x -> if x = "" || List.mem x acc then acc else acc @ [ x ]) [] xs
 
-let register_provider ?(aliases = []) ?(headers = []) ?runtime ~name ~protocol ~base_url ~env_keys
+let set_provider_request_hook ?client hook = (pstate client).request_hook <- hook
+let set_provider_response_hook ?client hook = (pstate client).response_hook <- hook
+let apply_provider_request_hooks ?client payload = (pstate client).request_hook payload
+let emit_provider_response_hooks ?client ~status ~headers () = (pstate client).response_hook ~status ~headers
+
+(* Swap the HTTP transport (e.g. a native OCaml client in place of curl). *)
+let set_transport ?client t = (pstate client).transport <- t
+let transport ?client () = (pstate client).transport
+
+let registry ?client () = (pstate client).registry @ builtin_registry
+
+let register_provider ?client ?(aliases = []) ?(headers = []) ?runtime ~name ~protocol ~base_url ~env_keys
     ~default_model () =
+  let p = pstate client in
   let names = uniq (List.map normalize_name (name :: aliases)) in
   if names <> [] && String.trim base_url <> "" && String.trim default_model <> "" then begin
     let provider = { names; protocol; base_url; env_keys = uniq env_keys; default_model; headers; runtime } in
-    extension_registry :=
+    p.registry <-
       provider
       :: List.filter
            (fun existing -> not (List.exists (fun name -> List.mem name existing.names) names))
-           !extension_registry
+           p.registry
   end
 
-let register_provider_runtime runtime handler =
-  Hashtbl.replace extension_runtimes runtime handler
+let register_provider_runtime ?client runtime handler =
+  Hashtbl.replace (pstate client).runtimes runtime handler
 
-let unregister_provider name =
+let unregister_provider ?client name =
+  let p = pstate client in
   let n = normalize_name name in
   if n = "" then []
   else
-    let removed, kept = List.partition (fun existing -> List.mem n existing.names) !extension_registry in
-    extension_registry := kept;
+    let removed, kept = List.partition (fun existing -> List.mem n existing.names) p.registry in
+    p.registry <- kept;
     List.iter
-      (fun provider -> Option.iter (fun runtime -> Hashtbl.remove extension_runtimes runtime) provider.runtime)
+      (fun provider -> Option.iter (fun runtime -> Hashtbl.remove p.runtimes runtime) provider.runtime)
       removed;
     uniq (List.concat_map (fun provider -> provider.names) removed)
 
-let clear_extension_providers () =
-  extension_registry := [];
-  Hashtbl.clear extension_runtimes
+let clear_extension_providers ?client () =
+  let p = pstate client in
+  p.registry <- [];
+  Hashtbl.clear p.runtimes
 
-let find_known name =
+let find_known ?client name =
   let n = String.lowercase_ascii name in
-  List.find_opt (fun k -> List.mem n k.names) (registry ())
+  List.find_opt (fun k -> List.mem n k.names) (registry ?client ())
 
-let is_known_provider name = find_known name <> None
+let is_known_provider ?client name = find_known ?client name <> None
 
-let all_env_keys () = List.concat_map (fun k -> k.env_keys) (registry ())
+let all_env_keys ?client () = List.concat_map (fun k -> k.env_keys) (registry ?client ())
 
 let read_max_tokens () =
   match getenv "AGENT_MAX_TOKENS" with Some s -> ( try int_of_string s with _ -> 4096) | None -> 4096
@@ -192,18 +212,18 @@ let read_thinking () =
     | None -> "off")
 
 (* Canonical provider names paired with whether their key env var is set. *)
-let provider_status () =
+let provider_status ?client () =
   List.filter_map
     (fun k ->
       match k.names with
       | name :: _ -> Some (name, k.runtime <> None || first_env k.env_keys <> None)
       | [] -> None)
-    (registry ())
+    (registry ?client ())
 
-let unknown_provider_error alias =
+let unknown_provider_error ?client alias =
   Config_error
     (Printf.sprintf "unknown provider %S; known: %s" alias
-       (String.concat ", " (List.map fst (provider_status ()))))
+       (String.concat ", " (List.map fst (provider_status ?client ()))))
 
 (* Pure: build a fully-explicit config without consulting the environment,
    settings files, or the provider registry. The entry point SDK/library
@@ -222,9 +242,9 @@ let make_config ?(max_tokens = 4096) ?(extra_headers = []) ?runtime ?(thinking =
 (* Pure: build a config from a known provider entry (its protocol, base URL,
    default model, and required headers) with an explicitly supplied API key.
    No environment or settings reads. Raises [Config_error] for unknown aliases. *)
-let config_of_known ?model ?(thinking = "off") ?(max_tokens = 4096) ~api_key alias : config =
-  match find_known alias with
-  | None -> raise (unknown_provider_error alias)
+let config_of_known ?client ?model ?(thinking = "off") ?(max_tokens = 4096) ~api_key alias : config =
+  match find_known ?client alias with
+  | None -> raise (unknown_provider_error ?client alias)
   | Some k ->
     make_config ~provider:k.protocol ~base_url:k.base_url ~api_key
       ~model:(Option.value model ~default:k.default_model)
@@ -234,9 +254,9 @@ let config_of_known ?model ?(thinking = "off") ?(max_tokens = 4096) ~api_key ali
    Convenience layer over [config_of_known]: reads the key from the provider's
    env vars (or AGENT_API_KEY) and pulls max_tokens/thinking from env/settings;
    lets [model] override the model. *)
-let config_for ?model alias : config =
-  match find_known alias with
-  | None -> raise (unknown_provider_error alias)
+let config_for ?client ?model alias : config =
+  match find_known ?client alias with
+  | None -> raise (unknown_provider_error ?client alias)
   | Some k ->
     let api_key =
       match first_env k.env_keys with
@@ -250,9 +270,9 @@ let config_for ?model alias : config =
             (Config_error
                (Printf.sprintf "no API key for %s; set %s" alias (String.concat " or " k.env_keys))))
     in
-    config_of_known ?model ~thinking:(read_thinking ()) ~max_tokens:(read_max_tokens ()) ~api_key alias
+    config_of_known ?client ?model ~thinking:(read_thinking ()) ~max_tokens:(read_max_tokens ()) ~api_key alias
 
-let config () : config =
+let config ?client () : config =
   let max_tokens = read_max_tokens () in
   (* Resolve the chosen provider entry (or a generic fallback). *)
   let chosen : [ `Known of known | `Generic of provider ] =
@@ -263,7 +283,7 @@ let config () : config =
     in
     match configured_provider with
     | Some p -> (
-      match find_known p with
+      match find_known ?client p with
       | Some k -> `Known k
       | None ->
         (* Unknown alias: treat as a generic endpoint; guess protocol by name. *)
@@ -271,7 +291,7 @@ let config () : config =
         `Generic proto)
     | None -> (
       (* Auto-detect: first registry entry whose key env var is present. *)
-      match List.find_opt (fun k -> first_env k.env_keys <> None) (registry ()) with
+      match List.find_opt (fun k -> first_env k.env_keys <> None) (registry ?client ()) with
       | Some k -> `Known k
       | None -> if getenv "AGENT_API_KEY" <> None then `Generic Openai else `Generic Anthropic)
   in
@@ -295,7 +315,7 @@ let config () : config =
           (Config_error
              (Printf.sprintf
                 "no API key found. Set one of these env vars and re-run:\n  %s\nor set AGENT_API_KEY (with AGENT_PROVIDER / AGENT_BASE_URL for a custom endpoint)."
-                (String.concat ", " (all_env_keys ())))))
+                (String.concat ", " (all_env_keys ?client ())))))
   in
   let model =
     match getenv "AGENT_MODEL" with
@@ -412,11 +432,14 @@ type builder =
   | BThinking of { text : Buffer.t; sign : Buffer.t }
   | BTool of { id : string; name : string; json : Buffer.t }
 
-let anthropic_complete cfg ~system ~on_text ~tools_enabled ?tool_names ~transport turns : content list * usage =
+let anthropic_complete cfg ~system ~on_text ~tools_enabled ?tool_names ~client ~transport turns :
+    content list * usage =
   let budget = thinking_budget cfg.thinking in
   (* Extended thinking requires max_tokens strictly greater than the budget. *)
   let max_tokens = if budget > 0 && cfg.max_tokens <= budget then budget + 4096 else cfg.max_tokens in
-  let tool_schemas = if tools_enabled then Tools.anthropic_schemas ?allowed:tool_names () else [] in
+  let tool_schemas =
+    if tools_enabled then Tools.anthropic_schemas ~reg:client.tools ?allowed:tool_names () else []
+  in
 	  let body =
 	    `Assoc
 	      ([ ("model", `String cfg.model);
@@ -430,7 +453,7 @@ let anthropic_complete cfg ~system ~on_text ~tools_enabled ?tool_names ~transpor
 	        [ ("thinking", `Assoc [ ("type", `String "enabled"); ("budget_tokens", `Int budget) ]) ]
 	      else [])
 	  in
-	  let body = apply_provider_request_hooks body in
+		  let body = apply_provider_request_hooks ~client body in
 	  let url = cfg.base_url ^ "/v1/messages" in
   let headers =
     [ "content-type: application/json";
@@ -510,7 +533,7 @@ let anthropic_complete cfg ~system ~on_text ~tools_enabled ?tool_names ~transpor
 	         | Some data when data <> "[DONE]" -> handle data
 	         | Some _ -> ()
 	         | None -> if String.trim line <> "" then Buffer.add_string err (line ^ "\n"));
-	     emit_provider_response_hooks ~status:200 ~headers:[]
+		     emit_provider_response_hooks ~client ~status:200 ~headers:[] ()
 	   with Transport.Http_error e ->
 	     let msg = if Buffer.length err > 0 then e ^ "\n" ^ Buffer.contents err else e in
 	     raise (Api_error msg));
@@ -582,8 +605,11 @@ let openai_messages ~system turns =
   in
   sys_msg :: List.concat_map of_turn turns
 
-let openai_complete cfg ~system ~on_text ~tools_enabled ?tool_names ~transport turns : content list * usage =
-  let tool_schemas = if tools_enabled then Tools.openai_schemas ?allowed:tool_names () else [] in
+let openai_complete cfg ~system ~on_text ~tools_enabled ?tool_names ~client ~transport turns :
+    content list * usage =
+  let tool_schemas =
+    if tools_enabled then Tools.openai_schemas ~reg:client.tools ?allowed:tool_names () else []
+  in
 	  let body =
 	    `Assoc
 	      ([ ("model", `String cfg.model);
@@ -597,7 +623,7 @@ let openai_complete cfg ~system ~on_text ~tools_enabled ?tool_names ~transport t
 	        [ ("tools", `List tool_schemas); ("tool_choice", `String "auto") ]
 	      else [])
 	  in
-	  let body = apply_provider_request_hooks body in
+		  let body = apply_provider_request_hooks ~client body in
 	  let url = cfg.base_url ^ "/chat/completions" in
   let headers =
     [ "content-type: application/json"; "Authorization: Bearer " ^ cfg.api_key ] @ cfg.extra_headers
@@ -660,7 +686,7 @@ let openai_complete cfg ~system ~on_text ~tools_enabled ?tool_names ~transport t
 	         | Some data when data <> "[DONE]" -> handle data
 	         | Some _ -> ()
 	         | None -> if String.trim line <> "" then Buffer.add_string err (line ^ "\n"));
-	     emit_provider_response_hooks ~status:200 ~headers:[]
+		     emit_provider_response_hooks ~client ~status:200 ~headers:[] ()
 	   with Transport.Http_error e ->
 	     let msg = if Buffer.length err > 0 then e ^ "\n" ^ Buffer.contents err else e in
 	     raise (Api_error msg));
@@ -685,15 +711,16 @@ let openai_complete cfg ~system ~on_text ~tools_enabled ?tool_names ~transport t
 
 (* --- dispatch --- *)
 
-let complete (cfg : config) ~system ?(on_text = fun _ -> ()) ?(tools_enabled = true) ?tool_names ?transport
-    turns : content list * usage =
-  let transport = match transport with Some t -> t | None -> !default_transport in
+let complete ?client (cfg : config) ~system ?(on_text = fun _ -> ()) ?(tools_enabled = true) ?tool_names
+    ?transport turns : content list * usage =
+  let client = match client with Some c -> c | None -> default_client in
+  let transport = match transport with Some t -> t | None -> client.providers.transport in
   match cfg.runtime with
   | Some runtime -> (
-    match Hashtbl.find_opt extension_runtimes runtime with
+    match Hashtbl.find_opt client.providers.runtimes runtime with
     | Some complete -> complete cfg ~system ~on_text ~tools_enabled ?tool_names turns
     | None -> raise (Api_error ("extension provider runtime is not registered: " ^ runtime)))
   | None -> (
     match cfg.provider with
-  | Anthropic -> anthropic_complete cfg ~system ~on_text ~tools_enabled ?tool_names ~transport turns
-  | Openai -> openai_complete cfg ~system ~on_text ~tools_enabled ?tool_names ~transport turns)
+  | Anthropic -> anthropic_complete cfg ~system ~on_text ~tools_enabled ?tool_names ~client ~transport turns
+  | Openai -> openai_complete cfg ~system ~on_text ~tools_enabled ?tool_names ~client ~transport turns)

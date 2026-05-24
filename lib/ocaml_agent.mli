@@ -55,6 +55,11 @@ module Llm : sig
     turn list ->
     content list * usage
 
+  type client
+
+  val create_client : unit -> client
+  val default_client : client
+
   (* --- pure construction (no env/disk/registry reads) --- *)
 
   val make_config :
@@ -70,22 +75,29 @@ module Llm : sig
     config
 
   val config_of_known :
-    ?model:string -> ?thinking:string -> ?max_tokens:int -> api_key:string -> string -> config
+    ?client:client ->
+    ?model:string ->
+    ?thinking:string ->
+    ?max_tokens:int ->
+    api_key:string ->
+    string ->
+    config
 
   (* --- environment/settings convenience layers --- *)
 
-  val config_for : ?model:string -> string -> config
-  val config : unit -> config
+  val config_for : ?client:client -> ?model:string -> string -> config
+  val config : ?client:client -> unit -> config
   val describe : config -> string
 
   (* --- transport selection --- *)
 
-  val set_transport : Transport.t -> unit
-  val transport : unit -> Transport.t
+  val set_transport : ?client:client -> Transport.t -> unit
+  val transport : ?client:client -> unit -> Transport.t
 
   (* --- provider registry --- *)
 
   val register_provider :
+    ?client:client ->
     ?aliases:string list ->
     ?headers:string list ->
     ?runtime:string ->
@@ -97,17 +109,22 @@ module Llm : sig
     unit ->
     unit
 
-  val register_provider_runtime : string -> runtime_complete -> unit
-  val is_known_provider : string -> bool
+  val register_provider_runtime : ?client:client -> string -> runtime_complete -> unit
+  val is_known_provider : ?client:client -> string -> bool
 
   (* --- request/response hooks --- *)
 
-  val set_provider_request_hook : (Yojson.Safe.t -> Yojson.Safe.t) -> unit
-  val set_provider_response_hook : (status:int -> headers:(string * string) list -> unit) -> unit
+  val set_provider_request_hook : ?client:client -> (Yojson.Safe.t -> Yojson.Safe.t) -> unit
+  val set_provider_response_hook :
+    ?client:client -> (status:int -> headers:(string * string) list -> unit) -> unit
+  val apply_provider_request_hooks : ?client:client -> Yojson.Safe.t -> Yojson.Safe.t
+  val emit_provider_response_hooks :
+    ?client:client -> status:int -> headers:(string * string) list -> unit -> unit
 
   (* --- completion --- *)
 
   val complete :
+    ?client:client ->
     config ->
     system:string ->
     ?on_text:(string -> unit) ->
