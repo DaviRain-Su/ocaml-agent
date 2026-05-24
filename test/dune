@@ -3,6 +3,10 @@
  (libraries agent_lib notty)
  (deps ocaml_sdk_extension.exe))
 
+(test
+ (name test_misc)
+ (libraries agent_lib notty))
+
 (executable
  (name ocaml_sdk_extension)
  (libraries agent_lib str))
