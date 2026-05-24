@@ -364,6 +364,8 @@ tool/command registration, `before_agent_start` system prompt/message injection,
   `tool_execution_*` notifications, session switch/fork/compact guard events,
   model/thinking selection events, `resources_discover` dynamic resource paths,
   command `argumentHint` labels and `getArgumentCompletions()` Tab candidates,
+  `pi.getCommands()` command inventory with extension/prompt/skill source
+  metadata,
   shared `pi.events` EventBus handlers for loaded JS extension communication,
   extension `registerFlag()` / `getFlag()` defaults plus `PI_FLAG_*` /
   `AGENT_FLAG_*` environment overrides, `registerShortcut()` TUI shortcuts, and
@@ -396,9 +398,10 @@ tool/command registration, `before_agent_start` system prompt/message injection,
   context messages for the next model request. Extension `pi.exec()` runs
   argv-style subprocesses and returns Pi-style `stdout` / `stderr` / `code` /
   `exitCode` / `killed` result fields.
-	  OpenAI/Anthropic-compatible `registerProvider()` providers, extension provider
-	  runtimes, and text fallback `registerMessageRenderer()` / `registerRenderer()`
-	  renderers with structured rich component metadata plus terminal text adapters.
+	  OpenAI/Anthropic-compatible `registerProvider()` / `unregisterProvider()`
+	  providers, extension provider runtimes, and text fallback
+	  `registerMessageRenderer()` / `registerRenderer()` renderers with structured
+	  rich component metadata plus terminal text adapters.
 	  Provider lifecycle hooks can inspect and replace built-in request payloads
 	  before dispatch and receive response metadata after successful responses.
   Extension `sendMessage()` / `sendUserMessage()` custom messages are captured,
@@ -410,13 +413,19 @@ Extension tool execute handlers follow Pi's
 available on `ctx.operations`. Command/tool/shortcut handlers get
 noninteractive `ctx.ui.notify` / `confirm` / `input` / `select`
 fallbacks, with captured UI request metadata exposed to the TUI/RPC-compatible
-execution layer. Custom UI surface calls such as status, widget, title,
+execution layer. The bridge exports Pi's `withFileMutationQueue()` helper for
+custom tools that need same-file read-modify-write serialization, plus
+tool-event type guards such as `isToolCallEventType()` and
+`isBashToolResult()`, and `wrapRegisteredTool()` / `wrapRegisteredTools()` for
+SDK-compatible tool wrapping. Custom UI surface calls such as status, widget, title,
 header/footer, editor text, paste, and working-state updates are captured for
-terminal and RPC adapters. Component factories that can render to terminal lines
-are adapted into surface metadata; rendered header/footer/widget/editor-component
-surfaces are mounted into persistent TUI bands, while custom overlay requests,
-overlay options, and synthetic overlay handle actions are captured for RPC/TUI
-adapters. Fully focusable component input handling remains parity work.
+terminal and RPC adapters. TUI working message, visibility, and indicator
+settings drive the active turn status row. Component factories that can render
+to terminal lines are adapted into surface metadata; rendered
+header/footer/widget/editor-component surfaces are mounted into persistent TUI
+bands, while custom overlay requests, overlay options, and synthetic overlay
+handle actions are captured for RPC/TUI adapters. Fully focusable component
+input handling remains parity work.
 
 In the REPL, type your request at the `you>` prompt. Tool calls are shown as
 `⚙ tool_name {input}`. Type `/exit` or Ctrl-D to quit.

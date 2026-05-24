@@ -3,3 +3,5 @@ _build/
 *.merlin
 .ocaml-agent/
 *.bak
+.rpiv
+.pi

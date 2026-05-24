@@ -20,7 +20,12 @@ type command =
     description : string;
     argument_hint : string option;
     has_argument_completions : bool;
-    path : string }
+    path : string;
+    runtime : extension_runtime }
+
+and extension_runtime =
+  | Node
+  | Ocaml_sdk
 
 type shortcut =
   { spec : string;
@@ -90,6 +95,7 @@ let command_registry : command list ref = ref []
 let shortcut_registry : shortcut list ref = ref []
 let message_renderer_registry : message_renderer list ref = ref []
 let event_paths : (string * string list) list ref = ref []
+let ocaml_event_paths : (string * string list) list ref = ref []
 let js_extension_paths : string list ref = ref []
 let discovered_skill_paths : string list ref = ref []
 let discovered_prompt_paths : string list ref = ref []
@@ -165,17 +171,20 @@ let is_json_file path = Filename.check_suffix path ".json"
 let is_js_extension_file path =
   List.exists (Filename.check_suffix path) [ ".ts"; ".js"; ".mjs"; ".cjs" ]
 
+let is_ocaml_sdk_extension_file path =
+  List.exists (Filename.check_suffix path) [ ".ocamlext"; ".ocaml-extension" ]
+
 let files_in_dir path =
   match Sys.readdir path with
   | exception _ -> []
   | entries ->
     Array.to_list entries
-    |> List.filter (fun name -> is_json_file name || is_js_extension_file name)
+    |> List.filter (fun name -> is_json_file name || is_js_extension_file name || is_ocaml_sdk_extension_file name)
     |> List.sort compare
     |> List.map (Filename.concat path)
 
 let index_files path =
-  [ "index.ts"; "index.js"; "index.mjs"; "index.cjs" ]
+  [ "index.ts"; "index.js"; "index.mjs"; "index.cjs"; "index.ocamlext"; "index.ocaml-extension" ]
   |> List.map (Filename.concat path)
   |> List.filter Sys.file_exists
 
@@ -192,7 +201,7 @@ let expand_manifest_path path =
                if Sys.file_exists full && Sys.is_directory full then index_files full else [])
     in
     direct @ nested |> Config_paths.uniq
-  else if is_json_file path || is_js_extension_file path then [ path ]
+  else if is_json_file path || is_js_extension_file path || is_ocaml_sdk_extension_file path then [ path ]
   else []
 
 (* Run [command], feeding [input] on stdin, returning combined stdout+stderr. *)
@@ -303,6 +312,56 @@ const Type = {
 function defineTool(tool) {
   return tool;
 }
+
+function wrapToolDefinition(definition, ctxFactory) {
+  if (!definition || typeof definition !== "object") return definition;
+  const wrapped = {
+    name: definition.name,
+    label: definition.label,
+    description: definition.description,
+    parameters: definition.parameters,
+    prepareArguments: definition.prepareArguments,
+    executionMode: definition.executionMode,
+  };
+  if (definition.promptSnippet !== undefined) wrapped.promptSnippet = definition.promptSnippet;
+  if (definition.promptGuidelines !== undefined) wrapped.promptGuidelines = definition.promptGuidelines;
+  if (definition.renderShell !== undefined) wrapped.renderShell = definition.renderShell;
+  if (definition.renderCall !== undefined) wrapped.renderCall = definition.renderCall;
+  if (definition.renderResult !== undefined) wrapped.renderResult = definition.renderResult;
+  if (typeof definition.execute === "function") {
+    wrapped.execute = (toolCallId, params, signal, onUpdate) =>
+      definition.execute(toolCallId, params, signal, onUpdate, ctxFactory ? ctxFactory() : undefined);
+  }
+  return wrapped;
+}
+
+function wrapRegisteredTool(registeredTool, runner) {
+  const definition = registeredTool && registeredTool.definition ? registeredTool.definition : registeredTool;
+  return wrapToolDefinition(definition, () =>
+    runner && typeof runner.createContext === "function" ? runner.createContext() : undefined
+  );
+}
+
+function wrapRegisteredTools(registeredTools, runner) {
+  if (!Array.isArray(registeredTools)) return [];
+  return registeredTools.map((registeredTool) => wrapRegisteredTool(registeredTool, runner));
+}
+
+function toolEventName(event) {
+  return event && typeof event === "object" ? event.toolName : undefined;
+}
+
+function isToolCallEventType(toolName, event) {
+  return toolEventName(event) === toolName;
+}
+
+const isBashToolResult = (event) => toolEventName(event) === "bash";
+const isReadToolResult = (event) => toolEventName(event) === "read";
+const isEditToolResult = (event) => toolEventName(event) === "edit";
+const isWriteToolResult = (event) => toolEventName(event) === "write";
+const isGrepToolResult = (event) => toolEventName(event) === "grep";
+const isFindToolResult = (event) => toolEventName(event) === "find";
+const isLsToolResult = (event) => toolEventName(event) === "ls";
 
 function createEventBus() {
   const listeners = new Map();
@@ -441,6 +500,48 @@ function createLocalToolOperations(options = {}) {
   };
 }
 
+const fileMutationQueues = new Map();
+let fileMutationRegistrationQueue = Promise.resolve();
+
+function isMissingPathError(error) {
+  return error && typeof error === "object" && (error.code === "ENOENT" || error.code === "ENOTDIR");
+}
+
+async function fileMutationQueueKey(filePath) {
+  const resolvedPath = path.resolve(String(filePath || ""));
+  try {
+    return await fs.promises.realpath(resolvedPath);
+  } catch (error) {
+    if (isMissingPathError(error)) return resolvedPath;
+    throw error;
+  }
+}
+
+async function withFileMutationQueue(filePath, fn) {
+  if (typeof fn !== "function") throw new Error("withFileMutationQueue requires a function");
+  const registration = fileMutationRegistrationQueue.then(async () => {
+    const key = await fileMutationQueueKey(filePath);
+    const currentQueue = fileMutationQueues.get(key) || Promise.resolve();
+    let releaseNext = () => {};
+    const nextQueue = new Promise((resolve) => {
+      releaseNext = resolve;
+    });
+    const chainedQueue = currentQueue.then(() => nextQueue);
+    fileMutationQueues.set(key, chainedQueue);
+    return { key, currentQueue, chainedQueue, releaseNext };
+  });
+  fileMutationRegistrationQueue = registration.then(() => undefined, () => undefined);
+
+  const { key, currentQueue, chainedQueue, releaseNext } = await registration;
+  await currentQueue;
+  try {
+    return await fn();
+  } finally {
+    releaseNext();
+    if (fileMutationQueues.get(key) === chainedQueue) fileMutationQueues.delete(key);
+  }
+}
+
 function execCommand(command, args = [], options = {}) {
   return new Promise((resolve) => {
     const stdout = [];
@@ -567,9 +668,20 @@ function renderDiff(value) {
 function piCodingAgentExports() {
   return {
     defineTool,
+    wrapRegisteredTool,
+    wrapRegisteredTools,
+    isToolCallEventType,
+    isBashToolResult,
+    isReadToolResult,
+    isEditToolResult,
+    isWriteToolResult,
+    isGrepToolResult,
+    isFindToolResult,
+    isLsToolResult,
     createLocalBashOperations,
     createLocalFileOperations,
     createLocalToolOperations,
+    withFileMutationQueue,
     createEventBus,
     CustomEditor,
     Container,
@@ -764,7 +876,7 @@ function toolInfoName(tool) {
   return normalizeToolName(tool && tool.name);
 }
 
-function makeApi(registry) {
+function makeApi(registry, extensionPath = "<unknown>") {
   const { tools, commands, handlers, flags, flagValues, shortcuts, providers, renderers, messages } = registry;
   const noop = () => {};
   const registerRenderer = (name, options) => {
@@ -846,10 +958,24 @@ function makeApi(registry) {
         entry = { ...(options || {}), name: provider };
       }
       const name = String(entry.name || entry.id || entry.provider || "").trim();
-      if (name) providers.set(name, { ...entry, name });
+      if (name) {
+        const provider = { ...entry, name, extensionPath };
+        providers.set(name, provider);
+        registry.providersChanged = true;
+        for (const providerName of providerNames(provider)) registry.unregisteredProviders.delete(providerName);
+        registry.unregisteredProviders.delete(name.toLowerCase());
+      }
     },
     unregisterProvider: (name) => {
-      providers.delete(String(name || "").trim());
+      const requested = String(name || "").trim();
+      if (!requested) return;
+      const normalized = requested.toLowerCase();
+      for (const [key, provider] of providers.entries()) {
+        const keyMatches = String(key || "").trim().toLowerCase() === normalized;
+        if (keyMatches || providerNames(provider).includes(normalized)) providers.delete(key);
+      }
+      registry.providersChanged = true;
+      registry.unregisteredProviders.add(normalized);
     },
     registerTool: (tool) => {
       if (tool && typeof tool.name === "string" && typeof tool.execute === "function") tools.set(tool.name, tool);
@@ -918,6 +1044,8 @@ async function loadTools(extensionPath, flagValues = {}, context = {}) {
     flagValues,
     shortcuts: new Map(),
     providers: new Map(),
+    providersChanged: false,
+    unregisteredProviders: new Set(),
     renderers: new Map(),
     messages: [],
     externalTools: Array.isArray(context.allTools) ? context.allTools : [],
@@ -954,7 +1082,7 @@ async function loadTools(extensionPath, flagValues = {}, context = {}) {
   for (const currentPath of extensionPaths) {
     const factory = await loadFactory(currentPath);
     if (typeof factory !== "function") throw new Error(`extension does not export a default factory function: ${currentPath}`);
-    await factory(makeApi(registry));
+    await factory(makeApi(registry, currentPath));
   }
   return registry;
 }
@@ -1004,6 +1132,9 @@ function activeToolState(registry) {
   return {
     activeToolsChanged: !!registry.activeToolsChanged,
     activeTools: activeToolPayload(registry),
+    providersChanged: !!registry.providersChanged,
+    providers: registry.providersChanged ? providerPayload(registry) : undefined,
+    unregisteredProviders: [...registry.unregisteredProviders],
     modelChanged: !!registry.modelChanged,
     model: registry.model || null,
     sessionNameChanged: !!registry.sessionNameChanged,
@@ -1113,6 +1244,7 @@ function providerPayload(registry) {
     headers: provider.headers || {},
     models: provider.models || [],
     hasRuntime: !!providerRuntimeHandler(provider),
+    extensionPath: provider.extensionPath || "",
   }));
 }
 
@@ -1141,6 +1273,11 @@ function findProvider(registry, requested) {
     if (providerNames(provider).includes(wanted)) return provider;
   }
   return undefined;
+}
+
+function resetProviderRuntimeState(registry) {
+  registry.providersChanged = false;
+  registry.unregisteredProviders.clear();
 }
 
 function rendererPayload(registry) {
@@ -2297,6 +2434,7 @@ async function handleRequest(request) {
     }
     if (request.mode === "provider") {
       await replaySessionStart(tools);
+      resetProviderRuntimeState(tools);
       const provider = findProvider(tools, request.provider);
       if (!provider) throw new Error(`provider not registered: ${request.provider}`);
       const handler = providerRuntimeHandler(provider);
@@ -2317,6 +2455,7 @@ async function handleRequest(request) {
     }
     if (request.mode === "execute") {
       await replaySessionStart(tools);
+      resetProviderRuntimeState(tools);
       const tool = tools.tools.get(request.tool);
       if (!tool) throw new Error(`tool not registered: ${request.tool}`);
       const operations = createLocalToolOperations();
@@ -2336,6 +2475,7 @@ async function handleRequest(request) {
     }
     if (request.mode === "command") {
       await replaySessionStart(tools);
+      resetProviderRuntimeState(tools);
       const command = tools.commands.get(request.command);
       if (!command || typeof command.handler !== "function") throw new Error(`command not registered: ${request.command}`);
       const ctx = eventContext(request.uiResponses || {}, null, tools);
@@ -2345,6 +2485,7 @@ async function handleRequest(request) {
     }
     if (request.mode === "command_completions") {
       await replaySessionStart(tools);
+      resetProviderRuntimeState(tools);
       const command = tools.commands.get(request.command);
       if (!command || typeof command.getArgumentCompletions !== "function") {
         return { ok: true, items: [], ...activeToolState(tools) };
@@ -2354,6 +2495,7 @@ async function handleRequest(request) {
     }
     if (request.mode === "shortcut") {
       await replaySessionStart(tools);
+      resetProviderRuntimeState(tools);
       const spec = normalizeShortcutSpec(request.shortcut || request.spec || "");
       const shortcut = tools.shortcuts.get(spec);
       if (!shortcut) throw new Error(`shortcut not registered: ${spec}`);
@@ -2398,6 +2540,7 @@ async function handleRequest(request) {
       const list = tools.handlers.get(request.event) || [];
       const event = request.payload || {};
       const ctx = eventContext(request.uiResponses || {}, null, tools);
+      resetProviderRuntimeState(tools);
       let lastResult;
       for (const handler of list) {
         const result = await handler(event, ctx);
@@ -2516,6 +2659,8 @@ let bridge_request_context request =
 let should_share_js_runtime mode =
   List.mem mode [ "command"; "command_completions"; "execute"; "provider"; "render"; "shortcut" ]
 
+let apply_provider_registrations : (Yojson.Safe.t -> unit) ref = ref (fun _ -> ())
+
 let add_js_runtime_paths request =
   let paths = !js_extension_paths in
   match request with
@@ -2534,6 +2679,22 @@ let apply_runtime_state_from_json json =
     |> List.filter_map (function `String s when String.trim s <> "" -> Some s | _ -> None)
     |> set_active_tools
   | _ -> ();
+  (match json |> member "unregisteredProviders" with
+   | `List names ->
+     names
+     |> List.filter_map (function `String s when String.trim s <> "" -> Some s | _ -> None)
+     |> List.iter (fun name ->
+            let removed_names = Llm.unregister_provider name in
+            let removed_names =
+              match removed_names with
+              | [] -> [ String.lowercase_ascii (String.trim name) ]
+              | names -> names
+            in
+            List.iter Models.unregister_extension_provider removed_names)
+   | _ -> ());
+  (match json |> member "providersChanged" with
+   | `Bool true -> !apply_provider_registrations json
+   | _ -> ());
   (match json |> member "modelChanged", json |> member "model" with
    | `Bool true, model_json -> Option.iter set_active_model (model_choice_of_json model_json)
    | _ -> ());
@@ -2556,6 +2717,45 @@ let run_node_bridge request =
       | Error _ as error -> error)
     | _ -> Error body
     | exception e -> Error (Printexc.to_string e ^ ": " ^ body)
+
+let ocaml_sdk_command path =
+  let direct () = Filename.quote path in
+  match Yojson.Safe.from_file path with
+  | `Assoc _ as json -> (
+    match json |> member "command" with
+    | `String command when String.trim command <> "" ->
+      let cwd =
+        match json |> member "cwd" with
+        | `String dir when String.trim dir <> "" ->
+          let dir = Config_paths.expand_tilde (String.trim dir) in
+          if Filename.is_relative dir then Filename.concat (Filename.dirname path) dir else dir
+        | _ -> Filename.dirname path
+      in
+      Printf.sprintf "cd %s && %s" (Filename.quote cwd) command
+    | _ -> direct ())
+  | _ -> direct ()
+  | exception _ -> direct ()
+
+let run_ocaml_sdk_bridge path request =
+  let request = bridge_request_context request in
+  let command = ocaml_sdk_command path in
+  let code, body = Tools.run_process ~stdin_data:(Yojson.Safe.to_string request) command in
+  if code <> 0 then Error (Printf.sprintf "OCaml extension exited %d: %s" code body)
+  else
+    match Yojson.Safe.from_string body with
+    | `Assoc _ as json -> (
+      match bridge_json_result body json with
+      | Ok json ->
+        apply_runtime_state_from_json json;
+        Ok json
+      | Error _ as error -> error)
+    | _ -> Error body
+    | exception e -> Error (Printexc.to_string e ^ ": " ^ body)
+
+let run_extension_bridge runtime path request =
+  match runtime with
+  | Node -> run_node_bridge request
+  | Ocaml_sdk -> run_ocaml_sdk_bridge path request
 
 let js_tool_of_json path (j : Yojson.Safe.t) : Tools.tool option =
   match j |> member "name" with
@@ -2592,6 +2792,42 @@ let js_tool_of_json path (j : Yojson.Safe.t) : Tools.tool option =
             | Error msg -> "Error: " ^ msg) }
   | _ -> None
 
+let ocaml_sdk_tool_of_json path (j : Yojson.Safe.t) : Tools.tool option =
+  match j |> member "name" with
+  | `String name when String.trim name <> "" ->
+    let name = String.trim name in
+    let description =
+      match j |> member "description" with
+      | `String s -> s
+      | _ -> ""
+    in
+    let parameters =
+      match j |> member "parameters" with
+      | `Null -> `Assoc [ ("type", `String "object"); ("properties", `Assoc []) ]
+      | p -> p
+    in
+    Some
+      { Tools.name;
+        description;
+        parameters;
+        requires_approval = true;
+        execute =
+          (fun input ->
+            let request =
+              `Assoc
+                [ ("mode", `String "execute");
+                  ("path", `String path);
+                  ("tool", `String name);
+                  ("input", input) ]
+            in
+            match run_ocaml_sdk_bridge path request with
+            | Ok json -> (
+              match json |> member "text" with
+              | `String s -> s
+              | value -> Yojson.Safe.to_string value)
+            | Error msg -> "Error: " ^ msg) }
+  | _ -> None
+
 let js_command_of_json path (j : Yojson.Safe.t) : command option =
   match j |> member "name" with
   | `String name when String.trim name <> "" ->
@@ -2614,8 +2850,13 @@ let js_command_of_json path (j : Yojson.Safe.t) : command option =
       | `Bool b -> b
       | _ -> false
     in
-    Some { name; description; argument_hint; has_argument_completions; path }
+    Some { name; description; argument_hint; has_argument_completions; path; runtime = Node }
   | _ -> None
+
+let ocaml_sdk_command_of_json path (j : Yojson.Safe.t) : command option =
+  match js_command_of_json path j with
+  | Some command -> Some { command with runtime = Ocaml_sdk }
+  | None -> None
 
 let normalize_shortcut_spec spec =
   let spec = String.lowercase_ascii (String.trim spec) in
@@ -2674,7 +2915,7 @@ let register_message_renderer (renderer : message_renderer) =
   message_renderer_registry :=
     renderer :: List.filter (fun (r : message_renderer) -> r.name <> renderer.name) !message_renderer_registry
 
-let register_events path events =
+let register_events ?(runtime = Node) path events =
   let supported =
     [ "session_start";
       "session_before_switch";
@@ -2707,13 +2948,28 @@ let register_events path events =
       "resources_discover" ]
   in
   let events = List.filter (fun e -> List.mem e supported) events in
-  if events <> [] then event_paths := (path, events) :: List.remove_assoc path !event_paths
+  if events <> [] then
+    match runtime with
+    | Node -> event_paths := (path, events) :: List.remove_assoc path !event_paths
+    | Ocaml_sdk -> ocaml_event_paths := (path, events) :: List.remove_assoc path !ocaml_event_paths
+
+let all_event_targets () =
+  (List.map (fun (path, events) -> (Node, path, events)) !event_paths)
+  @ List.map (fun (path, events) -> (Ocaml_sdk, path, events)) !ocaml_event_paths
 
 let register_js_commands path json =
   match json |> member "commands" with
   | `List xs ->
     xs
     |> List.filter_map (js_command_of_json path)
+    |> List.iter register_command
+  | _ -> ()
+
+let register_ocaml_sdk_commands path json =
+  match json |> member "commands" with
+  | `List xs ->
+    xs
+    |> List.filter_map (ocaml_sdk_command_of_json path)
     |> List.iter register_command
   | _ -> ()
 
@@ -2846,6 +3102,9 @@ let register_js_providers path json =
            match first_string provider [ "name"; "id"; "provider" ] with
            | None -> ()
            | Some name ->
+             let provider_path =
+               Option.value (first_string provider [ "extensionPath"; "path" ]) ~default:path
+             in
              let aliases = strings_from_json (provider |> member "aliases") @ strings_from_json (provider |> member "names") in
              let protocol =
                match first_string provider [ "protocol"; "wireProtocol"; "api"; "type" ] with
@@ -2886,12 +3145,14 @@ let register_js_providers path json =
              in
              let headers = headers_from_json (provider |> member "headers") in
              let runtime =
-               if has_runtime then Some (path ^ "#" ^ String.lowercase_ascii (String.trim name)) else None
+               if has_runtime then Some (provider_path ^ "#" ^ String.lowercase_ascii (String.trim name)) else None
              in
              Llm.register_provider ?runtime ~name ~aliases ~headers ~protocol ~base_url ~env_keys ~default_model ();
-             Option.iter (register_js_provider_runtime path name) runtime;
+             Option.iter (register_js_provider_runtime provider_path name) runtime;
              register_provider_models (String.lowercase_ascii (String.trim name)) default_model (provider |> member "models"))
   | _ -> ()
+
+let () = apply_provider_registrations := register_js_providers "<runtime>"
 
 let register_js_tools path json =
   match json |> member "tools" with
@@ -2899,6 +3160,18 @@ let register_js_tools path json =
     List.filter_map
       (fun j ->
         match js_tool_of_json path j with
+        | Some t when Tools.register t -> Some t.Tools.name
+        | Some _ -> None
+        | None -> None)
+      entries
+  | _ -> []
+
+let register_ocaml_sdk_tools path json =
+  match json |> member "tools" with
+  | `List entries ->
+    List.filter_map
+      (fun j ->
+        match ocaml_sdk_tool_of_json path j with
         | Some t when Tools.register t -> Some t.Tools.name
         | Some _ -> None
         | None -> None)
@@ -3023,9 +3296,20 @@ let load_js_extension ?(reason = "startup") path =
       let names = register_js_tools path json in
       if List.mem "session_start" events then names @ emit_session_start_for_path ~reason path else names
 
+let load_ocaml_sdk_extension ?(reason = "startup") path =
+  let request = `Assoc [ ("mode", `String "describe"); ("path", `String path); ("reason", `String reason) ] in
+  match run_ocaml_sdk_bridge path request with
+  | Error msg ->
+    Printf.eprintf "[warning] failed to load OCaml extension %s: %s\n%!" path msg;
+    []
+  | Ok json ->
+    register_ocaml_sdk_commands path json;
+    register_ocaml_sdk_tools path json
+
 let load_path ?(reason = "startup") path =
   if is_json_file path then load_manifest path
   else if is_js_extension_file path then load_js_extension ~reason path
+  else if is_ocaml_sdk_extension_file path then load_ocaml_sdk_extension ~reason path
   else []
 
 (* Load and register manifest tools; returns the names registered.
@@ -3081,7 +3365,7 @@ let command_argument_completions name prefix =
           ("command", `String name);
           ("prefix", `String prefix) ]
     in
-    match run_node_bridge request with
+    match run_extension_bridge command.runtime command.path request with
     | Error msg ->
       Printf.eprintf "[warning] extension command completion /%s failed: %s\n%!" name msg;
       []
@@ -3477,7 +3761,7 @@ let execute_command_response ?session_name ?session_context ?themes ?theme_name 
                ("args", `String args) ])
       in
       Some
-        (match run_node_bridge request with
+        (match run_extension_bridge c.runtime c.path request with
          | Ok json -> text_response json
          | Error msg -> error_command_response ("Error: " ^ msg))
 

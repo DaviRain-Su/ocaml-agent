@@ -875,6 +875,33 @@ let () =
   in
   let names = Extensions.load () in
   check "global Pi extension manifest loads" (List.mem "from_pi_agent_dir" names);
+  let sdk_exe = Filename.concat (Filename.dirname Sys.executable_name) "ocaml_sdk_extension.exe" in
+  let sdk_descriptor =
+    Yojson.Safe.to_string
+      (`Assoc
+        [ ("runtime", `String "ocaml");
+          ("command", `String (Filename.quote sdk_exe)) ])
+  in
+  let _ =
+    run "write_file"
+      (Yojson.Safe.to_string
+         (`Assoc [ ("path", `String ".pi/extensions/ocaml-sdk.ocamlext"); ("content", `String sdk_descriptor) ]))
+  in
+  let names = Extensions.load () in
+  check "OCaml SDK extension registers tool" (List.mem "ocaml_greet" names);
+  check "OCaml SDK extension executes registered tool"
+    (match Tools.find "ocaml_greet" with
+     | Some t -> t.Tools.execute (`Assoc [ ("name", `String "SDK") ]) = "Hello SDK"
+     | None -> false);
+  check "OCaml SDK extension command appears in completion"
+    (List.mem_assoc "/ocamlhello" (Complete.menu "/ocaml"));
+  check "OCaml SDK extension command argument completions feed Tab candidates"
+    (let start, cands = Complete.completion "/ocamlhello s" in
+     start = String.length "/ocamlhello " && cands = [ "sdk" ]);
+  check "OCaml SDK extension command executes"
+    (match Extensions.execute_command "/ocamlhello Pi" with
+     | Some output -> output = "OCaml command Pi"
+     | None -> false);
   let node_available = Sys.command "command -v node >/dev/null 2>&1" = 0 in
   let _ =
     run "write_file"
@@ -894,6 +921,10 @@ let () =
   in
   let _ =
     run "write_file"
+      {|{"path":".pi/extensions/command-api.ts","content":"export default function(pi) {\n  pi.registerCommand(\"commandlist\", {\n    description: \"Probe pi.getCommands API\",\n    handler: async () => {\n      return pi.getCommands()\n        .map((command) => `${command.name}:${command.source || \"\"}:${command.sourceInfo ? command.sourceInfo.path || \"\" : \"\"}`)\n        .sort()\n        .join(\"|\");\n    },\n  });\n}\n"}|}
+  in
+  let _ =
+    run "write_file"
       {|{"path":".pi/extensions/event-bus.ts","content":"export default function(pi) {\n  const seen = [];\n  pi.events.on(\"probe\", (data) => {\n    seen.push(`${data.kind}:${data.value}`);\n  });\n  const off = pi.events.on(\"probe-off\", () => {\n    seen.push(\"off-called\");\n  });\n  off();\n  pi.registerCommand(\"eventbus\", {\n    description: \"Probe pi.events EventBus\",\n    handler: async () => {\n      pi.events.emit(\"probe\", { kind: \"cmd\", value: 1 });\n      pi.events.emit(\"probe-off\", { kind: \"cmd\", value: 2 });\n      pi.events.emit(\"probe\", { kind: \"cmd\", value: 3 });\n      return seen.join(\",\");\n    },\n  });\n}\n"}|}
   in
   let _ =
@@ -907,6 +938,18 @@ let () =
   let _ =
     run "write_file"
       {|{"path":".pi/extensions/exec.ts","content":"export default function(pi) {\n  pi.registerCommand(\"execprobe\", {\n    description: \"Probe pi.exec result shape\",\n    handler: async () => {\n      const ok = await pi.exec(process.execPath, [\"-e\", \"process.stdout.write('out'); process.stderr.write('err')\"]);\n      const fail = await pi.exec(process.execPath, [\"-e\", \"process.exit(7)\"]);\n      return `${ok.stdout}:${ok.stderr}:${ok.code}:${ok.exitCode}:${ok.killed}:${fail.code}:${fail.exitCode}:${fail.killed}`;\n    },\n  });\n}\n"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":".pi/extensions/file-queue.ts","content":"const fs = require(\"node:fs/promises\");\nconst path = require(\"node:path\");\nconst { withFileMutationQueue } = require(\"@earendil-works/pi-coding-agent\");\n\nconst sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));\n\nexport default function(pi) {\n  pi.registerCommand(\"queueprobe\", {\n    description: \"Probe withFileMutationQueue serialization\",\n    handler: async () => {\n      const file = path.resolve(\"queue-probe.txt\");\n      await fs.writeFile(file, \"\", \"utf8\");\n      await Promise.all([\n        withFileMutationQueue(file, async () => {\n          const before = await fs.readFile(file, \"utf8\");\n          await sleep(30);\n          await fs.writeFile(file, `${before}A`, \"utf8\");\n          return \"A\";\n        }),\n        withFileMutationQueue(file, async () => {\n          const before = await fs.readFile(file, \"utf8\");\n          await fs.writeFile(file, `${before}B`, \"utf8\");\n          return \"B\";\n        }),\n      ]);\n      return await fs.readFile(file, \"utf8\");\n    },\n  });\n}\n"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":".pi/extensions/type-guards.ts","content":"const { isToolCallEventType, isBashToolResult, isReadToolResult, isEditToolResult, isWriteToolResult, isGrepToolResult, isFindToolResult, isLsToolResult } = require(\"@earendil-works/pi-coding-agent\");\n\nexport default function(pi) {\n  pi.registerCommand(\"guardprobe\", {\n    description: \"Probe tool event type guards\",\n    handler: async () => [\n      typeof isToolCallEventType,\n      isToolCallEventType(\"ts_greet\", { toolName: \"ts_greet\" }),\n      isToolCallEventType(\"bash\", { toolName: \"read\" }),\n      isBashToolResult({ toolName: \"bash\" }),\n      isReadToolResult({ toolName: \"read\" }),\n      isEditToolResult({ toolName: \"edit\" }),\n      isWriteToolResult({ toolName: \"write\" }),\n      isGrepToolResult({ toolName: \"grep\" }),\n      isFindToolResult({ toolName: \"find\" }),\n      isLsToolResult({ toolName: \"ls\" }),\n    ].join(\":\"),\n  });\n}\n"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":".pi/extensions/wrapped-tool.ts","content":"const { wrapRegisteredTool, wrapRegisteredTools } = require(\"@earendil-works/pi-coding-agent\");\n\nexport default function(pi) {\n  const runner = { createContext: () => ({ wrapped: true }) };\n  const registered = {\n    definition: {\n      name: \"wrapped_tool\",\n      label: \"Wrapped Tool\",\n      description: \"Probe wrapRegisteredTool\",\n      parameters: { type: \"object\", properties: { value: { type: \"string\" } } },\n      async execute(_id, params, _signal, _onUpdate, ctx) {\n        return { content: [{ type: \"text\", text: `wrapped:${params.value}:${ctx.wrapped}` }], details: {} };\n      },\n    },\n    sourceInfo: { path: \"wrapped-tool.ts\", source: \"extension\", scope: \"project\", origin: \"top-level\" },\n  };\n  pi.registerTool(wrapRegisteredTool(registered, runner));\n  pi.registerCommand(\"wrapprobe\", {\n    description: \"Probe registered tool wrappers\",\n    handler: async () => {\n      const wrapped = wrapRegisteredTools([registered], runner);\n      return `${typeof wrapRegisteredTool}:${wrapped.length}:${wrapped[0].name}:${wrapped[0].description}`;\n    },\n  });\n}\n"}|}
   in
   let _ =
     run "write_file"
@@ -967,6 +1010,10 @@ let () =
   let _ =
     run "write_file"
       {|{"path":".pi/extensions/provider.ts","content":"export default function(pi) {\n  pi.registerProvider({\n    name: \"localai\",\n    aliases: [\"local\"],\n    protocol: \"openai\",\n    baseUrl: \"https://local.invalid/v1\",\n    apiKeyEnvVar: \"LOCALAI_API_KEY\",\n    defaultModel: \"local-large\",\n    headers: { \"X-Local\": \"1\" },\n    models: [{ id: \"local-large\", contextWindow: 4242 }, \"local-small\"],\n  });\n}\n"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":".pi/extensions/provider-unregister.ts","content":"export default function(pi) {\n  pi.registerCommand(\"provideradd\", {\n    description: \"Register provider at runtime\",\n    handler: async () => {\n      pi.registerProvider({\n        name: \"lateai\",\n        protocol: \"openai\",\n        baseUrl: \"https://late.invalid/v1\",\n        apiKeyEnvVar: \"LATEAI_API_KEY\",\n        defaultModel: \"late-small\",\n        models: [{ id: \"late-small\", contextWindow: 777 }],\n      });\n      return \"added\";\n    },\n  });\n  pi.registerCommand(\"providerdrop\", {\n    description: \"Unregister provider by alias\",\n    handler: async () => {\n      pi.unregisterProvider(\"local\");\n      return \"dropped\";\n    },\n  });\n}\n"}|}
   in
   let _ =
     run "write_file"
@@ -1116,6 +1163,22 @@ let () =
      match Extensions.execute_command "/tshello Pi" with
      | Some output -> contains0 output "Command Pi"
      | None -> false);
+  check "TypeScript extension pi.getCommands exposes sources"
+    ((not node_available)
+     ||
+     let commands =
+       [ j
+           {|{"name":"promptcmd","description":"Prompt command","source":"prompt","sourceInfo":{"path":"prompt.md","source":"prompt","scope":"project","origin":"top-level"}}|};
+         j
+           {|{"name":"skill:review","description":"Skill command","source":"skill","sourceInfo":{"path":"skill/SKILL.md","source":"skill","scope":"project","origin":"top-level"}}|} ]
+     in
+     match Extensions.execute_command_response ~commands "/commandlist" with
+     | Some response ->
+       contains0 response.Extensions.text "commandlist:extension:<extension-command:commandlist>"
+       && contains0 response.Extensions.text "tshello:extension:<extension-command:tshello>"
+       && contains0 response.Extensions.text "promptcmd:prompt:prompt.md"
+       && contains0 response.Extensions.text "skill:review:skill:skill/SKILL.md"
+     | None -> false);
   check "TypeScript extension pi.events emits and unsubscribes handlers"
     ((not node_available)
      ||
@@ -1135,6 +1198,30 @@ let () =
      ||
      match Extensions.execute_command "/execprobe" with
      | Some output -> output = "out:err:0:0:false:7:7:false"
+     | None -> false);
+  check "TypeScript extension withFileMutationQueue serializes same-file mutations"
+    ((not node_available)
+     ||
+     match Extensions.execute_command "/queueprobe" with
+     | Some output -> output = "AB"
+     | None -> false);
+  check "TypeScript extension exports tool event type guards"
+    ((not node_available)
+     ||
+     match Extensions.execute_command "/guardprobe" with
+     | Some output -> output = "function:true:false:true:true:true:true:true:true:true"
+     | None -> false);
+  check "TypeScript extension exports registered tool wrappers"
+    ((not node_available)
+     ||
+     match Extensions.execute_command "/wrapprobe" with
+     | Some output -> output = "function:1:wrapped_tool:Probe wrapRegisteredTool"
+     | None -> false);
+  check "TypeScript extension wrapped registered tool executes with runner context"
+    ((not node_available)
+     ||
+     match Tools.find "wrapped_tool" with
+     | Some t -> t.Tools.execute (`Assoc [ ("value", `String "ok") ]) = "wrapped:ok:true"
      | None -> false);
   check "TypeScript extension get/setThinkingLevel updates runtime state"
     ((not node_available)
@@ -2820,6 +2907,35 @@ let () =
      match blocks with
      | [ Llm.Text text ] -> text = "runtime runtime-small:sys:1:false" && Buffer.contents streamed = text
      | _ -> false);
+  check "TypeScript extension runtime registerProvider updates provider registry"
+    ((not node_available)
+     ||
+     match Extensions.execute_command "/provideradd" with
+     | Some output ->
+       output = "added"
+       && List.mem_assoc "lateai" (Llm.provider_status ())
+       && Models.context_window "late-small" = Some 777
+     | None -> false);
+  Unix.putenv "LATEAI_API_KEY" "late-key";
+  check "TypeScript extension runtime registerProvider configures LLM provider"
+    ((not node_available)
+     ||
+     let cfg = Llm.config_for "lateai" in
+     cfg.Llm.provider = Llm.Openai && cfg.base_url = "https://late.invalid/v1"
+     && cfg.api_key = "late-key" && cfg.model = "late-small");
+  Unix.putenv "LATEAI_API_KEY" "";
+  check "TypeScript extension unregisterProvider removes provider and models"
+    ((not node_available)
+     ||
+     match Extensions.execute_command "/providerdrop" with
+     | Some output ->
+       output = "dropped"
+       && not (List.mem_assoc "localai" (Llm.provider_status ()))
+       && not
+            (List.exists
+               (fun (e : Models.entry) -> e.provider = "localai")
+               (Models.list ~pat:"localai" ()))
+     | None -> false);
   check "TypeScript extension registerFlag/getFlag uses default values"
     ((not node_available)
      ||

@@ -1,7 +1,9 @@
 (* Shared HTTP helper: POST a JSON body with headers via `curl`, return parsed
    JSON. Shelling out to curl keeps the project free of a TLS/HTTP stack. *)
 
-exception Http_error of string
+(* Alias the shared transport error so callers can catch either name and a
+   native transport can raise the same exception. *)
+exception Http_error = Transport.Http_error
 
 let read_all ic =
   let buf = Buffer.create 4096 in
@@ -146,3 +148,6 @@ let post_stream ~url ~(headers : string list) ~(on_line : string -> unit) (body 
         | Unix.WEXITED c -> raise (Http_error (Printf.sprintf "curl exited %d" c))
         | Unix.WSIGNALED s | Unix.WSTOPPED s ->
           raise (Http_error (Printf.sprintf "curl killed by signal %d" s))))
+
+(* This module packaged as a [Transport.t], the default LLM transport. *)
+let transport : Transport.t = { Transport.post_stream; post_json }

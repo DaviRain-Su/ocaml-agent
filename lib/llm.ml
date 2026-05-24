@@ -118,6 +118,13 @@ let set_provider_response_hook hook = provider_response_hook := hook
 let apply_provider_request_hooks payload = !provider_request_hook payload
 let emit_provider_response_hooks ~status ~headers = !provider_response_hook ~status ~headers
 
+(* The HTTP transport used to reach providers. Defaults to the curl-based
+   [Http] implementation; swap in a native OCaml client with [set_transport],
+   or pass one per call to [complete]. *)
+let default_transport : Transport.t ref = ref Http.transport
+let set_transport t = default_transport := t
+let transport () = !default_transport
+
 let registry () = !extension_registry @ builtin_registry
 
 let normalize_name name = String.lowercase_ascii (String.trim name)
@@ -139,6 +146,17 @@ let register_provider ?(aliases = []) ?(headers = []) ?runtime ~name ~protocol ~
 
 let register_provider_runtime runtime handler =
   Hashtbl.replace extension_runtimes runtime handler
+
+let unregister_provider name =
+  let n = normalize_name name in
+  if n = "" then []
+  else
+    let removed, kept = List.partition (fun existing -> List.mem n existing.names) !extension_registry in
+    extension_registry := kept;
+    List.iter
+      (fun provider -> Option.iter (fun runtime -> Hashtbl.remove extension_runtimes runtime) provider.runtime)
+      removed;
+    uniq (List.concat_map (fun provider -> provider.names) removed)
 
 let clear_extension_providers () =
   extension_registry := [];
@@ -373,7 +391,7 @@ type builder =
   | BThinking of { text : Buffer.t; sign : Buffer.t }
   | BTool of { id : string; name : string; json : Buffer.t }
 
-let anthropic_complete cfg ~system ~on_text ~tools_enabled ?tool_names turns : content list * usage =
+let anthropic_complete cfg ~system ~on_text ~tools_enabled ?tool_names ~transport turns : content list * usage =
   let budget = thinking_budget cfg.thinking in
   (* Extended thinking requires max_tokens strictly greater than the budget. *)
   let max_tokens = if budget > 0 && cfg.max_tokens <= budget then budget + 4096 else cfg.max_tokens in
@@ -466,13 +484,13 @@ let anthropic_complete cfg ~system ~on_text ~tools_enabled ?tool_names turns : c
     with Api_error _ as e -> raise e | _ -> ()
   in
 	  (try
-	     Http.post_stream ~url ~headers body ~on_line:(fun line ->
+	     transport.Transport.post_stream ~url ~headers body ~on_line:(fun line ->
 	         match sse_data line with
 	         | Some data when data <> "[DONE]" -> handle data
 	         | Some _ -> ()
 	         | None -> if String.trim line <> "" then Buffer.add_string err (line ^ "\n"));
 	     emit_provider_response_hooks ~status:200 ~headers:[]
-	   with Http.Http_error e ->
+	   with Transport.Http_error e ->
 	     let msg = if Buffer.length err > 0 then e ^ "\n" ^ Buffer.contents err else e in
 	     raise (Api_error msg));
   if !blocks = [] && Buffer.length err > 0 then raise (Api_error (Buffer.contents err));
@@ -543,7 +561,7 @@ let openai_messages ~system turns =
   in
   sys_msg :: List.concat_map of_turn turns
 
-let openai_complete cfg ~system ~on_text ~tools_enabled ?tool_names turns : content list * usage =
+let openai_complete cfg ~system ~on_text ~tools_enabled ?tool_names ~transport turns : content list * usage =
   let tool_schemas = if tools_enabled then Tools.openai_schemas ?allowed:tool_names () else [] in
 	  let body =
 	    `Assoc
@@ -590,39 +608,39 @@ let openai_complete cfg ~system ~on_text ~tools_enabled ?tool_names turns : cont
            | u ->
              (match u |> member "prompt_tokens" with `Int n -> in_tok := n | _ -> ());
              (match u |> member "completion_tokens" with `Int n -> out_tok := n | _ -> ()));
-          match j |> member "choices" |> to_list with
-          | choice :: _ -> (
-            let d = choice |> member "delta" in
-            (match d |> member "content" with
-             | `String s when s <> "" ->
-               Buffer.add_string text s;
-               on_text s
-             | _ -> ());
-            match d |> member "tool_calls" with
-            | `Null -> ()
-            | calls ->
-              calls |> to_list
-              |> List.iter (fun c ->
-                     let idx = match c |> member "index" with `Int i -> i | _ -> 0 in
-                     let id, name, args = get_tool idx in
-                     (match c |> member "id" with `String s when s <> "" -> id := s | _ -> ());
-                     let fn = c |> member "function" in
-                     (match fn |> member "name" with `String s when s <> "" -> name := s | _ -> ());
-                     match fn |> member "arguments" with
-                     | `String s -> Buffer.add_string args s
-                     | _ -> ()))
-          | [] -> ())
+          (match j |> member "choices" with
+           | `List (choice :: _) -> (
+             let d = choice |> member "delta" in
+             (match d |> member "content" with
+              | `String s when s <> "" ->
+                Buffer.add_string text s;
+                on_text s
+              | _ -> ());
+             match d |> member "tool_calls" with
+             | `Null -> ()
+             | calls ->
+               calls |> to_list
+               |> List.iter (fun c ->
+                      let idx = match c |> member "index" with `Int i -> i | _ -> 0 in
+                      let id, name, args = get_tool idx in
+                      (match c |> member "id" with `String s when s <> "" -> id := s | _ -> ());
+                      let fn = c |> member "function" in
+                      (match fn |> member "name" with `String s when s <> "" -> name := s | _ -> ());
+                      match fn |> member "arguments" with
+                      | `String s -> Buffer.add_string args s
+                      | _ -> ()))
+           | _ -> ()))
         | _ -> raise (Api_error data))
     with Api_error _ as e -> raise e | _ -> ()
   in
 	  (try
-	     Http.post_stream ~url ~headers body ~on_line:(fun line ->
+	     transport.Transport.post_stream ~url ~headers body ~on_line:(fun line ->
 	         match sse_data line with
 	         | Some data when data <> "[DONE]" -> handle data
 	         | Some _ -> ()
 	         | None -> if String.trim line <> "" then Buffer.add_string err (line ^ "\n"));
 	     emit_provider_response_hooks ~status:200 ~headers:[]
-	   with Http.Http_error e ->
+	   with Transport.Http_error e ->
 	     let msg = if Buffer.length err > 0 then e ^ "\n" ^ Buffer.contents err else e in
 	     raise (Api_error msg));
   let text_blocks =
@@ -646,8 +664,9 @@ let openai_complete cfg ~system ~on_text ~tools_enabled ?tool_names turns : cont
 
 (* --- dispatch --- *)
 
-let complete (cfg : config) ~system ?(on_text = fun _ -> ()) ?(tools_enabled = true) ?tool_names turns :
-    content list * usage =
+let complete (cfg : config) ~system ?(on_text = fun _ -> ()) ?(tools_enabled = true) ?tool_names ?transport
+    turns : content list * usage =
+  let transport = match transport with Some t -> t | None -> !default_transport in
   match cfg.runtime with
   | Some runtime -> (
     match Hashtbl.find_opt extension_runtimes runtime with
@@ -655,5 +674,5 @@ let complete (cfg : config) ~system ?(on_text = fun _ -> ()) ?(tools_enabled = t
     | None -> raise (Api_error ("extension provider runtime is not registered: " ^ runtime)))
   | None -> (
     match cfg.provider with
-  | Anthropic -> anthropic_complete cfg ~system ~on_text ~tools_enabled ?tool_names turns
-  | Openai -> openai_complete cfg ~system ~on_text ~tools_enabled ?tool_names turns)
+  | Anthropic -> anthropic_complete cfg ~system ~on_text ~tools_enabled ?tool_names ~transport turns
+  | Openai -> openai_complete cfg ~system ~on_text ~tools_enabled ?tool_names ~transport turns)

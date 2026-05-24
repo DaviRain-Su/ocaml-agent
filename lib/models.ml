@@ -33,6 +33,10 @@ let register_extension_model entry =
          (fun e -> not (e.provider = entry.provider && e.id = entry.id))
          !extension_catalog
 
+let unregister_extension_provider provider =
+  let provider = String.lowercase_ascii (String.trim provider) in
+  if provider <> "" then extension_catalog := List.filter (fun e -> e.provider <> provider) !extension_catalog
+
 let clear_extension_models () =
   extension_catalog := []
 

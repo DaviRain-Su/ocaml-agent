@@ -406,20 +406,21 @@ let push_result ui res =
          push ui a line);
   redraw ui
 
-let rec confirm ui cmd =
+let confirm ui _cmd =
   ui.quiet <- true;
   try
-    let r =
+    let r = ref None in
+    while !r = None do
       match Term.event ui.term with
-      | `Key (`ASCII ('y' | 'Y'), _) -> Agent.Approve_once
-      | `Key (`ASCII ('a' | 'A'), _) -> Agent.Approve_always
-      | `Key (`ASCII ('n' | 'N'), _) | `Key (`Enter, _) | `Key (`Escape, _) -> Agent.Deny
-      | `Key (`ASCII 'c', [ `Ctrl ]) -> Agent.Deny
-      | `Resize _ -> redraw ui; confirm ui cmd
-      | _ -> confirm ui cmd
-    in
+      | `Key (`ASCII ('y' | 'Y'), _) -> r := Some Agent.Approve_once
+      | `Key (`ASCII ('a' | 'A'), _) -> r := Some Agent.Approve_always
+      | `Key (`ASCII ('n' | 'N'), _) | `Key (`Enter, _) | `Key (`Escape, _) -> r := Some Agent.Deny
+      | `Key (`ASCII 'c', [ `Ctrl ]) -> r := Some Agent.Deny
+      | `Resize _ -> redraw ui
+      | _ -> ()
+    done;
     ui.quiet <- false;
-    r
+    Option.get !r
   with e -> ui.quiet <- false; raise e
 
 let make_frontend ui : Agent.frontend =
@@ -467,16 +468,17 @@ let select ui ~title (items : string list) : int option =
             Term.cursor ui.term None)
       in
       render ();
-      let rec loop () =
+      let r = ref None in
+      while !r = None do
         match Term.event ui.term with
-        | `Key (`Arrow `Up, _) -> sel := (if !sel = 0 then n - 1 else !sel - 1); render (); loop ()
-        | `Key (`Arrow `Down, _) -> sel := (!sel + 1) mod n; render (); loop ()
-        | `Key (`Enter, _) -> Some !sel
-        | `Key (`Escape, _) | `Key (`ASCII 'c', [ `Ctrl ]) -> None
-        | `Resize _ -> render (); loop ()
-        | _ -> loop ()
-      in
-      let r = loop () in
+        | `Key (`Arrow `Up, _) -> sel := (if !sel = 0 then n - 1 else !sel - 1); render ()
+        | `Key (`Arrow `Down, _) -> sel := (!sel + 1) mod n; render ()
+        | `Key (`Enter, _) -> r := Some (Some !sel)
+        | `Key (`Escape, _) | `Key (`ASCII 'c', [ `Ctrl ]) -> r := Some None
+        | `Resize _ -> render ()
+        | _ -> ()
+      done;
+      let r = Option.get !r in
       ui.quiet <- false;
       redraw ui;
       r

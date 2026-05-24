@@ -722,6 +722,7 @@ let apply_command_prefix command =
   | _ -> command
 
 let run_process ?stdin_data ?(timeout_s = command_timeout_s) ?(use_shell_settings = false) command =
+  let timeout_s = max 1 timeout_s in
   let command = if use_shell_settings then apply_command_prefix command else command in
   let shell = if use_shell_settings then configured_shell_path () else "/bin/sh" in
   let stdin_path = ref None in
@@ -825,7 +826,7 @@ let run_bash =
     execute =
       (fun input ->
         let command = str_field input "command" in
-        let timeout_s = Option.value (opt_int_field input "timeout") ~default:command_timeout_s in
+        let timeout_s = max 1 (Option.value (opt_int_field input "timeout") ~default:command_timeout_s) in
         let code, out = run_process ~timeout_s ~use_shell_settings:true command in
         Printf.sprintf "(exit %d)\n%s" code out) }
 

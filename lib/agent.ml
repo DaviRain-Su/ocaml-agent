@@ -205,7 +205,7 @@ let create ?session ?(initial_turns = []) ?(tools_enabled = true) ?allowed_tools
     allowed_tools = Option.map Tools.canonical_names allowed_tools;
     context_window =
       (match Sys.getenv_opt "AGENT_CONTEXT_WINDOW" with
-       | Some s -> ( try int_of_string s with _ -> 128000)
+       | Some s -> ( try max 1 (int_of_string s) with _ -> 128000)
        | None -> Option.value (Models.context_window cfg.model) ~default:128000);
     compact_threshold = env_float "AGENT_COMPACT_THRESHOLD" 0.75;
     auto_compact;

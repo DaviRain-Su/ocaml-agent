@@ -1,3 +1,8 @@
 (test
  (name test_tools)
- (libraries agent_lib notty))
+ (libraries agent_lib notty)
+ (deps ocaml_sdk_extension.exe))
+
+(executable
+ (name ocaml_sdk_extension)
+ (libraries agent_lib))
