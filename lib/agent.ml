@@ -171,6 +171,7 @@ type t =
     mutable auto_approve : bool;
     tools_enabled : bool;
     allowed_tools : string list option;
+    client : Llm.client; (* provider/transport state + tool registry for this agent *)
     context_window : int;
     compact_threshold : float; (* fraction of the window that triggers compaction *)
     mutable auto_compact : bool;
@@ -185,7 +186,8 @@ type t =
 
 let max_depth = 2
 
-let create ?session ?(initial_turns = []) ?(tools_enabled = true) ?allowed_tools ?(depth = 0) ?frontend cfg =
+let create ?session ?(initial_turns = []) ?(tools_enabled = true) ?allowed_tools ?(depth = 0) ?frontend
+    ?(client = Llm.default_client) cfg =
   (* Default to auto-approving tools (like pi). Set AGENT_AUTO_APPROVE=0 to be
      prompted before run_bash and subprocess extension tools. *)
   let auto_approve =
@@ -203,6 +205,7 @@ let create ?session ?(initial_turns = []) ?(tools_enabled = true) ?allowed_tools
     auto_approve;
     tools_enabled;
     allowed_tools = Option.map Tools.canonical_names allowed_tools;
+    client;
     context_window =
       (match Sys.getenv_opt "AGENT_CONTEXT_WINDOW" with
        | Some s -> ( try max 1 (int_of_string s) with _ -> 128000)
@@ -393,7 +396,7 @@ let config_for_model_choice t (choice : Extensions.model_choice) =
     in
     let cfg =
       match (parsed.provider, parsed.model) with
-      | Some provider, model -> Llm.config_for ?model provider
+      | Some provider, model -> Llm.config_for ~client:t.client ?model provider
       | None, Some model -> { t.cfg with Llm.model = model }
       | None, None -> t.cfg
     in
@@ -470,7 +473,9 @@ let approval_text name input =
 (* Command-capable tools are gated. Returns true if the call may proceed. *)
 let approve t name input =
   let requires_approval =
-    match Tools.find (Tools.canonical_name name) with Some tool -> tool.Tools.requires_approval | None -> false
+    match Tools.find ~reg:t.client.Llm.tools (Tools.canonical_name name) with
+    | Some tool -> tool.Tools.requires_approval
+    | None -> false
   in
   if not requires_approval then true
   else if t.auto_approve then true
@@ -560,7 +565,7 @@ let compact t =
     in
     let prompt = [ { Llm.role = User; content = [ Llm.Text ("Summarize this conversation:\n\n" ^ transcript) ] } ] in
     try
-      let blocks, _ = Llm.complete t.cfg ~system:sys ~tools_enabled:false prompt in
+      let blocks, _ = Llm.complete ~client:t.client t.cfg ~system:sys ~tools_enabled:false prompt in
       let summary = String.concat "\n" (List.filter_map (function Llm.Text s -> Some s | _ -> None) blocks) in
       let summary_turn = { Llm.role = User; content = [ Llm.Text ("[Earlier conversation summary]\n" ^ summary) ] } in
       t.turns <- summary_turn :: recent;
@@ -615,7 +620,7 @@ and run_tool t id name input : Llm.content =
       else if Tools.canonical_name name = "task" then run_sub_agent t input
       else if not (approve t name input) then "Error: command not approved by user"
       else
-        match Tools.find (Tools.canonical_name name) with
+        match Tools.find ~reg:t.client.Llm.tools (Tools.canonical_name name) with
         | Some tool -> ( try tool.execute input with
         | Sys.Break as e -> raise e
         | e -> "Error: " ^ Printexc.to_string e)
@@ -657,7 +662,8 @@ and step t : string =
       let llm_turns = Extensions.emit_context (context_turns t) in
       let cfg = effective_config t in
       let blocks, usage =
-        Llm.complete cfg ~system:t.system ~on_text ~tools_enabled:t.tools_enabled ?tool_names:(effective_tool_names t) llm_turns
+        Llm.complete ~client:t.client cfg ~system:t.system ~on_text ~tools_enabled:t.tools_enabled
+          ?tool_names:(effective_tool_names t) llm_turns
       in
       if usage.Llm.input_tokens > 0 then t.last_input_tokens <- usage.Llm.input_tokens;
       if usage.Llm.output_tokens > 0 then t.last_output_tokens <- usage.Llm.output_tokens;
