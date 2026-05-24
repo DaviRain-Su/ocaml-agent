@@ -791,27 +791,6 @@ let () =
      && not (contains0 builtin_schema "\"name\":\"read_file\"")
      && not (contains0 builtin_schema "\"name\":\"run_bash\""));
 
-  (* --- model catalog --- *)
-  check "model context window lookup" (Models.context_window "deepseek-v4-pro" = Some 1000000);
-  check "model unknown -> None" (Models.context_window "no-such-model" = None);
-  check "model list filters" (List.for_all (fun (e : Models.entry) -> contains0 e.Models.id "glm" || contains0 e.Models.provider "zai") (Models.list ~pat:"zai" ()));
-  check "model list nonempty" (Models.list () <> []);
-  let parsed = Model_spec.parse (Some "openai/gpt-4o:high") in
-  check "model spec parses provider prefix"
-    (parsed.Model_spec.provider = Some "openai" && parsed.model = Some "gpt-4o" && parsed.thinking = Some "high");
-  let parsed = Model_spec.parse (Some "openai") in
-  check "model spec preserves provider-only switch" (parsed.Model_spec.provider = Some "openai" && parsed.model = None);
-  let parsed = Model_spec.parse ~provider:"openrouter" (Some "openai/gpt-4o") in
-  check "explicit provider keeps slash model id"
-    (parsed.Model_spec.provider = Some "openrouter" && parsed.model = Some "openai/gpt-4o");
-  Unix.putenv "AGENT_SCOPED_MODELS" "anthropic/*\nglm:high";
-  let scoped = Models.scoped_from_env () in
-  check "scoped models match globs and strip thinking suffix"
-    (List.exists (fun (e : Models.entry) -> e.provider = "anthropic") scoped
-     && List.exists (fun (e : Models.entry) -> contains0 e.id "glm") scoped
-     && not (List.exists (fun (e : Models.entry) -> e.provider = "openai") scoped));
-  Unix.putenv "AGENT_SCOPED_MODELS" "";
-
   (* --- extensions: custom tool from manifest --- *)
   let oc = open_out ".ocaml-agent/tools.json" in
   output_string oc

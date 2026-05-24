@@ -7,6 +7,10 @@
  (name test_misc)
  (libraries agent_lib notty))
 
+(test
+ (name test_models)
+ (libraries agent_lib))
+
 (executable
  (name ocaml_sdk_extension)
  (libraries agent_lib str))
