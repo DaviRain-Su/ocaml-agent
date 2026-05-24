@@ -5,4 +5,4 @@
 
 (executable
  (name ocaml_sdk_extension)
- (libraries agent_lib))
+ (libraries agent_lib str))

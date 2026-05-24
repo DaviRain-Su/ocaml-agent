@@ -417,7 +417,10 @@ execution layer. The bridge exports Pi's `withFileMutationQueue()` helper for
 custom tools that need same-file read-modify-write serialization, plus
 tool-event type guards such as `isToolCallEventType()` and
 `isBashToolResult()`, and `wrapRegisteredTool()` / `wrapRegisteredTools()` for
-SDK-compatible tool wrapping. Custom UI surface calls such as status, widget, title,
+SDK-compatible tool wrapping. It also exposes the Pi extension loader/runtime
+entry points `createExtensionRuntime()`, `loadExtensionFromFactory()`,
+`loadExtensions()`, `discoverAndLoadExtensions()`, and `ExtensionRunner()` for
+programmatic extension composition. Custom UI surface calls such as status, widget, title,
 header/footer, editor text, paste, and working-state updates are captured for
 terminal and RPC adapters. TUI working message, visibility, and indicator
 settings drive the active turn status row. Component factories that can render

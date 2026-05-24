@@ -902,6 +902,36 @@ let () =
     (match Extensions.execute_command "/ocamlhello Pi" with
      | Some output -> output = "OCaml command Pi"
      | None -> false);
+  check "OCaml SDK extension command returns UI surfaces"
+    (match Extensions.execute_command_response "/ocamlui" with
+     | Some response ->
+       response.Extensions.text = "ui ok"
+       && List.mem "ocaml notice" response.Extensions.ui.notifications
+       &&
+       (match response.Extensions.ui.surfaces with
+        | `Assoc fields :: _ ->
+          List.assoc_opt "kind" fields = Some (`String "status")
+          && List.assoc_opt "key" fields = Some (`String "ocaml")
+        | _ -> false)
+     | None -> false);
+  check "OCaml SDK extension before_provider_request mutates payload"
+    (let mutated = Llm.apply_provider_request_hooks (j {|{"model":"base"}|}) in
+     Yojson.Safe.Util.member "ocamlHooked" mutated = `Bool true);
+  check "OCaml SDK extension after_provider_response receives payload"
+    (Llm.emit_provider_response_hooks ~status:299 ~headers:[ ("x-ocaml", "ok") ];
+     contains0 (Tools.read_file_contents "ocaml-hooks.log") "after 299");
+  check "OCaml SDK extension registers provider runtime"
+    (let cfg = Llm.config_for "ocamlai" in
+     let blocks, usage =
+       Llm.complete cfg ~system:"SDK-SYSTEM" ~tools_enabled:false
+         [ { Llm.role = Llm.User; content = [ Llm.Text "hello" ] } ]
+     in
+     match blocks with
+     | [ Llm.Text text ] ->
+       text = "ocaml provider ocaml-small:true:1"
+       && usage.Llm.input_tokens = 5
+       && usage.Llm.output_tokens = 2
+     | _ -> false);
   let node_available = Sys.command "command -v node >/dev/null 2>&1" = 0 in
   let _ =
     run "write_file"
@@ -950,6 +980,18 @@ let () =
   let _ =
     run "write_file"
       {|{"path":".pi/extensions/wrapped-tool.ts","content":"const { wrapRegisteredTool, wrapRegisteredTools } = require(\"@earendil-works/pi-coding-agent\");\n\nexport default function(pi) {\n  const runner = { createContext: () => ({ wrapped: true }) };\n  const registered = {\n    definition: {\n      name: \"wrapped_tool\",\n      label: \"Wrapped Tool\",\n      description: \"Probe wrapRegisteredTool\",\n      parameters: { type: \"object\", properties: { value: { type: \"string\" } } },\n      async execute(_id, params, _signal, _onUpdate, ctx) {\n        return { content: [{ type: \"text\", text: `wrapped:${params.value}:${ctx.wrapped}` }], details: {} };\n      },\n    },\n    sourceInfo: { path: \"wrapped-tool.ts\", source: \"extension\", scope: \"project\", origin: \"top-level\" },\n  };\n  pi.registerTool(wrapRegisteredTool(registered, runner));\n  pi.registerCommand(\"wrapprobe\", {\n    description: \"Probe registered tool wrappers\",\n    handler: async () => {\n      const wrapped = wrapRegisteredTools([registered], runner);\n      return `${typeof wrapRegisteredTool}:${wrapped.length}:${wrapped[0].name}:${wrapped[0].description}`;\n    },\n  });\n}\n"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":"sdk-child.ts","content":"export default function(pi) {\n  pi.registerTool({\n    name: \"sdk_child_tool\",\n    label: \"SDK Child Tool\",\n    description: \"Loaded through loadExtensions\",\n    parameters: { type: \"object\", properties: { value: { type: \"string\" } } },\n    async execute(_id, params, _signal, _onUpdate, ctx) {\n      return { content: [{ type: \"text\", text: `child:${params.value}:${ctx.cwd.endsWith(\"ocaml-agent\")}` }], details: {} };\n    },\n  });\n  pi.registerCommand(\"sdkchild\", { description: \"SDK child command\", handler: async () => \"child\" });\n}\n"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":"sdk-ext-dir/index.ts","content":"export default function(pi) {\n  pi.registerCommand(\"sdkdiscovered\", { description: \"Discovered SDK command\", handler: async () => \"discovered\" });\n}\n"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":".pi/extensions/sdk-loader.ts","content":"const { createExtensionRuntime, loadExtensionFromFactory, loadExtensions, discoverAndLoadExtensions, ExtensionRunner, wrapRegisteredTool } = require(\"@earendil-works/pi-coding-agent\");\n\nexport default function(pi) {\n  pi.registerCommand(\"sdkloader\", {\n    description: \"Probe Pi extension loader exports\",\n    handler: async () => {\n      const runtime = createExtensionRuntime();\n      const inline = await loadExtensionFromFactory((api) => {\n        api.registerTool({\n          name: \"sdk_inline_tool\",\n          label: \"SDK Inline Tool\",\n          description: \"Inline SDK tool\",\n          parameters: { type: \"object\", properties: { value: { type: \"string\" } } },\n          async execute(_id, params, _signal, _onUpdate, ctx) {\n            return { content: [{ type: \"text\", text: `inline:${params.value}:${ctx.hasUI}` }], details: {} };\n          },\n        });\n        api.registerCommand(\"sdkinline\", { description: \"Inline command\", handler: async () => \"inline\" });\n        api.on(\"turn_start\", async () => ({ seen: true }));\n        api.registerProvider(\"queuedai\", { baseUrl: \"https://queued.invalid/v1\", apiKeyEnvVar: \"QUEUEDAI_API_KEY\", defaultModel: \"queued-small\", models: [\"queued-small\"] });\n      }, process.cwd(), pi.events, runtime, \"inline-sdk.ts\");\n      const loaded = await loadExtensions([\"sdk-child.ts\"], process.cwd(), pi.events);\n      const discovered = await discoverAndLoadExtensions([\"sdk-ext-dir\"], process.cwd(), process.cwd(), pi.events);\n      const runner = new ExtensionRunner([inline, ...loaded.extensions, ...discovered.extensions], runtime, process.cwd(), { id: \"session\" }, { id: \"models\" });\n      runner.setUIContext({ notify: () => {} });\n      const wrapped = wrapRegisteredTool(inline.tools.get(\"sdk_inline_tool\"), runner);\n      const wrappedText = await wrapped.execute(\"sdk-call\", { value: \"ok\" });\n      const toolNames = runner.getAllRegisteredTools().map((tool) => tool.definition.name).sort().join(\",\");\n      const commands = runner.getRegisteredCommands().map((command) => command.invocationName).sort().join(\",\");\n      const eventResult = await runner.emit({ type: \"turn_start\" });\n      return [\n        typeof createExtensionRuntime,\n        loaded.errors.length,\n        discovered.errors.length,\n        runtime.pendingProviderRegistrations.map((item) => item.name).join(\",\"),\n        runner.hasHandlers(\"turn_start\"),\n        eventResult && eventResult.seen,\n        toolNames.includes(\"sdk_inline_tool\"),\n        toolNames.includes(\"sdk_child_tool\"),\n        commands.includes(\"sdkinline\"),\n        commands.includes(\"sdkchild\"),\n        commands.includes(\"sdkdiscovered\"),\n        wrappedText.content[0].text,\n      ].join(\":\");\n    },\n  });\n}\n"}|}
   in
   let _ =
     run "write_file"
@@ -1222,6 +1264,13 @@ let () =
      ||
      match Tools.find "wrapped_tool" with
      | Some t -> t.Tools.execute (`Assoc [ ("value", `String "ok") ]) = "wrapped:ok:true"
+     | None -> false);
+  check "TypeScript extension exports loader runtime and runner APIs"
+    ((not node_available)
+     ||
+     match Extensions.execute_command "/sdkloader" with
+     | Some output ->
+       output = "function:0:0:queuedai:true:true:true:true:true:true:true:inline:ok:true"
      | None -> false);
   check "TypeScript extension get/setThinkingLevel updates runtime state"
     ((not node_available)

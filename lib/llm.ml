@@ -173,22 +173,23 @@ let all_env_keys () = List.concat_map (fun k -> k.env_keys) (registry ())
 let read_max_tokens () =
   match getenv "AGENT_MAX_TOKENS" with Some s -> ( try int_of_string s with _ -> 4096) | None -> 4096
 
+(* Map any thinking level onto the canonical {off,low,medium,high} set. Unknown
+   values clamp to "off" so an invalid string never reaches the Anthropic
+   thinking block or OpenAI reasoning_effort field. *)
+let canonical_thinking s =
+  match String.lowercase_ascii (String.trim s) with
+  | "low" | "minimal" -> "low"
+  | "medium" -> "medium"
+  | "high" | "xhigh" -> "high"
+  | _ -> "off"
+
 let read_thinking () =
-  let configured =
-    match getenv "AGENT_THINKING" with
-    | Some s -> Some s
-    | None -> Config_paths.settings_string [ "defaultThinkingLevel" ]
-  in
-  match configured with
-  | Some s -> (
-    match String.lowercase_ascii (String.trim s) with
-    | ("low" | "minimal") -> "low"
-    | "medium" -> "medium"
-    | ("high" | "xhigh") -> "high"
-    (* Clamp anything unrecognized to "off" so an invalid value never reaches
-       the Anthropic thinking block or OpenAI reasoning_effort field. *)
-    | _ -> "off")
-  | None -> "off"
+  match getenv "AGENT_THINKING" with
+  | Some s -> canonical_thinking s
+  | None -> (
+    match Config_paths.settings_string [ "defaultThinkingLevel" ] with
+    | Some s -> canonical_thinking s
+    | None -> "off")
 
 (* Canonical provider names paired with whether their key env var is set. *)
 let provider_status () =
@@ -199,16 +200,43 @@ let provider_status () =
       | [] -> None)
     (registry ())
 
+let unknown_provider_error alias =
+  Config_error
+    (Printf.sprintf "unknown provider %S; known: %s" alias
+       (String.concat ", " (List.map fst (provider_status ()))))
+
+(* Pure: build a fully-explicit config without consulting the environment,
+   settings files, or the provider registry. The entry point SDK/library
+   callers should prefer when they already hold credentials and endpoint. *)
+let make_config ?(max_tokens = 4096) ?(extra_headers = []) ?runtime ?(thinking = "off") ~provider
+    ~base_url ~api_key ~model () : config =
+  { provider;
+    base_url;
+    api_key;
+    model;
+    max_tokens;
+    extra_headers;
+    runtime;
+    thinking = canonical_thinking thinking }
+
+(* Pure: build a config from a known provider entry (its protocol, base URL,
+   default model, and required headers) with an explicitly supplied API key.
+   No environment or settings reads. Raises [Config_error] for unknown aliases. *)
+let config_of_known ?model ?(thinking = "off") ?(max_tokens = 4096) ~api_key alias : config =
+  match find_known alias with
+  | None -> raise (unknown_provider_error alias)
+  | Some k ->
+    make_config ~provider:k.protocol ~base_url:k.base_url ~api_key
+      ~model:(Option.value model ~default:k.default_model)
+      ?runtime:k.runtime ~extra_headers:k.headers ~max_tokens ~thinking ()
+
 (* Build a config for an explicitly named provider (used by /model switching).
-   Uses the registry's own base URL / default model, reads the key from the
-   provider's env vars (or AGENT_API_KEY), and lets [model] override the model. *)
+   Convenience layer over [config_of_known]: reads the key from the provider's
+   env vars (or AGENT_API_KEY) and pulls max_tokens/thinking from env/settings;
+   lets [model] override the model. *)
 let config_for ?model alias : config =
   match find_known alias with
-  | None ->
-    raise
-      (Config_error
-         (Printf.sprintf "unknown provider %S; known: %s" alias
-            (String.concat ", " (List.map (fun (n, _) -> n) (provider_status ())))))
+  | None -> raise (unknown_provider_error alias)
   | Some k ->
     let api_key =
       match first_env k.env_keys with
@@ -222,15 +250,7 @@ let config_for ?model alias : config =
             (Config_error
                (Printf.sprintf "no API key for %s; set %s" alias (String.concat " or " k.env_keys))))
     in
-    let model = match model with Some m -> m | None -> k.default_model in
-    { provider = k.protocol;
-      base_url = k.base_url;
-      api_key;
-      model;
-      max_tokens = read_max_tokens ();
-      extra_headers = k.headers;
-      runtime = k.runtime;
-      thinking = read_thinking () }
+    config_of_known ?model ~thinking:(read_thinking ()) ~max_tokens:(read_max_tokens ()) ~api_key alias
 
 let config () : config =
   let max_tokens = read_max_tokens () in
@@ -288,7 +308,8 @@ let config () : config =
         | Some m -> m
         | None -> raise (Config_error "AGENT_MODEL must be set for a generic openai endpoint")))
   in
-  { provider; base_url; api_key; model; max_tokens; extra_headers; runtime; thinking = read_thinking () }
+  make_config ~provider ~base_url ~api_key ~model ~max_tokens ~extra_headers ?runtime
+    ~thinking:(read_thinking ()) ()
 
 let describe cfg =
   let p = match cfg.provider with Anthropic -> "anthropic" | Openai -> "openai" in

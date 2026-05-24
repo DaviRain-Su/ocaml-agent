@@ -400,6 +400,47 @@ function createEventBus() {
   };
 }
 
+function createExtensionRuntime() {
+  const notInitialized = () => {
+    throw new Error("Extension runtime not initialized. Action methods cannot be called during extension loading.");
+  };
+  const state = {};
+  const assertActive = () => {
+    if (state.staleMessage) throw new Error(state.staleMessage);
+  };
+  const runtime = {
+    sendMessage: notInitialized,
+    sendUserMessage: notInitialized,
+    appendEntry: notInitialized,
+    setSessionName: notInitialized,
+    getSessionName: notInitialized,
+    setLabel: notInitialized,
+    getActiveTools: notInitialized,
+    getAllTools: notInitialized,
+    setActiveTools: notInitialized,
+    refreshTools: () => {},
+    getCommands: notInitialized,
+    setModel: () => Promise.reject(new Error("Extension runtime not initialized")),
+    getThinkingLevel: notInitialized,
+    setThinkingLevel: notInitialized,
+    flagValues: new Map(),
+    pendingProviderRegistrations: [],
+    assertActive,
+    invalidate: (message) => {
+      state.staleMessage ||= message ||
+        "This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload().";
+    },
+    registerProvider: (name, config, extensionPath = "<unknown>") => {
+      runtime.pendingProviderRegistrations.push({ name, config, extensionPath });
+    },
+    unregisterProvider: (name) => {
+      const requested = String(name || "").trim();
+      runtime.pendingProviderRegistrations = runtime.pendingProviderRegistrations.filter((item) => item.name !== requested);
+    },
+  };
+  return runtime;
+}
+
 function defaultShellPath() {
   if (process.env.AGENT_SHELL_PATH) return process.env.AGENT_SHELL_PATH;
   if (process.env.PI_SHELL_PATH) return process.env.PI_SHELL_PATH;
@@ -668,6 +709,11 @@ function renderDiff(value) {
 function piCodingAgentExports() {
   return {
     defineTool,
+    createExtensionRuntime,
+    loadExtensionFromFactory,
+    loadExtensions,
+    discoverAndLoadExtensions,
+    ExtensionRunner,
     wrapRegisteredTool,
     wrapRegisteredTools,
     isToolCallEventType,
@@ -1029,6 +1075,336 @@ function makeApi(registry, extensionPath = "<unknown>") {
     getFlag: (name) => getRegisteredFlagValue(flags, flagValues, name),
     events: registry.eventBus,
   };
+}
+
+function createSourceInfo(extensionPath) {
+  return { path: extensionPath, source: "extension", scope: "project", origin: "top-level" };
+}
+
+function createExtensionRecord(extensionPath) {
+  return {
+    path: extensionPath,
+    sourceInfo: createSourceInfo(extensionPath),
+    tools: new Map(),
+    commands: new Map(),
+    handlers: new Map(),
+    flags: new Map(),
+    shortcuts: new Map(),
+    messageRenderers: new Map(),
+    renderers: new Map(),
+  };
+}
+
+function providerRegistration(provider, options = {}) {
+  let entry = {};
+  if (provider && typeof provider === "object") {
+    entry = { ...provider };
+  } else if (typeof provider === "string") {
+    entry = { ...(options || {}), name: provider };
+  }
+  const name = String(entry.name || entry.id || entry.provider || "").trim();
+  return name ? { name, config: { ...entry, name } } : null;
+}
+
+function makeExtensionLoaderApi(extension, runtime, cwd, eventBus) {
+  const registerRenderer = (name, options) => {
+    let entry = {};
+    if (name && typeof name === "object") entry = { ...name };
+    else if (typeof name === "string") entry = typeof options === "function" ? { render: options, name } : { ...(options || {}), name };
+    const rendererName = String(entry.name || entry.id || entry.type || "").trim();
+    if (rendererName) extension.renderers.set(rendererName, { ...entry, name: rendererName });
+  };
+  const registerMessageRenderer = (customType, renderer) => {
+    if (typeof customType === "string" && customType.trim()) {
+      const entry = typeof renderer === "function" ? { render: renderer } : { ...(renderer || {}) };
+      extension.messageRenderers.set(customType, {
+        ...entry,
+        name: customType,
+        customType,
+        target: "custom_message",
+      });
+      return;
+    }
+    registerRenderer(customType, renderer);
+  };
+  return {
+    on: (event, handler) => {
+      runtime.assertActive();
+      if (typeof event !== "string" || typeof handler !== "function") return;
+      const list = extension.handlers.get(event) || [];
+      list.push(handler);
+      extension.handlers.set(event, list);
+    },
+    registerTool: (tool) => {
+      runtime.assertActive();
+      if (!tool || typeof tool.name !== "string") return;
+      extension.tools.set(tool.name, { definition: tool, sourceInfo: extension.sourceInfo });
+      runtime.refreshTools();
+    },
+    registerCommand: (name, options = {}) => {
+      runtime.assertActive();
+      if (typeof name !== "string" || !name.trim()) return;
+      extension.commands.set(name, { name, sourceInfo: extension.sourceInfo, ...options });
+    },
+    registerShortcut: (shortcut, options = {}) => {
+      runtime.assertActive();
+      const spec = normalizeShortcutSpec(typeof shortcut === "string" ? shortcut : shortcut && (shortcut.key || shortcut.shortcut || shortcut.binding));
+      if (spec) extension.shortcuts.set(spec, { shortcut: spec, spec, extensionPath: extension.path, ...(typeof options === "function" ? { handler: options } : options || {}) });
+    },
+    registerFlag: (name, options = {}) => {
+      runtime.assertActive();
+      const entry = name && typeof name === "object" ? { ...name } : { ...(options || {}), name };
+      const flagName = normalizeFlagName(entry.name);
+      if (flagName) extension.flags.set(flagName, { ...entry, name: flagName, extensionPath: extension.path });
+    },
+    registerMessageRenderer,
+    registerRenderer,
+    registerComponentRenderer: registerRenderer,
+    registerOutputRenderer: registerRenderer,
+    registerProvider: (provider, options) => {
+      runtime.assertActive();
+      const registration = providerRegistration(provider, options);
+      if (registration) runtime.registerProvider(registration.name, registration.config, extension.path);
+    },
+    unregisterProvider: (name) => {
+      runtime.assertActive();
+      runtime.unregisterProvider(String(name || "").trim(), extension.path);
+    },
+    sendMessage: (...args) => runtime.sendMessage(...args),
+    sendUserMessage: (...args) => runtime.sendUserMessage(...args),
+    appendEntry: (...args) => runtime.appendEntry(...args),
+    setSessionName: (...args) => runtime.setSessionName(...args),
+    getSessionName: (...args) => runtime.getSessionName(...args),
+    setLabel: (...args) => runtime.setLabel(...args),
+    getActiveTools: (...args) => runtime.getActiveTools(...args),
+    getAllTools: (...args) => runtime.getAllTools(...args),
+    setActiveTools: (...args) => runtime.setActiveTools(...args),
+    refreshTools: (...args) => runtime.refreshTools(...args),
+    getCommands: (...args) => runtime.getCommands(...args),
+    setModel: (...args) => runtime.setModel(...args),
+    getThinkingLevel: (...args) => runtime.getThinkingLevel(...args),
+    setThinkingLevel: (...args) => runtime.setThinkingLevel(...args),
+    getFlag: (name) => runtime.flagValues.get(normalizeFlagName(name)),
+    cwd,
+    events: eventBus,
+  };
+}
+
+async function loadExtensionFromFactory(factory, cwd = process.cwd(), eventBus = createEventBus(), runtime = createExtensionRuntime(), extensionPath = "<inline>") {
+  if (typeof factory !== "function") throw new Error("loadExtensionFromFactory requires a function");
+  const extension = createExtensionRecord(extensionPath);
+  await factory(makeExtensionLoaderApi(extension, runtime, path.resolve(cwd || process.cwd()), eventBus));
+  return extension;
+}
+
+async function loadExtensions(paths, cwd = process.cwd(), eventBus = createEventBus()) {
+  const runtime = createExtensionRuntime();
+  const extensions = [];
+  const errors = [];
+  for (const extPath of Array.isArray(paths) ? paths : []) {
+    try {
+      const resolved = path.resolve(cwd || process.cwd(), String(extPath || ""));
+      const factory = await loadFactory(resolved);
+      extensions.push(await loadExtensionFromFactory(factory, cwd, eventBus, runtime, resolved));
+    } catch (error) {
+      errors.push({ path: String(extPath || ""), error: error && error.message ? error.message : String(error) });
+    }
+  }
+  return { extensions, errors, runtime };
+}
+
+function bridgeExtensionFile(name) {
+  return [".ts", ".js", ".mjs", ".cjs"].some((suffix) => String(name || "").endsWith(suffix));
+}
+
+function discoverExtensionsInDir(dir) {
+  try {
+    return fs.readdirSync(dir)
+      .filter((name) => bridgeExtensionFile(name))
+      .sort()
+      .map((name) => path.join(dir, name));
+  } catch {
+    return [];
+  }
+}
+
+function resolveExtensionEntries(dir) {
+  for (const name of ["index.ts", "index.js", "index.mjs", "index.cjs"]) {
+    const candidate = path.join(dir, name);
+    if (fs.existsSync(candidate)) return [candidate];
+  }
+  const packagePath = path.join(dir, "package.json");
+  try {
+    const manifest = JSON.parse(fs.readFileSync(packagePath, "utf8"));
+    const entries = manifest && manifest.pi && Array.isArray(manifest.pi.extensions) ? manifest.pi.extensions : [];
+    if (entries.length) return entries.map((entry) => path.resolve(dir, entry));
+  } catch {}
+  return null;
+}
+
+async function discoverAndLoadExtensions(configuredPaths = [], cwd = process.cwd(), agentDir = path.join(process.env.HOME || cwd, ".pi"), eventBus = createEventBus()) {
+  const resolvedCwd = path.resolve(cwd || process.cwd());
+  const resolvedAgentDir = path.resolve(agentDir || path.join(process.env.HOME || resolvedCwd, ".pi"));
+  const allPaths = [];
+  const seen = new Set();
+  const addPath = (item) => {
+    const resolved = path.resolve(resolvedCwd, String(item || ""));
+    if (!seen.has(resolved)) {
+      seen.add(resolved);
+      allPaths.push(resolved);
+    }
+  };
+  for (const item of discoverExtensionsInDir(path.join(resolvedCwd, ".pi", "extensions"))) addPath(item);
+  for (const item of discoverExtensionsInDir(path.join(resolvedAgentDir, "extensions"))) addPath(item);
+  for (const configured of Array.isArray(configuredPaths) ? configuredPaths : []) {
+    const resolved = path.resolve(resolvedCwd, String(configured || ""));
+    if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
+      const entries = resolveExtensionEntries(resolved) || discoverExtensionsInDir(resolved);
+      for (const entry of entries) addPath(entry);
+    } else {
+      addPath(resolved);
+    }
+  }
+  return loadExtensions(allPaths, resolvedCwd, eventBus);
+}
+
+class ExtensionRunner {
+  constructor(extensions = [], runtime = createExtensionRuntime(), cwd = process.cwd(), sessionManager = {}, modelRegistry = {}) {
+    this.extensions = Array.isArray(extensions) ? extensions : [];
+    this.runtime = runtime;
+    this.cwd = path.resolve(cwd || process.cwd());
+    this.sessionManager = sessionManager;
+    this.modelRegistry = modelRegistry;
+    this.uiContext = {};
+    this.errorListeners = new Set();
+    this.staleMessage = undefined;
+  }
+
+  bindCore(actions = {}, contextActions = {}, providerActions = {}) {
+    for (const key of ["sendMessage", "sendUserMessage", "appendEntry", "setSessionName", "getSessionName", "setLabel", "getActiveTools", "getAllTools", "setActiveTools", "refreshTools", "getCommands", "setModel", "getThinkingLevel", "setThinkingLevel"]) {
+      if (typeof actions[key] === "function") this.runtime[key] = actions[key];
+    }
+    this.contextActions = contextActions || {};
+    for (const registration of this.runtime.pendingProviderRegistrations || []) {
+      try {
+        if (providerActions && typeof providerActions.registerProvider === "function") providerActions.registerProvider(registration.name, registration.config);
+      } catch (error) {
+        this.emitError({ extensionPath: registration.extensionPath, event: "register_provider", error: error && error.message ? error.message : String(error) });
+      }
+    }
+    this.runtime.pendingProviderRegistrations = [];
+    this.runtime.registerProvider = (name, config) => {
+      if (providerActions && typeof providerActions.registerProvider === "function") providerActions.registerProvider(name, config);
+    };
+    this.runtime.unregisterProvider = (name) => {
+      if (providerActions && typeof providerActions.unregisterProvider === "function") providerActions.unregisterProvider(name);
+    };
+  }
+
+  bindCommandContext(actions = {}) { this.commandActions = actions || {}; }
+  setUIContext(uiContext) { this.uiContext = uiContext || {}; }
+  getUIContext() { return this.uiContext; }
+  hasUI() { return Object.keys(this.uiContext || {}).length > 0; }
+  getExtensionPaths() { return this.extensions.map((extension) => extension.path); }
+
+  getAllRegisteredTools() {
+    const byName = new Map();
+    for (const extension of this.extensions) {
+      for (const tool of extension.tools.values()) if (!byName.has(tool.definition.name)) byName.set(tool.definition.name, tool);
+    }
+    return [...byName.values()];
+  }
+
+  getToolDefinition(toolName) {
+    for (const extension of this.extensions) {
+      const tool = extension.tools.get(toolName);
+      if (tool) return tool.definition;
+    }
+    return undefined;
+  }
+
+  getFlags() {
+    const flags = new Map();
+    for (const extension of this.extensions) for (const [name, flag] of extension.flags) if (!flags.has(name)) flags.set(name, flag);
+    return flags;
+  }
+
+  setFlagValue(name, value) { this.runtime.flagValues.set(normalizeFlagName(name), value); }
+  getFlagValues() { return new Map(this.runtime.flagValues); }
+  getShortcuts() {
+    const shortcuts = new Map();
+    for (const extension of this.extensions) for (const [key, shortcut] of extension.shortcuts) shortcuts.set(key, shortcut);
+    return shortcuts;
+  }
+  getShortcutDiagnostics() { return []; }
+
+  invalidate(message) {
+    this.staleMessage ||= message || "This extension ctx is stale after session replacement or reload.";
+    this.runtime.invalidate(this.staleMessage);
+  }
+  assertActive() { if (this.staleMessage) throw new Error(this.staleMessage); }
+  onError(listener) { this.errorListeners.add(listener); return () => this.errorListeners.delete(listener); }
+  emitError(error) { for (const listener of this.errorListeners) listener(error); }
+  hasHandlers(eventType) { return this.extensions.some((extension) => (extension.handlers.get(eventType) || []).length > 0); }
+  getMessageRenderer(customType) {
+    for (const extension of this.extensions) {
+      const renderer = extension.messageRenderers.get(customType);
+      if (renderer) return renderer;
+    }
+    return undefined;
+  }
+
+  getRegisteredCommands() {
+    const commands = [];
+    for (const extension of this.extensions) for (const command of extension.commands.values()) commands.push(command);
+    const counts = new Map();
+    for (const command of commands) counts.set(command.name, (counts.get(command.name) || 0) + 1);
+    const seen = new Map();
+    return commands.map((command) => {
+      const occurrence = (seen.get(command.name) || 0) + 1;
+      seen.set(command.name, occurrence);
+      return { ...command, invocationName: counts.get(command.name) > 1 ? `${command.name}:${occurrence}` : command.name };
+    });
+  }
+  getCommandDiagnostics() { return []; }
+  getCommand(name) { return this.getRegisteredCommands().find((command) => command.invocationName === name); }
+  shutdown() { if (this.contextActions && typeof this.contextActions.shutdown === "function") this.contextActions.shutdown(); }
+
+  createContext() {
+    const runner = this;
+    return {
+      get ui() { runner.assertActive(); return runner.uiContext; },
+      get hasUI() { runner.assertActive(); return runner.hasUI(); },
+      get cwd() { runner.assertActive(); return runner.cwd; },
+      get sessionManager() { runner.assertActive(); return runner.sessionManager; },
+      get modelRegistry() { runner.assertActive(); return runner.modelRegistry; },
+      get model() { runner.assertActive(); return runner.contextActions && typeof runner.contextActions.getModel === "function" ? runner.contextActions.getModel() : undefined; },
+      isIdle: () => !runner.contextActions || typeof runner.contextActions.isIdle !== "function" || runner.contextActions.isIdle(),
+      get signal() { return runner.contextActions && typeof runner.contextActions.getSignal === "function" ? runner.contextActions.getSignal() : undefined; },
+      abort: () => runner.contextActions && typeof runner.contextActions.abort === "function" && runner.contextActions.abort(),
+      hasPendingMessages: () => !!(runner.contextActions && typeof runner.contextActions.hasPendingMessages === "function" && runner.contextActions.hasPendingMessages()),
+      shutdown: () => runner.shutdown(),
+      getContextUsage: () => runner.contextActions && typeof runner.contextActions.getContextUsage === "function" ? runner.contextActions.getContextUsage() : undefined,
+      compact: (options) => runner.contextActions && typeof runner.contextActions.compact === "function" && runner.contextActions.compact(options),
+      getSystemPrompt: () => runner.contextActions && typeof runner.contextActions.getSystemPrompt === "function" ? runner.contextActions.getSystemPrompt() : "",
+    };
+  }
+
+  createCommandContext() {
+    return { ...this.createContext(), waitForIdle: async () => {}, newSession: async () => ({ cancelled: false }), fork: async () => ({ cancelled: false }), navigateTree: async () => ({ cancelled: false }), switchSession: async () => ({ cancelled: false }), reload: async () => {} };
+  }
+
+  async emit(event) {
+    this.assertActive();
+    const handlers = [];
+    for (const extension of this.extensions) handlers.push(...(extension.handlers.get(event && event.type) || []));
+    let lastResult;
+    for (const handler of handlers) {
+      const result = await handler(event, this.createContext());
+      if (result !== undefined) lastResult = result;
+    }
+    return lastResult;
+  }
 }
 
 async function loadTools(extensionPath, flagValues = {}, context = {}) {
@@ -2729,7 +3105,7 @@ let ocaml_sdk_command path =
         | `String dir when String.trim dir <> "" ->
           let dir = Config_paths.expand_tilde (String.trim dir) in
           if Filename.is_relative dir then Filename.concat (Filename.dirname path) dir else dir
-        | _ -> Filename.dirname path
+        | _ -> Sys.getcwd ()
       in
       Printf.sprintf "cd %s && %s" (Filename.quote cwd) command
     | _ -> direct ())
@@ -3063,7 +3439,7 @@ let register_provider_models provider default_model models_json =
       models
   | _ -> ()
 
-let register_js_provider_runtime path provider_name runtime =
+let register_provider_runtime_for runtime_kind path provider_name runtime =
   Llm.register_provider_runtime runtime
     (fun cfg ~system ~on_text ~tools_enabled ?tool_names turns ->
       let tool_schemas =
@@ -3086,7 +3462,7 @@ let register_js_provider_runtime path provider_name runtime =
           | Some names -> [ ("toolNames", `List (List.map (fun name -> `String name) names)) ]
           | None -> [])
       in
-      match run_node_bridge request with
+      match run_extension_bridge runtime_kind path request with
       | Error msg -> raise (Llm.Api_error msg)
       | Ok json ->
         let blocks = content_blocks_from_json json in
@@ -3094,7 +3470,13 @@ let register_js_provider_runtime path provider_name runtime =
         let usage = usage_from_json (json |> member "usage") in
         (blocks, usage))
 
-let register_js_providers path json =
+let register_js_provider_runtime path provider_name runtime =
+  register_provider_runtime_for Node path provider_name runtime
+
+let register_ocaml_sdk_provider_runtime path provider_name runtime =
+  register_provider_runtime_for Ocaml_sdk path provider_name runtime
+
+let register_providers_for runtime_kind path json =
   match json |> member "providers" with
   | `List providers ->
     providers
@@ -3148,9 +3530,12 @@ let register_js_providers path json =
                if has_runtime then Some (provider_path ^ "#" ^ String.lowercase_ascii (String.trim name)) else None
              in
              Llm.register_provider ?runtime ~name ~aliases ~headers ~protocol ~base_url ~env_keys ~default_model ();
-             Option.iter (register_js_provider_runtime provider_path name) runtime;
+             Option.iter (register_provider_runtime_for runtime_kind provider_path name) runtime;
              register_provider_models (String.lowercase_ascii (String.trim name)) default_model (provider |> member "models"))
   | _ -> ()
+
+let register_js_providers path json = register_providers_for Node path json
+let register_ocaml_sdk_providers path json = register_providers_for Ocaml_sdk path json
 
 let () = apply_provider_registrations := register_js_providers "<runtime>"
 
@@ -3178,6 +3563,11 @@ let register_ocaml_sdk_tools path json =
       entries
   | _ -> []
 
+let register_ocaml_sdk_response path json =
+  register_ocaml_sdk_commands path json;
+  register_ocaml_sdk_providers path json;
+  register_ocaml_sdk_tools path json
+
 let optional_string name = function
   | Some value when String.trim value <> "" -> [ (name, `String value) ]
   | _ -> []
@@ -3200,31 +3590,34 @@ let session_payload ?current_session_file ?current_session_id ?current_session_n
     @ optional_string "position" position)
 
 let emit_session_start_for_path ?previous_session_file ?session_file ?session_id ?session_name ?(reason = "startup")
-    path =
+    runtime path =
   let payload =
     session_payload ?previous_session_file ?session_file ?session_id ?session_name "session_start" reason
   in
   match
-    run_node_bridge
+    run_extension_bridge runtime path
       (`Assoc [ ("mode", `String "event"); ("path", `String path); ("event", `String "session_start"); ("payload", payload) ])
   with
   | Error _ -> []
   | Ok json ->
-    register_js_commands path json;
-    register_js_shortcuts path json;
-    register_js_message_renderers path json;
-    register_js_providers path json;
-    register_js_tools path json
+    (match runtime with
+     | Node ->
+       register_js_commands path json;
+       register_js_shortcuts path json;
+       register_js_message_renderers path json;
+       register_js_providers path json;
+       register_js_tools path json
+     | Ocaml_sdk -> register_ocaml_sdk_response path json)
 
 let emit_session_start ?previous_session_file ?session_file ?session_id ?session_name ~reason () =
   let registered = ref [] in
-  !event_paths
+  all_event_targets ()
   |> List.rev
-  |> List.iter (fun (path, events) ->
+  |> List.iter (fun (runtime, path, events) ->
          if List.mem "session_start" events then
            registered :=
              !registered
-             @ emit_session_start_for_path ?previous_session_file ?session_file ?session_id ?session_name ~reason path);
+             @ emit_session_start_for_path ?previous_session_file ?session_file ?session_id ?session_name ~reason runtime path);
   !registered
 
 let json_string_list field json =
@@ -3248,12 +3641,12 @@ let emit_resources_discover ~reason () =
         ("cwd", `String (Sys.getcwd ()));
         ("reason", `String reason) ]
   in
-  !event_paths
+  all_event_targets ()
   |> List.rev
-  |> List.iter (fun (path, events) ->
+  |> List.iter (fun (runtime, path, events) ->
          if List.mem "resources_discover" events then
            match
-             run_node_bridge
+             run_extension_bridge runtime path
                (`Assoc
                  [ ("mode", `String "event");
                    ("path", `String path);
@@ -3294,7 +3687,7 @@ let load_js_extension ?(reason = "startup") path =
       in
       register_events path events;
       let names = register_js_tools path json in
-      if List.mem "session_start" events then names @ emit_session_start_for_path ~reason path else names
+      if List.mem "session_start" events then names @ emit_session_start_for_path ~reason Node path else names
 
 let load_ocaml_sdk_extension ?(reason = "startup") path =
   let request = `Assoc [ ("mode", `String "describe"); ("path", `String path); ("reason", `String reason) ] in
@@ -3304,7 +3697,15 @@ let load_ocaml_sdk_extension ?(reason = "startup") path =
     []
   | Ok json ->
     register_ocaml_sdk_commands path json;
-    register_ocaml_sdk_tools path json
+    register_ocaml_sdk_providers path json;
+    let events =
+      match json |> member "events" with
+      | `List xs -> List.filter_map (function `String s -> Some s | _ -> None) xs
+      | _ -> []
+    in
+    register_events ~runtime:Ocaml_sdk path events;
+    let names = register_ocaml_sdk_tools path json in
+    if List.mem "session_start" events then names @ emit_session_start_for_path ~reason Ocaml_sdk path else names
 
 let load_path ?(reason = "startup") path =
   if is_json_file path then load_manifest path
@@ -3321,6 +3722,7 @@ let load ?(reason = "startup") () : string list =
   shortcut_registry := [];
   message_renderer_registry := [];
   event_paths := [];
+  ocaml_event_paths := [];
   js_extension_paths := [];
   discovered_skill_paths := [];
   discovered_prompt_paths := [];
@@ -3865,19 +4267,20 @@ let content_text json =
     if texts = [] then None else Some (String.concat "\n" texts)
   | _ -> None
 
-let emit_event path event payload =
-  run_node_bridge (`Assoc [ ("mode", `String "event"); ("path", `String path); ("event", `String event); ("payload", payload) ])
+let emit_event runtime path event payload =
+  run_extension_bridge runtime path
+    (`Assoc [ ("mode", `String "event"); ("path", `String path); ("event", `String event); ("payload", payload) ])
 
 let emit_before_provider_request payload =
   let current = ref payload in
-  !event_paths
+  all_event_targets ()
   |> List.rev
-  |> List.iter (fun (path, events) ->
+  |> List.iter (fun (runtime, path, events) ->
          if List.mem "before_provider_request" events then
            let event_payload =
              `Assoc [ ("type", `String "before_provider_request"); ("payload", !current) ]
            in
-           match emit_event path "before_provider_request" event_payload with
+           match emit_event runtime path "before_provider_request" event_payload with
            | Ok json -> (
              match json |> member "result" with
              | `Null -> ()
@@ -3910,10 +4313,10 @@ let turns_from_json = function
   | _ -> []
 
 let emit_notification event payload =
-  !event_paths
+  all_event_targets ()
   |> List.rev
-  |> List.iter (fun (path, events) ->
-         if List.mem event events then ignore (emit_event path event payload))
+  |> List.iter (fun (runtime, path, events) ->
+         if List.mem event events then ignore (emit_event runtime path event payload))
 
 let emit_after_provider_response ~status ~headers =
   emit_notification "after_provider_response"
@@ -3978,11 +4381,11 @@ let summary_from_json json =
 let session_before event payload =
   let decision = ref Session_continue in
   let cancelled () = match !decision with Session_cancel _ -> true | Session_continue -> false in
-  !event_paths
+  all_event_targets ()
   |> List.rev
-  |> List.iter (fun (path, events) ->
+  |> List.iter (fun (runtime, path, events) ->
          if (not (cancelled ())) && List.mem event events then
-           match emit_event path event payload with
+           match emit_event runtime path event payload with
            | Error _ -> ()
            | Ok json ->
              let result_cancel = cancellation_from_json (json |> member "result") in
@@ -4046,11 +4449,11 @@ let emit_session_before_tree ~target_id ?old_leaf_id ?common_ancestor_id ?label 
         tree_replace_instructions = None }
   in
   let cancelled () = Option.is_some (!result).tree_cancel in
-  !event_paths
+  all_event_targets ()
   |> List.rev
-  |> List.iter (fun (path, events) ->
+  |> List.iter (fun (runtime, path, events) ->
          if (not (cancelled ())) && List.mem "session_before_tree" events then
-           match emit_event path "session_before_tree" payload with
+           match emit_event runtime path "session_before_tree" payload with
            | Error _ -> ()
            | Ok json ->
              let event =
@@ -4181,12 +4584,12 @@ let emit_model_select ?(source = "set") ~(previous_model : Llm.config option) (c
 
 let emit_context messages =
   let current = ref messages in
-  !event_paths
+  all_event_targets ()
   |> List.rev
-  |> List.iter (fun (path, events) ->
+  |> List.iter (fun (runtime, path, events) ->
          if List.mem "context" events then
            let payload = `Assoc [ ("type", `String "context"); ("messages", `List (List.map Llm.turn_to_json !current)) ] in
-           match emit_event path "context" payload with
+           match emit_event runtime path "context" payload with
            | Error _ -> ()
            | Ok json ->
              let next =
@@ -4217,9 +4620,9 @@ type before_agent_start_result =
 let emit_before_agent_start ~prompt ~system_prompt =
   let current_system_prompt = ref system_prompt in
   let injected = ref [] in
-  !event_paths
+  all_event_targets ()
   |> List.rev
-  |> List.iter (fun (path, events) ->
+  |> List.iter (fun (runtime, path, events) ->
          if List.mem "before_agent_start" events then
            let payload =
              `Assoc
@@ -4233,7 +4636,7 @@ let emit_before_agent_start ~prompt ~system_prompt =
                        ("skills", `List []);
                        ("selectedTools", `List []) ] ) ]
            in
-           match emit_event path "before_agent_start" payload with
+           match emit_event runtime path "before_agent_start" payload with
            | Error _ -> ()
            | Ok json -> (
              let result =
@@ -4285,12 +4688,12 @@ let emit_message_update ?(delta = "") turn =
 
 let emit_message_end turn =
   let current = ref turn in
-  !event_paths
+  all_event_targets ()
   |> List.rev
-  |> List.iter (fun (path, events) ->
+  |> List.iter (fun (runtime, path, events) ->
          if List.mem "message_end" events then
            let payload = `Assoc [ ("type", `String "message_end"); ("message", Llm.turn_to_json !current) ] in
-           match emit_event path "message_end" payload with
+           match emit_event runtime path "message_end" payload with
            | Error _ -> ()
            | Ok json -> (
              let result_message =
@@ -4345,9 +4748,9 @@ let emit_tool_execution_end ~tool_call_id ~tool_name ~result ~is_error =
 let emit_tool_call ~tool_call_id ~tool_name input =
   let input = ref input in
   let blocked = ref None in
-  !event_paths
+  all_event_targets ()
   |> List.rev
-  |> List.iter (fun (path, events) ->
+  |> List.iter (fun (runtime, path, events) ->
          if !blocked = None && List.mem "tool_call" events then
            let payload =
              `Assoc
@@ -4356,7 +4759,7 @@ let emit_tool_call ~tool_call_id ~tool_name input =
                  ("toolName", `String (Tools.wire_name tool_name));
                  ("input", !input) ]
            in
-           match emit_event path "tool_call" payload with
+           match emit_event runtime path "tool_call" payload with
            | Error msg -> blocked := Some ("Extension failed, blocking execution: " ^ msg)
            | Ok json ->
              (match json |> member "event" |> member "input" with
@@ -4376,9 +4779,9 @@ let emit_tool_call ~tool_call_id ~tool_name input =
 
 let emit_tool_result ~tool_call_id ~tool_name ~input result =
   let result_text = ref result in
-  !event_paths
+  all_event_targets ()
   |> List.rev
-  |> List.iter (fun (path, events) ->
+  |> List.iter (fun (runtime, path, events) ->
          if List.mem "tool_result" events then
            let payload =
              `Assoc
@@ -4389,7 +4792,7 @@ let emit_tool_result ~tool_call_id ~tool_name ~input result =
                  ("content", `List [ `Assoc [ ("type", `String "text"); ("text", `String !result_text) ] ]);
                  ("isError", `Bool (String.length !result_text >= 6 && String.sub !result_text 0 6 = "Error:")) ]
            in
-           match emit_event path "tool_result" payload with
+           match emit_event runtime path "tool_result" payload with
            | Error _ -> ()
           | Ok json -> (
              match json |> member "result" |> member "content" |> content_text with
@@ -4403,9 +4806,9 @@ let emit_tool_result ~tool_call_id ~tool_name ~input result =
 let emit_input ?(source = "interactive") text =
   let text = ref text in
   let handled = ref false in
-  !event_paths
+  all_event_targets ()
   |> List.rev
-  |> List.iter (fun (path, events) ->
+  |> List.iter (fun (runtime, path, events) ->
          if (not !handled) && List.mem "input" events then
            let payload =
              `Assoc
@@ -4413,7 +4816,7 @@ let emit_input ?(source = "interactive") text =
                  ("text", `String !text);
                  ("source", `String source) ]
            in
-           match emit_event path "input" payload with
+           match emit_event runtime path "input" payload with
            | Error _ -> ()
            | Ok json -> (
              let result =
@@ -4470,9 +4873,9 @@ let bash_result json =
 
 let emit_user_bash ~command ~exclude_from_context =
   let replacement = ref None in
-  !event_paths
+  all_event_targets ()
   |> List.rev
-  |> List.iter (fun (path, events) ->
+  |> List.iter (fun (runtime, path, events) ->
          if !replacement = None && List.mem "user_bash" events then
            let payload =
              `Assoc
@@ -4482,7 +4885,7 @@ let emit_user_bash ~command ~exclude_from_context =
                  ("cwd", `String (Sys.getcwd ())) ]
            in
            match
-             run_node_bridge
+             run_extension_bridge runtime path
                (`Assoc
                  [ ("mode", `String "event");
                    ("path", `String path);

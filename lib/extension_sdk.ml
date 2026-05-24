@@ -236,7 +236,7 @@ let execute_event request =
              last_result := result;
              (match event_name, result with
               | "before_provider_request", replacement -> current_event := replacement
-              | "input", `Assoc _ as obj when member "action" obj = `String "transform" -> (
+              | "input", ((`Assoc _) as obj) when member "action" obj = `String "transform" -> (
                 match member "text" obj with
                 | `String text -> current_event := `Assoc [ ("type", `String "input"); ("text", `String text) ]
                 | _ -> ())
