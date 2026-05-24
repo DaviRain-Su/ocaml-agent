@@ -13,6 +13,18 @@ type command =
     complete : (string -> string list) option;
     handler : string -> Yojson.Safe.t }
 
+type shortcut =
+  { spec : string;
+    description : string;
+    command : string option;
+    handler : (Yojson.Safe.t -> Yojson.Safe.t) option }
+
+type message_renderer =
+  { name : string;
+    description : string;
+    target : string;
+    render : Yojson.Safe.t -> Yojson.Safe.t }
+
 type provider =
   { provider_name : string;
     aliases : string list;
@@ -25,6 +37,8 @@ type provider =
 
 let tools : tool list ref = ref []
 let commands : command list ref = ref []
+let shortcuts : shortcut list ref = ref []
+let message_renderers : message_renderer list ref = ref []
 let providers : provider list ref = ref []
 let hooks : (string * (Yojson.Safe.t -> Yojson.Safe.t option)) list ref = ref []
 
@@ -62,6 +76,40 @@ let register_command_response ?argument_hint ?complete ~name ~description ~handl
     commands :=
       { name; description; argument_hint; complete; handler }
       :: List.filter (fun (command : command) -> command.name <> name) !commands
+
+let normalize_shortcut_spec spec =
+  let spec = String.lowercase_ascii (String.trim spec) in
+  let spec =
+    if String.length spec >= 2 && String.sub spec 0 2 = "c-" then "ctrl+" ^ String.sub spec 2 (String.length spec - 2)
+    else if String.length spec >= 8 && String.sub spec 0 8 = "control+" then
+      "ctrl+" ^ String.sub spec 8 (String.length spec - 8)
+    else spec
+  in
+  spec |> String.split_on_char ' ' |> String.concat ""
+
+let register_shortcut ?command ?handler ~spec ~description () =
+  let spec = normalize_shortcut_spec spec in
+  if spec <> "" then
+    shortcuts :=
+      { spec; description; command; handler = Option.map (fun handler event -> ok [ ("text", `String (handler event)) ]) handler }
+      :: List.filter (fun (shortcut : shortcut) -> shortcut.spec <> spec) !shortcuts
+
+let register_shortcut_response ?command ?handler ~spec ~description () =
+  let spec = normalize_shortcut_spec spec in
+  if spec <> "" then
+    shortcuts :=
+      { spec; description; command; handler }
+      :: List.filter (fun (shortcut : shortcut) -> shortcut.spec <> spec) !shortcuts
+
+let register_message_renderer_response ?(target = "all") ~name ~description ~render () =
+  let name = String.trim name in
+  if name <> "" then
+    message_renderers :=
+      { name; description; target; render }
+      :: List.filter (fun (renderer : message_renderer) -> renderer.name <> name) !message_renderers
+
+let register_message_renderer ?(target = "all") ~name ~description ~render () =
+  register_message_renderer_response ~target ~name ~description ~render:(fun event -> ok [ ("text", `String (render event)) ]) ()
 
 let register_provider ?(aliases = []) ?base_url ?(env_keys = []) ?(models = []) ?(protocol = "openai")
     ~name ~default_model ~complete () =
@@ -108,6 +156,22 @@ let command_json (command : command) =
     | Some hint when String.trim hint <> "" -> [ ("argumentHint", `String hint) ]
     | _ -> [])
 
+let shortcut_json (shortcut : shortcut) =
+  `Assoc
+    ([ ("spec", `String shortcut.spec);
+       ("description", `String shortcut.description);
+       ("hasHandler", `Bool (Option.is_some shortcut.handler)) ]
+    @
+    match shortcut.command with
+    | Some command when String.trim command <> "" -> [ ("command", `String command) ]
+    | _ -> [])
+
+let message_renderer_json (renderer : message_renderer) =
+  `Assoc
+    [ ("name", `String renderer.name);
+      ("description", `String renderer.description);
+      ("target", `String renderer.target) ]
+
 let provider_json (provider : provider) =
   `Assoc
     ([ ("name", `String provider.provider_name);
@@ -145,6 +209,8 @@ let describe () =
   ok
     [ ("tools", `List (List.rev_map tool_json !tools));
       ("commands", `List (List.rev_map command_json !commands));
+      ("shortcuts", `List (List.rev_map shortcut_json !shortcuts));
+      ("renderers", `List (List.rev_map message_renderer_json !message_renderers));
       ("providers", `List (List.rev_map provider_json !providers));
       ("events", `List (List.map (fun event -> `String event) (registered_events ()))) ]
 
@@ -208,6 +274,78 @@ let command_completions request =
     | Some _ | None -> ok [ ("items", `List []) ])
   | _ -> error "missing command"
 
+let execute_shortcut request =
+  match request |> member "shortcut" with
+  | `String spec -> (
+    let spec = normalize_shortcut_spec spec in
+    match List.find_opt (fun (shortcut : shortcut) -> shortcut.spec = spec) !shortcuts with
+    | None -> error ("shortcut not registered: " ^ spec)
+    | Some { command = Some command; _ } -> ok [ ("command", `String command) ]
+    | Some { handler = Some handler; _ } -> (
+      try handler request with e -> error (Printexc.to_string e))
+    | Some _ -> ok [ ("text", `String "") ])
+  | _ -> error "missing shortcut"
+
+let content_text json =
+  match json with
+  | `String s -> Some s
+  | `List xs ->
+    let texts =
+      xs
+      |> List.filter_map (function
+             | `String s -> Some s
+             | `Assoc _ as obj -> (
+               match obj |> member "type", obj |> member "text" with
+               | `String "text", `String s -> Some s
+               | _ -> None)
+             | _ -> None)
+    in
+    if texts = [] then None else Some (String.concat "\n" texts)
+  | _ -> None
+
+let render_text_from_response json fallback =
+  match json |> member "text" with
+  | `String s -> s
+  | _ -> (
+    match json |> member "content" |> content_text with
+    | Some s -> s
+    | None -> fallback)
+
+let execute_render request =
+  let kind =
+    match request |> member "kind" with
+    | `String s when String.trim s <> "" -> s
+    | _ -> "message"
+  in
+  let current =
+    ref
+      (match request |> member "text" with
+       | `String s -> s
+       | _ -> "")
+  in
+  let components = ref [] in
+  !message_renderers
+  |> List.rev
+  |> List.iter (fun renderer ->
+         if renderer.target = "all" || renderer.target = kind then
+           let event =
+             `Assoc
+               [ ("type", `String "message_renderer");
+                 ("kind", `String kind);
+                 ("role", request |> member "role");
+                 ("toolName", request |> member "toolName");
+                 ("text", `String !current);
+                 ("content", `List [ `Assoc [ ("type", `String "text"); ("text", `String !current) ] ]);
+                 ("message", request |> member "message") ]
+           in
+           match renderer.render event with
+           | `Assoc _ as result ->
+             (match result |> member "components" with `List xs -> components := !components @ xs | _ -> ());
+             current := render_text_from_response result !current
+           | `String s -> current := s
+           | other -> current := render_text_from_response other !current);
+  ok [ ("text", `String !current); ("components", `List !components) ]
+
 let execute_provider request =
   match request |> member "provider" with
   | `String name -> (
@@ -260,6 +398,8 @@ let handle request =
   | `String "execute" -> execute_tool request
   | `String "command" -> execute_command request
   | `String "command_completions" -> command_completions request
+  | `String "shortcut" -> execute_shortcut request
+  | `String "render" -> execute_render request
   | `String "provider" -> execute_provider request
   | `String "event" -> execute_event request
   | `String mode -> error ("unknown mode: " ^ mode)

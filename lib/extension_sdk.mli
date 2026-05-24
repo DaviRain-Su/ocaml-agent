@@ -1,5 +1,7 @@
 type tool
 type command
+type shortcut
+type message_renderer
 type provider
 
 val empty_parameters : Yojson.Safe.t
@@ -37,6 +39,38 @@ val register_command_response :
   name:string ->
   description:string ->
   handler:(string -> Yojson.Safe.t) ->
+  unit ->
+  unit
+
+val register_shortcut :
+  ?command:string ->
+  ?handler:(Yojson.Safe.t -> string) ->
+  spec:string ->
+  description:string ->
+  unit ->
+  unit
+
+val register_shortcut_response :
+  ?command:string ->
+  ?handler:(Yojson.Safe.t -> Yojson.Safe.t) ->
+  spec:string ->
+  description:string ->
+  unit ->
+  unit
+
+val register_message_renderer :
+  ?target:string ->
+  name:string ->
+  description:string ->
+  render:(Yojson.Safe.t -> string) ->
+  unit ->
+  unit
+
+val register_message_renderer_response :
+  ?target:string ->
+  name:string ->
+  description:string ->
+  render:(Yojson.Safe.t -> Yojson.Safe.t) ->
   unit ->
   unit
 

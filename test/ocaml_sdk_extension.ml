@@ -45,6 +45,21 @@ let () =
              ())
         "ui ok")
     ();
+  Extension_sdk.register_shortcut ~spec:"ctrl+o" ~description:"Run an OCaml SDK shortcut"
+    ~handler:(fun _event -> "ocaml shortcut")
+    ();
+  Extension_sdk.register_shortcut ~spec:"ctrl+p" ~description:"Run an OCaml SDK command shortcut"
+    ~command:"/ocamlhello Shortcut"
+    ();
+  Extension_sdk.register_message_renderer ~name:"ocaml-native-renderer" ~description:"Render OCaml-native messages"
+    ~target:"ocaml_native"
+    ~render:(fun event ->
+      "ocaml-render:"
+      ^
+      match Yojson.Safe.Util.member "text" event with
+      | `String s -> s
+      | _ -> "")
+    ();
   Extension_sdk.register_provider ~name:"ocamlai" ~aliases:[ "ocaml-runtime" ] ~default_model:"ocaml-small"
     ~models:[ `Assoc [ ("id", `String "ocaml-small"); ("contextWindow", `Int 4321) ] ]
     ~complete:(fun request ->

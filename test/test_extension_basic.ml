@@ -136,6 +136,18 @@ let () =
           && List.assoc_opt "key" fields = Some (`String "ocaml")
         | _ -> false)
      | None -> false);
+  check "OCaml SDK extension shortcut appears in hotkeys"
+    (List.mem_assoc "ctrl+o" (Extensions.shortcut_menu ()));
+  check "OCaml SDK extension shortcut executes without Node bridge"
+    (match Extensions.execute_shortcut "C-o" with
+     | Some (Extensions.Shortcut_output output) -> output = "ocaml shortcut"
+     | _ -> false);
+  check "OCaml SDK extension command shortcut resolves locally"
+    (match Extensions.execute_shortcut "ctrl+p" with
+     | Some (Extensions.Shortcut_command command) -> command = "/ocamlhello Shortcut"
+     | _ -> false);
+  check "OCaml SDK extension message renderer transforms text"
+    (Extensions.render_text ~kind:"ocaml_native" ~role:"assistant" "hello" = "ocaml-render:hello");
   check "OCaml SDK extension before_provider_request mutates payload"
     (let mutated = Llm.apply_provider_request_hooks (j {|{"model":"base"}|}) in
      Yojson.Safe.Util.member "ocamlHooked" mutated = `Bool true);

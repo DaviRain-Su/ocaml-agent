@@ -31,6 +31,7 @@ type shortcut =
   { spec : string;
     description : string;
     path : string;
+    runtime : extension_runtime;
     command : string option;
     has_handler : bool }
 
@@ -77,7 +78,8 @@ type message_renderer =
   { name : string;
     description : string;
     target : string;
-    path : string }
+    path : string;
+    runtime : extension_runtime }
 
 type tool_call_result =
   | Tool_continue of Yojson.Safe.t
@@ -413,7 +415,7 @@ let normalize_shortcut_spec spec =
   in
   spec |> String.split_on_char ' ' |> String.concat ""
 
-let js_shortcut_of_json path (j : Yojson.Safe.t) : shortcut option =
+let shortcut_of_json runtime path (j : Yojson.Safe.t) : shortcut option =
   match j |> member "spec" with
   | `String spec when String.trim spec <> "" ->
     let spec = normalize_shortcut_spec spec in
@@ -428,10 +430,13 @@ let js_shortcut_of_json path (j : Yojson.Safe.t) : shortcut option =
       | _ -> None
     in
     let has_handler = match j |> member "hasHandler" with `Bool b -> b | _ -> false in
-    Some { spec; description; path; command; has_handler }
+    Some { spec; description; path; runtime; command; has_handler }
   | _ -> None
 
-let js_message_renderer_of_json path (j : Yojson.Safe.t) : message_renderer option =
+let js_shortcut_of_json path = shortcut_of_json Node path
+let ocaml_sdk_shortcut_of_json path = shortcut_of_json Ocaml_sdk path
+
+let message_renderer_of_json runtime path (j : Yojson.Safe.t) : message_renderer option =
   match j |> member "name" with
   | `String name when String.trim name <> "" ->
     let description =
@@ -447,8 +452,11 @@ let js_message_renderer_of_json path (j : Yojson.Safe.t) : message_renderer opti
         | `String s when String.trim s <> "" -> String.trim s
         | _ -> "all")
     in
-    Some { name = String.trim name; description; target; path }
+    Some { name = String.trim name; description; target; path; runtime }
   | _ -> None
+
+let js_message_renderer_of_json path = message_renderer_of_json Node path
+let ocaml_sdk_message_renderer_of_json path = message_renderer_of_json Ocaml_sdk path
 
 let register_command (cmd : command) =
   command_registry := cmd :: List.filter (fun (c : command) -> c.name <> cmd.name) !command_registry
@@ -526,11 +534,27 @@ let register_js_shortcuts path json =
     |> List.iter register_shortcut
   | _ -> ()
 
+let register_ocaml_sdk_shortcuts path json =
+  match json |> member "shortcuts" with
+  | `List xs ->
+    xs
+    |> List.filter_map (ocaml_sdk_shortcut_of_json path)
+    |> List.iter register_shortcut
+  | _ -> ()
+
 let register_js_message_renderers path json =
   match json |> member "renderers" with
   | `List xs ->
     xs
     |> List.filter_map (js_message_renderer_of_json path)
+    |> List.iter register_message_renderer
+  | _ -> ()
+
+let register_ocaml_sdk_message_renderers path json =
+  match json |> member "renderers" with
+  | `List xs ->
+    xs
+    |> List.filter_map (ocaml_sdk_message_renderer_of_json path)
     |> List.iter register_message_renderer
   | _ -> ()
 
@@ -734,6 +758,8 @@ let register_ocaml_sdk_tools path json =
 
 let register_ocaml_sdk_response path json =
   register_ocaml_sdk_commands path json;
+  register_ocaml_sdk_shortcuts path json;
+  register_ocaml_sdk_message_renderers path json;
   register_ocaml_sdk_providers path json;
   register_ocaml_sdk_tools path json
 
@@ -834,6 +860,8 @@ let load_ocaml_sdk_extension ?(reason = "startup") path =
     []
   | Ok json ->
     register_ocaml_sdk_commands path json;
+    register_ocaml_sdk_shortcuts path json;
+    register_ocaml_sdk_message_renderers path json;
     register_ocaml_sdk_providers path json;
     let events =
       match json |> member "events" with
@@ -1179,18 +1207,21 @@ let execute_shortcut_response ?session_name ?session_context ?themes ?theme_name
   match List.find_opt (fun s -> s.spec = spec) !shortcut_registry with
   | None -> None
   | Some shortcut ->
-    let request =
-      `Assoc
-        (add_runtime_context ?session_name ?session_context ?themes ?theme_name ?model ?models ?commands ?context_usage ?system_prompt ?has_ui
-           ?is_idle ?has_pending_messages ?tools_expanded
-           [ ("mode", `String "shortcut");
-             ("path", `String shortcut.path);
-             ("shortcut", `String shortcut.spec) ])
-    in
     Some
-      (match run_node_bridge request with
-       | Ok json -> (
-         match json |> member "command", json |> member "text" with
+      (match shortcut.command with
+       | Some command -> Shortcut_response_command command
+       | None ->
+         let request =
+           `Assoc
+             (add_runtime_context ?session_name ?session_context ?themes ?theme_name ?model ?models ?commands ?context_usage
+                ?system_prompt ?has_ui ?is_idle ?has_pending_messages ?tools_expanded
+                [ ("mode", `String "shortcut");
+                  ("path", `String shortcut.path);
+                  ("shortcut", `String shortcut.spec) ])
+         in
+         match run_extension_bridge shortcut.runtime shortcut.path request with
+         | Ok json -> (
+           match json |> member "command", json |> member "text" with
          | `String command, _ -> Shortcut_response_command command
          | _, `String _ -> Shortcut_response_output (text_response json)
          | _ ->
@@ -1206,9 +1237,9 @@ let execute_shortcut_response ?session_name ?session_context ?themes ?theme_name
                abort_requested = false;
                shutdown_requested = false;
                compact_requests = [];
-               reload_requested = false;
-               session_actions = [] })
-       | Error msg -> Shortcut_response_output (error_command_response ("Error: " ^ msg)))
+                 reload_requested = false;
+                 session_actions = [] })
+         | Error msg -> Shortcut_response_output (error_command_response ("Error: " ^ msg)))
 
 let execute_shortcut spec =
   match execute_shortcut_response spec with
@@ -1236,7 +1267,7 @@ let render_response ?(role = "") ?(tool_name = "") ~kind text =
                    ("toolName", `String tool_name);
                    ("text", `String !current) ]
              in
-             match run_node_bridge request with
+             match run_extension_bridge renderer.runtime renderer.path request with
              | Ok json -> (
                let response = render_response_of_json json in
                collected_components := !collected_components @ response.components;
