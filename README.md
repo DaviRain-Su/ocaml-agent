@@ -424,7 +424,16 @@ programmatic extension composition. Tool factory exports such as
 `createReadTool()`, `createBashTool()`, `createCodingTools()`,
 `createReadToolDefinition()`, and truncation helpers are available for
 extensions that need Pi-compatible built-in tool instances with custom
-operations. Custom UI surface calls such as status, widget, title,
+operations. `SessionManager.list()` / `listAll()`, `AuthStorage`,
+`ModelRegistry`, `SettingsManager`, skills helpers, `createSyntheticSourceInfo`,
+`DefaultResourceLoader`, `DefaultPackageManager`, `loadProjectContextFiles()`,
+compaction helpers such as `estimateTokens()` / `findCutPoint()`, frontmatter,
+shell, clipboard, image-dimension, theme utilities, programmatic SDK helpers
+such as `createAgentSession()`, `createAgentSessionRuntime()`, `RpcClient`,
+renderable interactive components, `getAgentDir()`, and `VERSION` are also
+exported for session discovery, SDK storage, model catalog access, resource
+loading, and Pi-style package metadata.
+Custom UI surface calls such as status, widget, title,
 header/footer, editor text, paste, and working-state updates are captured for
 terminal and RPC adapters. TUI working message, visibility, and indicator
 settings drive the active turn status row. Component factories that can render

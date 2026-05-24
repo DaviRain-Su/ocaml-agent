@@ -15,28 +15,35 @@ module Transport : sig
       post_json : url:string -> headers:string list -> Yojson.Safe.t -> Yojson.Safe.t }
 end
 
+(* Tool definitions and registries. Declared before [Llm] because a client's
+   tool registry ([Llm.client_tools]) has type [Tools.registry]. *)
+module Tools : module type of Tools
+
 (* Provider-agnostic LLM layer: normalized conversation types, configuration,
    provider registry, and the streaming [complete] entry point. *)
 module Llm : sig
+  (* Re-exported with manifest equations (type t = Llm.t = ...) so these are the
+     same types/exceptions the rest of the library uses — required for interop
+     with [Agent], and so callers can construct/match the constructors. *)
   exception Config_error of string
   exception Api_error of string
 
-  type content =
+  type content = Llm.content =
     | Text of string
     | Image of { mime_type : string; data : string }
     | Thinking of { text : string; signature : string }
     | Tool_use of { id : string; name : string; input : Yojson.Safe.t }
     | Tool_result of { id : string; content : string }
 
-  type role = User | Assistant
-  type turn = { role : role; content : content list }
-  type usage = { input_tokens : int; output_tokens : int }
+  type role = Llm.role = User | Assistant
+  type turn = Llm.turn = { role : role; content : content list }
+  type usage = Llm.usage = { input_tokens : int; output_tokens : int }
 
   val zero_usage : usage
 
-  type provider = Anthropic | Openai
+  type provider = Llm.provider = Anthropic | Openai
 
-  type config =
+  type config = Llm.config =
     { provider : provider;
       base_url : string;
       api_key : string;
@@ -46,19 +53,17 @@ module Llm : sig
       runtime : string option;
       thinking : string }
 
-  type runtime_complete =
-    config ->
-    system:string ->
-    on_text:(string -> unit) ->
-    tools_enabled:bool ->
-    ?tool_names:string list ->
-    turn list ->
-    content list * usage
+  type runtime_complete = Llm.runtime_complete
 
-  type client
+  (* Manifest alias (not abstract) so this is the same type the [Agent] module
+     consumes — Agent.create ?client expects exactly [Llm.client]. *)
+  type client = Llm.client
 
   val create_client : unit -> client
   val default_client : client
+
+  (* The client's tool registry (e.g. to register tools into a specific client). *)
+  val client_tools : client -> Tools.registry
 
   (* --- pure construction (no env/disk/registry reads) --- *)
 
@@ -135,6 +140,5 @@ module Llm : sig
     content list * usage
 end
 
-module Tools : module type of Tools
 module Agent : module type of Agent
 module Extension_sdk : module type of Extension_sdk

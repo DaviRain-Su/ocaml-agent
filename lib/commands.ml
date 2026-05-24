@@ -241,7 +241,7 @@ let summary_text_entry entry =
   let member name = Yojson.Safe.Util.member name entry in
   match member "type" with
   | `String "message" -> (
-    try transcript_of_turn (Llm.turn_of_json (member "message")) with _ -> None)
+    try transcript_of_turn (Llm.turn_of_json (member "message")) with Sys.Break as e -> raise e | _ -> None)
   | `String "custom_message" -> (
     match content_json_text (member "content") with
     | Some text -> Some ("custom: " ^ text)
@@ -600,15 +600,21 @@ let import_session agent path =
       adopt_with_events agent ~reason:"import" ~turns session;
       Printf.sprintf "Imported %s into session %s (%d turns)" path session.Session.id (List.length turns))
 
+let max_file_bytes = 1024 * 1024
+
 let read_file path =
   let ic = open_in_bin path in
   Fun.protect
     ~finally:(fun () -> close_in_noerr ic)
-    (fun () -> really_input_string ic (in_channel_length ic))
+    (fun () ->
+       let total = in_channel_length ic in
+       let len = min max_file_bytes total in
+       let s = really_input_string ic len in
+       if total > max_file_bytes then s ^ "\n... (truncated)" else s)
 
 let changelog () =
   if Sys.file_exists "CHANGELOG.md" && not (Sys.is_directory "CHANGELOG.md") then
-    try read_file "CHANGELOG.md" with _ -> "Failed to read CHANGELOG.md."
+    try read_file "CHANGELOG.md" with Sys.Break as e -> raise e | _ -> "Failed to read CHANGELOG.md."
   else "No changelog entries found."
 
 let hotkeys () =
@@ -659,12 +665,17 @@ let copy agent =
     match List.find_opt command_exists clipboard_commands with
     | None -> "Clipboard copy failed (no clipboard tool found; install pbcopy, xclip, xsel, or wl-copy)."
     | Some cmd -> (
+      let ok = ref false in
       try
         let oc = Unix.open_process_out cmd in
         Fun.protect
-          ~finally:(fun () -> ignore (Unix.close_process_out oc))
+          ~finally:(fun () ->
+            match Unix.close_process_out oc with
+            | Unix.WEXITED 0 -> ok := true
+            | _ -> ())
           (fun () -> output_string oc text);
-        "Copied last reply to clipboard."
+        if !ok then "Copied last reply to clipboard."
+        else Printf.sprintf "Clipboard copy failed (%s)." cmd
       with
       | Sys.Break as e -> raise e
       | _ -> Printf.sprintf "Clipboard copy failed (%s)." cmd))

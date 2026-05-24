@@ -244,33 +244,39 @@ let run_node_bridge request =
   let code, body = Tools.run_process ~stdin_data:(Yojson.Safe.to_string request) command in
   if code <> 0 then Error (Printf.sprintf "node bridge exited %d: %s" code body)
   else
-    match Yojson.Safe.from_string body with
-    | `Assoc _ as json -> (
-      match bridge_json_result body json with
-      | Ok json ->
-        apply_runtime_state_from_json json;
-        Ok json
-      | Error _ as error -> error)
-    | _ -> Error body
-    | exception e -> Error (Printexc.to_string e ^ ": " ^ body)
+    try
+      match Yojson.Safe.from_string body with
+      | `Assoc _ as json -> (
+        match bridge_json_result body json with
+        | Ok json ->
+          apply_runtime_state_from_json json;
+          Ok json
+        | Error _ as error -> error)
+      | _ -> Error body
+    with
+    | Sys.Break as e -> raise e
+    | e -> Error (Printexc.to_string e ^ ": " ^ body)
 
 let ocaml_sdk_command path =
   let direct () = Filename.quote path in
-  match Yojson.Safe.from_file path with
-  | `Assoc _ as json -> (
-    match json |> member "command" with
-    | `String command when String.trim command <> "" ->
-      let cwd =
-        match json |> member "cwd" with
-        | `String dir when String.trim dir <> "" ->
-          let dir = Config_paths.expand_tilde (String.trim dir) in
-          if Filename.is_relative dir then Filename.concat (Filename.dirname path) dir else dir
-        | _ -> Sys.getcwd ()
-      in
-      Printf.sprintf "cd %s && %s" (Filename.quote cwd) command
-    | _ -> direct ())
+  try
+    match Yojson.Safe.from_file path with
+    | `Assoc _ as json -> (
+      match json |> member "command" with
+      | `String command when String.trim command <> "" ->
+        let cwd =
+          match json |> member "cwd" with
+          | `String dir when String.trim dir <> "" ->
+            let dir = Config_paths.expand_tilde (String.trim dir) in
+            if Filename.is_relative dir then Filename.concat (Filename.dirname path) dir else dir
+          | _ -> Sys.getcwd ()
+        in
+        Printf.sprintf "cd %s && %s" (Filename.quote cwd) command
+      | _ -> direct ())
+    | _ -> direct ()
+  with
+  | Sys.Break as e -> raise e
   | _ -> direct ()
-  | exception _ -> direct ()
 
 let run_ocaml_sdk_bridge path request =
   let request = bridge_request_context request in
@@ -278,15 +284,18 @@ let run_ocaml_sdk_bridge path request =
   let code, body = Tools.run_process ~stdin_data:(Yojson.Safe.to_string request) command in
   if code <> 0 then Error (Printf.sprintf "OCaml extension exited %d: %s" code body)
   else
-    match Yojson.Safe.from_string body with
-    | `Assoc _ as json -> (
-      match bridge_json_result body json with
-      | Ok json ->
-        apply_runtime_state_from_json json;
-        Ok json
-      | Error _ as error -> error)
-    | _ -> Error body
-    | exception e -> Error (Printexc.to_string e ^ ": " ^ body)
+    try
+      match Yojson.Safe.from_string body with
+      | `Assoc _ as json -> (
+        match bridge_json_result body json with
+        | Ok json ->
+          apply_runtime_state_from_json json;
+          Ok json
+        | Error _ as error -> error)
+      | _ -> Error body
+    with
+    | Sys.Break as e -> raise e
+    | e -> Error (Printexc.to_string e ^ ": " ^ body)
 
 let run_extension_bridge runtime path request =
   match runtime with

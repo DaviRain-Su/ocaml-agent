@@ -112,7 +112,7 @@ let read_header path : info option =
 
 (* Load just the turns from a session file, skipping the header line. *)
 let load_turns path : Llm.turn list =
-  read_body path |> List.filter is_turn_json |> List.filter_map (fun j -> try Some (Llm.turn_of_json j) with _ -> None)
+  read_body path |> List.filter is_turn_json |> List.filter_map (fun j -> try Some (Llm.turn_of_json j) with Sys.Break as e -> raise e | _ -> None)
 
 let load_entries path = read_body path |> List.filter (fun j -> not (is_turn_json j))
 
@@ -205,7 +205,7 @@ let context_turn_of_json json =
   if is_turn_json json then Some (Llm.turn_of_json json) else context_turn_of_entry json
 
 let load_context_turns path : Llm.turn list =
-  read_body path |> List.filter_map (fun j -> try context_turn_of_json j with _ -> None)
+  read_body path |> List.filter_map (fun j -> try context_turn_of_json j with Sys.Break as e -> raise e | _ -> None)
 
 (* legacy single-file helper kept for the old API name *)
 let load = load_turns

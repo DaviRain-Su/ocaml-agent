@@ -62,15 +62,17 @@ let path_candidates tok =
   let base = Filename.basename tok in
   if base = "" then []
   else
-    match Sys.readdir dir with
-    | exception _ -> []
-    | entries ->
+    try
+      let entries = Sys.readdir dir in
       Array.to_list entries
       |> List.filter (fun e -> starts_with ~prefix:base e)
       |> List.sort compare
       |> List.map (fun e ->
              let shown = if String.contains tok '/' then Filename.concat dir e else e in
-             if (try Sys.is_directory (Filename.concat dir e) with _ -> false) then shown ^ "/" else shown)
+             if (try Sys.is_directory (Filename.concat dir e) with Sys.Break as e -> raise e | _ -> false) then shown ^ "/" else shown)
+    with
+    | Sys.Break as e -> raise e
+    | _ -> []
 
 let slash_argument input =
   if String.length input > 0 && input.[0] = '/' then

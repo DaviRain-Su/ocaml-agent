@@ -27,9 +27,17 @@ let disabled () =
   | Some ("1" | "true" | "yes" | "y") -> true
   | _ -> false
 
+let max_file_bytes = 1024 * 1024
+
 let read_file path =
   let ic = open_in_bin path in
-  Fun.protect ~finally:(fun () -> close_in_noerr ic) (fun () -> really_input_string ic (in_channel_length ic))
+  Fun.protect
+    ~finally:(fun () -> close_in_noerr ic)
+    (fun () ->
+       let total = in_channel_length ic in
+       let len = min max_file_bytes total in
+       let s = really_input_string ic len in
+       if total > max_file_bytes then s ^ "\n... (truncated)" else s)
 
 (* Parse a leading "---\n ... \n---" frontmatter block into key/value pairs. *)
 let parse_frontmatter content =
@@ -65,29 +73,41 @@ let parse_skill path : t option =
      | Some ("true" | "yes" | "1") -> None
      | _ -> Some { name; description; location = path })
 
+let is_real_dir path =
+  try
+    let st = Unix.lstat path in
+    st.Unix.st_kind = Unix.S_DIR
+  with _ -> false
+
 let discover_dir dir =
   if (try Sys.is_directory dir with _ -> false) then
-    let rec go root =
-      let entries = try Sys.readdir root |> Array.to_list |> List.sort compare with _ -> [] in
-      let markdown =
-        entries
-        |> List.filter (fun f -> Filename.check_suffix f ".md")
-        |> List.filter_map (fun f -> parse_skill (Filename.concat root f))
+    let rec go root visited =
+      let canon =
+        try Unix.realpath root with _ -> root
       in
-      let nested =
-        entries
-        |> List.concat_map (fun e ->
-               let path = Filename.concat root e in
-               if (try Sys.is_directory path with _ -> false) then
-                 let skill_file = Filename.concat path "SKILL.md" in
-                 if Sys.file_exists skill_file then
-                   match parse_skill skill_file with Some s -> [ s ] | None -> []
-                 else go path
-               else [])
-      in
-      markdown @ nested
+      if List.mem canon visited then []
+      else
+        let visited = canon :: visited in
+        let entries = try Sys.readdir root |> Array.to_list |> List.sort compare with _ -> [] in
+        let markdown =
+          entries
+          |> List.filter (fun f -> Filename.check_suffix f ".md")
+          |> List.filter_map (fun f -> parse_skill (Filename.concat root f))
+        in
+        let nested =
+          entries
+          |> List.concat_map (fun e ->
+                 let path = Filename.concat root e in
+                 if is_real_dir path then
+                   let skill_file = Filename.concat path "SKILL.md" in
+                   if Sys.file_exists skill_file then
+                     match parse_skill skill_file with Some s -> [ s ] | None -> []
+                   else go path visited
+                 else [])
+        in
+        markdown @ nested
     in
-    go dir
+    go dir []
   else []
 
 let discover_path path =

@@ -10,9 +10,17 @@ type t =
 
 let prompt_dirs () = Config_paths.uniq [ Config_paths.user_prompts_dir (); ".ocaml-agent/prompts"; ".pi/prompts" ]
 
+let max_file_bytes = 1024 * 1024
+
 let read_file path =
   let ic = open_in_bin path in
-  Fun.protect ~finally:(fun () -> close_in_noerr ic) (fun () -> really_input_string ic (in_channel_length ic))
+  Fun.protect
+    ~finally:(fun () -> close_in_noerr ic)
+    (fun () ->
+       let total = in_channel_length ic in
+       let len = min max_file_bytes total in
+       let s = really_input_string ic len in
+       if total > max_file_bytes then s ^ "\n... (truncated)" else s)
 
 let getenv_nonempty k =
   match Sys.getenv_opt k with Some s when String.trim s <> "" -> Some s | _ -> None
@@ -148,14 +156,15 @@ let slice args start len =
 let replace_regex re f s =
   let b = Buffer.create (String.length s) in
   let pos = ref 0 in
-  (try
-     while true do
-       let start = Str.search_forward re s !pos in
-       Buffer.add_substring b s !pos (start - !pos);
-       Buffer.add_string b (f s);
-       pos := Str.match_end ()
-     done
-   with Not_found -> ());
+  let continue = ref true in
+  while !continue do
+    match Str.search_forward re s !pos with
+    | exception Not_found -> continue := false
+    | start ->
+      Buffer.add_substring b s !pos (start - !pos);
+      Buffer.add_string b (f s);
+      pos := Str.match_end ()
+  done;
   Buffer.add_substring b s !pos (String.length s - !pos);
   Buffer.contents b
 
@@ -164,8 +173,8 @@ let expand_body body args =
     let re = Str.regexp "\\${@:\\([0-9][0-9]*\\):\\([0-9][0-9]*\\)}" in
     replace_regex re
       (fun source ->
-        let start = int_of_string (Str.matched_group 1 source) in
-        let len = Some (int_of_string (Str.matched_group 2 source)) in
+        let start = Option.value (int_of_string_opt (Str.matched_group 1 source)) ~default:0 in
+        let len = Option.map (fun v -> Option.value (int_of_string_opt v) ~default:0) (Some (Str.matched_group 2 source)) in
         join_args (slice args start len))
       body
   in
@@ -173,7 +182,7 @@ let expand_body body args =
     let re = Str.regexp "\\${@:\\([0-9][0-9]*\\)}" in
     replace_regex re
       (fun source ->
-        let start = int_of_string (Str.matched_group 1 source) in
+        let start = Option.value (int_of_string_opt (Str.matched_group 1 source)) ~default:0 in
         join_args (slice args start None))
       body
   in
@@ -181,7 +190,7 @@ let expand_body body args =
     let re = Str.regexp "\\$\\([0-9]+\\)" in
     replace_regex re
       (fun source ->
-        let idx = int_of_string (Str.matched_group 1 source) in
+        let idx = Option.value (int_of_string_opt (Str.matched_group 1 source)) ~default:0 in
         List.nth_opt args (idx - 1) |> Option.value ~default:"")
       body
   in

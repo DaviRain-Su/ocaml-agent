@@ -334,22 +334,25 @@ let has_filters = function
 
 let configured_packages_from_file scope path =
   let settings_dir = Filename.dirname path in
-  match Yojson.Safe.from_file path |> member "packages" with
-  | `List xs ->
-    xs
-    |> List.filter_map (fun pkg ->
-           match source_string pkg with
-           | None -> None
-           | Some source ->
-             let installed_path =
-               match parse_install_source source with
-               | Local _ when is_local_source source -> Some (resolve_path ~base:settings_dir source)
-               | Local _ -> None
-               | Npm _ | Git _ -> installed_path source scope
-             in
-             Some { source; scope; filtered = has_filters pkg; installed_path })
+  try
+    match Yojson.Safe.from_file path |> member "packages" with
+    | `List xs ->
+      xs
+      |> List.filter_map (fun pkg ->
+             match source_string pkg with
+             | None -> None
+             | Some source ->
+               let installed_path =
+                 match parse_install_source source with
+                 | Local _ when is_local_source source -> Some (resolve_path ~base:settings_dir source)
+                 | Local _ -> None
+                 | Npm _ | Git _ -> installed_path source scope
+               in
+               Some { source; scope; filtered = has_filters pkg; installed_path })
+    | _ -> []
+  with
+  | Sys.Break as e -> raise e
   | _ -> []
-  | exception _ -> []
 
 let configured_packages () =
   let user =
@@ -530,7 +533,7 @@ let install_git_dependencies target =
     run_npm ~cwd:target (args @ ignore_scripts_flag ())
 
 let checkout_git_ref target ref_ =
-  run_checked ~cwd:target "git" [ "fetch"; "origin"; ref_ ];
+  run_checked ~cwd:target "git" [ "fetch"; "--"; "origin"; ref_ ];
   run_checked ~cwd:target "git" [ "checkout"; "FETCH_HEAD" ]
 
 let install_git git scope =
@@ -540,13 +543,13 @@ let install_git git scope =
       failwith (Printf.sprintf "Git package target exists but is not a git checkout: %s" target);
     (match git.ref_ with
      | Some ref_ -> checkout_git_ref target ref_
-     | None -> run_checked ~cwd:target "git" [ "pull"; "--ff-only" ]);
+     | None -> run_checked ~cwd:target "git" [ "pull"; "--ff-only"; "--" ]);
     install_git_dependencies target
   end
   else begin
     ensure_gitignore (git_install_root scope);
     Settings.ensure_dir (Filename.dirname target);
-    run_checked "git" [ "clone"; git.repo; target ];
+    run_checked "git" [ "clone"; "--"; git.repo; target ];
     Option.iter (checkout_git_ref target) git.ref_;
     install_git_dependencies target
   end
@@ -554,12 +557,13 @@ let install_git git scope =
 let rec remove_tree path =
   match (Unix.lstat path).Unix.st_kind with
   | Unix.S_DIR ->
-    Sys.readdir path
-    |> Array.iter (fun name ->
-           if name <> "." && name <> ".." then remove_tree (Filename.concat path name));
-    Unix.rmdir path
-  | _ -> Sys.remove path
-  | exception _ -> ()
+    (try
+       Sys.readdir path
+       |> Array.iter (fun name ->
+              if name <> "." && name <> ".." then remove_tree (Filename.concat path name));
+       Unix.rmdir path
+     with Sys.Break as e -> raise e | _ -> ())
+  | _ -> (try Sys.remove path with Sys.Break as e -> raise e | _ -> ())
 
 let path_is_under ~root path =
   let root = normalize root in
@@ -575,12 +579,15 @@ let prune_empty_parents ~root target =
     let dir = normalize dir in
     if dir = root || not (path_is_under ~root dir) then ()
     else
-      match Sys.readdir dir with
-      | [||] ->
-        (try Unix.rmdir dir with _ -> ());
-        loop (Filename.dirname dir)
+      try
+        match Sys.readdir dir with
+        | [||] ->
+          (try Unix.rmdir dir with Sys.Break as e -> raise e | _ -> ());
+          loop (Filename.dirname dir)
+        | _ -> ()
+      with
+      | Sys.Break as e -> raise e
       | _ -> ()
-      | exception _ -> ()
   in
   loop (Filename.dirname target)
 
@@ -768,10 +775,13 @@ let set_resource_enabled ?(local = false) ~source ~kind ~path ~enabled () =
 
 let sources_from_settings_file scope path =
   let settings_dir = Filename.dirname path in
-  match Yojson.Safe.from_file path |> member "packages" with
-  | `List xs -> List.filter_map (parse_source ~settings_dir ~scope) xs
+  try
+    match Yojson.Safe.from_file path |> member "packages" with
+    | `List xs -> List.filter_map (parse_source ~settings_dir ~scope) xs
+    | _ -> []
+  with
+  | Sys.Break as e -> raise e
   | _ -> []
-  | exception _ -> []
 
 let sources () =
   let user =
@@ -790,7 +800,7 @@ let sources () =
 
 let read_package_json root =
   let path = Filename.concat root "package.json" in
-  try Some (Yojson.Safe.from_file path) with _ -> None
+  try Some (Yojson.Safe.from_file path) with Sys.Break as e -> raise e | _ -> None
 
 let package_manifest_paths root kind =
   match read_package_json root with

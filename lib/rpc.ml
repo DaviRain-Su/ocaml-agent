@@ -911,6 +911,7 @@ let handle_pi_command ?(prompt_prefix = []) emit agent j =
   | Llm.Api_error e -> failure emit ?id command_for_response e
   | Llm.Config_error e -> failure emit ?id command_for_response e
   | Exit -> raise Exit
+  | Sys.Break as e -> raise e
   | e -> failure emit ?id command_for_response (Printexc.to_string e)
 
 let handle_legacy_method ?(prompt_prefix = []) emit agent j =
@@ -925,6 +926,7 @@ let handle_legacy_method ?(prompt_prefix = []) emit agent j =
         event emit "turn_done" [ ("text", `String final); ("usage", usage_json agent) ]
       with
       | Llm.Api_error e -> error_event emit e
+      | Sys.Break as e -> raise e
       | e -> error_event emit (Printexc.to_string e)))
   | `String "set_model" -> (
     let params = j |> member "params" in
@@ -939,7 +941,9 @@ let handle_legacy_method ?(prompt_prefix = []) emit agent j =
       in
       Agent.set_config agent c;
       event emit "ok" [ ("config", `String (Llm.describe c)) ]
-    with Llm.Config_error e -> error_event emit e)
+    with
+    | Llm.Config_error e -> error_event emit e
+    | Sys.Break as e -> raise e)
   | `String "session" ->
     let c = Agent.config agent in
     event emit "ok"
@@ -962,9 +966,9 @@ let handle_command ?(prompt_prefix = []) emit agent j =
 
 let handle_command_for_test ?(prompt_prefix = []) agent j =
   let out = ref [] in
-  let emit j = out := !out @ [ j ] in
+  let emit j = out := j :: !out in
   handle_command ~prompt_prefix emit agent j;
-  !out
+  List.rev !out
 
 let run ?(prompt_prefix = []) agent =
   Agent.set_frontend agent (make_frontend emit_stdout);
@@ -982,6 +986,7 @@ let run ?(prompt_prefix = []) agent =
       if String.trim line <> "" then begin
         try handle line with
         | Exit -> raise Exit
+        | Sys.Break as e -> raise e
         | e -> error_event emit_stdout (Printexc.to_string e)
       end;
       loop ()

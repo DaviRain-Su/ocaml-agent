@@ -64,3 +64,11 @@ val ui :
 
 val response : ?ui:Yojson.Safe.t -> ?extra:(string * Yojson.Safe.t) list -> string -> Yojson.Safe.t
 val run : unit -> unit
+
+(* In-process API: mount registered tools without the stdin/stdout protocol. *)
+
+(* (name, description, parameters) of each registered tool. *)
+val tool_specs : unit -> (string * string * Yojson.Safe.t) list
+
+(* Run a registered tool by name; returns {ok;text} or {ok:false;error} JSON. *)
+val invoke_tool : string -> Yojson.Safe.t -> Yojson.Safe.t

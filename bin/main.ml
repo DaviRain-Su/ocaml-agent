@@ -631,9 +631,10 @@ let parse_args argv =
 
 let read_stdin_all () =
   let b = Buffer.create 256 in
+  let max = 10 * 1024 * 1024 in
   (try
-     while true do
-       Buffer.add_channel b stdin 4096
+     while Buffer.length b < max do
+       Buffer.add_channel b stdin (min 4096 (max - Buffer.length b))
      done
    with End_of_file -> ());
   Buffer.contents b

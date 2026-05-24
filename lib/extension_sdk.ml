@@ -163,6 +163,17 @@ let execute_tool request =
       (try tool.execute input with e -> error (Printexc.to_string e)))
   | _ -> error "missing tool"
 
+(* --- in-process API ---
+   Lets a host link this SDK directly and mount the registered tools without
+   going through the stdin/stdout protocol. *)
+
+(* (name, description, parameters) of each registered tool, e.g. for schemas. *)
+let tool_specs () = List.rev_map (fun (tool : tool) -> (tool.name, tool.description, tool.parameters)) !tools
+
+(* Run a registered tool by name; returns the same {ok;text}/{ok:false;error}
+   JSON the protocol would. *)
+let invoke_tool name input = execute_tool (`Assoc [ ("tool", `String name); ("input", input) ])
+
 let execute_command request =
   match request |> member "command" with
   | `String name -> (

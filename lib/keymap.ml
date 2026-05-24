@@ -37,20 +37,23 @@ let load () : t =
   match path with
   | None -> default
   | Some p -> (
-    match
-      let ic = open_in p in
-      Fun.protect ~finally:(fun () -> close_in_noerr ic) (fun () -> Yojson.Safe.from_channel ic)
+    try
+      match
+        let ic = open_in p in
+        Fun.protect ~finally:(fun () -> close_in_noerr ic) (fun () -> Yojson.Safe.from_channel ic)
+      with
+      | `Assoc fields ->
+        (* Overrides take precedence; start from defaults. *)
+        List.fold_left
+          (fun acc (k, v) ->
+            match (action_of_string k, v) with
+            | Some act, `String spec -> (
+              match parse_spec spec with Some key -> (key, act) :: acc | None -> acc)
+            | _ -> acc)
+          default fields
+      | _ -> default
     with
-    | exception _ -> default
-    | `Assoc fields ->
-      (* Overrides take precedence; start from defaults. *)
-      List.fold_left
-        (fun acc (k, v) ->
-          match (action_of_string k, v) with
-          | Some act, `String spec -> (
-            match parse_spec spec with Some key -> (key, act) :: acc | None -> acc)
-          | _ -> acc)
-        default fields
+    | Sys.Break as e -> raise e
     | _ -> default)
 
 let lookup (km : t) key = List.assoc_opt key km

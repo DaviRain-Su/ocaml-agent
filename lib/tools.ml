@@ -15,11 +15,16 @@ type tool =
 
 (* --- helpers --- *)
 
+let max_read_file_bytes = 10 * 1024 * 1024
+
 let read_file_contents path =
   let ic = open_in_bin path in
   Fun.protect
     ~finally:(fun () -> close_in_noerr ic)
-    (fun () -> really_input_string ic (in_channel_length ic))
+    (fun () ->
+       let total = in_channel_length ic in
+       let len = min max_read_file_bytes total in
+       really_input_string ic len)
 
 let write_file_contents path content =
   (* Create parent directories if needed. *)
@@ -30,6 +35,24 @@ let write_file_contents path content =
   Fun.protect
     ~finally:(fun () -> close_out_noerr oc)
     (fun () -> output_string oc content)
+
+let resolve_safe_path path =
+  let base = Sys.getcwd () in
+  let path = if Filename.is_relative path then Filename.concat base path else path in
+  let absolute = String.length path > 0 && path.[0] = '/' in
+  let parts = String.split_on_char '/' path in
+  let rec collapse acc = function
+    | [] -> List.rev acc
+    | ".." :: rest -> (
+      match acc with
+      | [] -> failwith "Path traversal above root detected"
+      | _ :: tail -> collapse tail rest)
+    | "." :: rest -> collapse acc rest
+    | "" :: rest -> collapse acc rest
+    | x :: rest -> collapse (x :: acc) rest
+  in
+  let collapsed = String.concat "/" (collapse [] parts) in
+  if absolute then "/" ^ collapsed else collapsed
 
 let str_field obj key =
   match obj |> member key with
@@ -76,22 +99,29 @@ exception Limit_reached
 (* Recursively visit every regular file under [root], calling [f relpath]. The
    path passed to [f] is relative to [root] (or [root] itself for a file).
    Raises Limit_reached if the caller wants to abort early (e.g. hit a result limit). *)
+let is_real_dir path =
+  try
+    let st = Unix.lstat path in
+    st.Unix.st_kind = Unix.S_DIR
+  with _ -> false
+
 let walk ?(ignored = fun _ -> false) root (f : string -> unit) =
-  let rec go rel =
+  let rec go rel visited =
     let full = if rel = "" then root else Filename.concat root rel in
-    match Sys.is_directory full with
-    | true ->
+    let canon = try Unix.realpath full with _ -> full in
+    if List.mem canon visited then ()
+    else if is_real_dir full then
+      let visited = canon :: visited in
       let entries = try Sys.readdir full with Sys_error _ -> [||] in
       Array.sort compare entries;
       Array.iter
         (fun e ->
           let child = if rel = "" then e else Filename.concat rel e in
-          if (not (List.mem e skip_dirs)) && not (ignored child) then go child)
+          if (not (List.mem e skip_dirs)) && not (ignored child) then go child visited)
         entries
-    | false -> if not (ignored rel) then f rel
-    | exception Sys_error _ -> ()
+    else if not (ignored rel) then f rel
   in
-  if Sys.file_exists root then if Sys.is_directory root then go "" else f (Filename.basename root)
+  if Sys.file_exists root then if is_real_dir root then go "" [] else f (Filename.basename root)
 
 (* Convert a glob with star/doublestar/question wildcards to an anchored regex. *)
 let glob_to_regex pat =
@@ -147,7 +177,7 @@ let glob_match pattern rel =
   try
     let re = Str.regexp (glob_to_regex pattern) in
     Str.string_match re candidate 0 && Str.match_end () = String.length candidate
-  with _ -> false
+  with Sys.Break as e -> raise e | _ -> false
 
 let load_gitignore root =
   let dir =
@@ -311,7 +341,7 @@ let write_file =
     requires_approval = false;
     execute =
       (fun input ->
-        let path = path_field input in
+        let path = resolve_safe_path (path_field input) in
         let content = str_field input "content" in
         try
           write_file_contents path content;
@@ -631,7 +661,11 @@ let edit_file =
         if edits = [] then "Error: edits must contain at least one replacement"
         else
           try
+            let path = resolve_safe_path path in
             let content = read_file_contents path in
+            if String.length content >= max_read_file_bytes then
+              Printf.sprintf "Error: file too large to edit (> %dMB): %s" (max_read_file_bytes / (1024 * 1024)) path
+            else
             match apply_edits content edits path with
             | Error e -> "Error: " ^ e
             | Ok updated ->
@@ -672,7 +706,7 @@ let list_dir =
             |> take limit
             |> List.map (fun e ->
                    let full = Filename.concat path e in
-                   if (try Sys.is_directory full with _ -> false) then e ^ "/" else e)
+                   if is_real_dir full then e ^ "/" else e)
           in
           let truncated = Array.length entries > List.length lines in
           if lines = [] then "(empty directory)"
@@ -721,6 +755,8 @@ let apply_command_prefix command =
   | Some prefix when String.trim prefix <> "" -> prefix ^ "\n" ^ command
   | _ -> command
 
+let max_process_output_bytes = 10 * 1024 * 1024
+
 let run_process ?stdin_data ?(timeout_s = command_timeout_s) ?(use_shell_settings = false) command =
   let timeout_s = max 1 timeout_s in
   let command = if use_shell_settings then apply_command_prefix command else command in
@@ -750,14 +786,17 @@ let run_process ?stdin_data ?(timeout_s = command_timeout_s) ?(use_shell_setting
   Unix.set_nonblock rd;
   let buf = Buffer.create 4096 in
   let bytes = Bytes.create 4096 in
+  let truncated = ref false in
   let rec drain () =
-    match Unix.read rd bytes 0 (Bytes.length bytes) with
-    | 0 -> ()
-    | n ->
-      Buffer.add_subbytes buf bytes 0 n;
-      drain ()
-    | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) -> ()
-    | exception Unix.Unix_error (Unix.EINTR, _, _) -> drain ()
+    if Buffer.length buf >= max_process_output_bytes then truncated := true
+    else
+      match Unix.read rd bytes 0 (Bytes.length bytes) with
+      | 0 -> ()
+      | n ->
+        Buffer.add_subbytes buf bytes 0 n;
+        drain ()
+      | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) -> ()
+      | exception Unix.Unix_error (Unix.EINTR, _, _) -> drain ()
   in
   let deadline = Unix.gettimeofday () +. float_of_int timeout_s in
   let timed_out = ref false in
@@ -795,7 +834,9 @@ let run_process ?stdin_data ?(timeout_s = command_timeout_s) ?(use_shell_setting
       let out =
         Buffer.contents buf
         ^
-        if !timed_out then "\n[Error: command timed out after 5 minutes]" else ""
+        if !timed_out then "\n[Error: command timed out after 5 minutes]"
+        else if !truncated then "\n[Output truncated: exceeded 10MB limit]"
+        else ""
       in
       let code =
         if !timed_out then 124
@@ -842,7 +883,7 @@ let line_matches ~literal ~ignore_case pattern line =
     find_substring line pattern <> None
   else
     let re =
-      try Some ((if ignore_case then Str.regexp_case_fold else Str.regexp) pattern) with _ -> None
+      try Some ((if ignore_case then Str.regexp_case_fold else Str.regexp) pattern) with Sys.Break as e -> raise e | _ -> None
     in
     match re with
     | None -> false
@@ -883,7 +924,7 @@ let grep =
           | None -> true
           | Some g -> glob_match g rel
         in
-        if (not literal) && (try ignore ((if ignore_case then Str.regexp_case_fold else Str.regexp) pattern); false with _ -> true) then
+        if (not literal) && (try ignore ((if ignore_case then Str.regexp_case_fold else Str.regexp) pattern); false with Sys.Break as e -> raise e | _ -> true) then
           "Error: invalid regex pattern"
         else
           let out = Buffer.create 4096 in
@@ -897,12 +938,11 @@ let grep =
                    raise Limit_reached);
                  if file_ok rel then begin
                    let full = if Sys.is_directory root then Filename.concat root rel else root in
-                   let size = try (Unix.stat full).Unix.st_size with _ -> 0 in
+                   let size = try (Unix.stat full).Unix.st_size with Sys.Break as e -> raise e | _ -> 0 in
                    if size > max_size then ()
                    else
-                     match read_file_contents full with
-                     | exception _ -> ()
-                     | content ->
+                     try
+                       let content = read_file_contents full in
                        if not (looks_binary content) then begin
                          let lines = String.split_on_char '\n' content in
                          List.iteri
@@ -926,6 +966,9 @@ let grep =
                              end)
                            lines
                        end
+                     with
+                     | Sys.Break as e -> raise e
+                     | _ -> ()
                  end)
            with Limit_reached -> ());
           if !count = 0 then "No matches found"

@@ -100,17 +100,11 @@ let tool_of_json (j : Yojson.Safe.t) : Tools.tool option =
 let load_manifest path =
   if not (Sys.file_exists path) then []
   else
-    match
-      let ic = open_in path in
-      Fun.protect ~finally:(fun () -> close_in_noerr ic) (fun () -> Yojson.Safe.from_channel ic)
-    with
-    | exception Yojson.Json_error msg ->
-      Printf.eprintf "[warning] extension manifest %s has invalid JSON: %s\n%!" path msg;
-      []
-    | exception e ->
-      Printf.eprintf "[warning] failed to read extension manifest %s: %s\n%!" path (Printexc.to_string e);
-      []
-    | json ->
+    try
+      let json =
+        let ic = open_in path in
+        Fun.protect ~finally:(fun () -> close_in_noerr ic) (fun () -> Yojson.Safe.from_channel ic)
+      in
       let entries = match json |> member "tools" with `List l -> l | _ -> [] in
       if entries = [] then
         Printf.eprintf "[warning] extension manifest %s has no tools array or it is empty\n%!" path;
@@ -124,3 +118,11 @@ let load_manifest path =
             Printf.eprintf "[warning] extension tool %s in %s is missing a required field (name or command)\n%!" name path;
             None)
         entries
+    with
+    | Sys.Break as e -> raise e
+    | Yojson.Json_error msg ->
+      Printf.eprintf "[warning] extension manifest %s has invalid JSON: %s\n%!" path msg;
+      []
+    | e ->
+      Printf.eprintf "[warning] failed to read extension manifest %s: %s\n%!" path (Printexc.to_string e);
+      []

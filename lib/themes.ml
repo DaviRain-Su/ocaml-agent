@@ -125,7 +125,7 @@ let load_file path =
       | _ -> Filename.remove_extension (Filename.basename path)
     in
     Some { name; location = path; colors }
-  with _ -> None
+  with Sys.Break as e -> raise e | _ -> None
 
 let builtin name = { name; location = "<builtin>"; colors = [] }
 

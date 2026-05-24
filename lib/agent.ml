@@ -25,7 +25,7 @@ let read_text_file path =
 
 let resolve_prompt_input input =
   if Sys.file_exists input && not (Sys.is_directory input) then
-    try read_text_file input with _ -> input
+    try read_text_file input with Sys.Break as e -> raise e | _ -> input
   else input
 
 let join_prompt_inputs inputs =
@@ -56,6 +56,7 @@ let build_system_prompt cfg =
         guess or claim to be a different model."
        provider cfg.Llm.base_url cfg.Llm.model);
   let context_files = if env_truthy "AGENT_NO_CONTEXT_FILES" then [] else Config_paths.context_files () in
+  let max_context_file_bytes = 100 * 1024 in
   let present =
     List.filter_map
       (fun path ->
@@ -65,10 +66,14 @@ let build_system_prompt cfg =
             let content =
               Fun.protect
                 ~finally:(fun () -> close_in_noerr ic)
-                (fun () -> really_input_string ic (in_channel_length ic))
+                (fun () ->
+                  let total = in_channel_length ic in
+                  let len = min max_context_file_bytes total in
+                  let s = really_input_string ic len in
+                  if total > max_context_file_bytes then s ^ "\n... (truncated)" else s)
             in
             Some (path, content)
-          with _ -> None
+          with Sys.Break as e -> raise e | _ -> None
         else None)
       context_files
   in
@@ -578,7 +583,9 @@ let compact t =
         ?session_name:(Option.map (fun (s : Session.info) -> s.name) session)
         ~before_turn_count:n ~after_turn_count:(List.length t.turns) ();
       Printf.sprintf "Compacted %d older turns into a summary." (List.length older)
-    with e ->
+    with
+    | Sys.Break as e -> t.turns <- old_turns; raise e
+    | e ->
       t.turns <- old_turns;
       "Compaction failed: " ^ Printexc.to_string e
   end
@@ -593,7 +600,7 @@ let should_compact t =
 let rec run_sub_agent t input =
   if t.depth >= max_depth then "Error: maximum sub-agent depth reached"
   else
-    let prompt = try Yojson.Safe.Util.(input |> member "prompt" |> to_string) with _ -> "" in
+    let prompt = try Yojson.Safe.Util.(input |> member "prompt" |> to_string) with Sys.Break as e -> raise e | _ -> "" in
     if prompt = "" then "Error: task requires a prompt"
     else begin
       let sub =

@@ -37,14 +37,13 @@ let render_line ~in_code line =
   else (style_inline line, false)
 
 (* Stateful streaming renderer. *)
-type t = { buf : Buffer.t; mutable in_code : bool }
+type t = { mutable partial : string; mutable in_code : bool }
 
-let create () = { buf = Buffer.create 120; in_code = false }
+let create () = { partial = ""; in_code = false }
 
 (* Feed a streamed chunk; print every line that is now complete. *)
 let feed t (chunk : string) =
-  Buffer.add_string t.buf chunk;
-  let s = Buffer.contents t.buf in
+  let s = t.partial ^ chunk in
   let rec loop start =
     match String.index_from_opt s start '\n' with
     | Some nl ->
@@ -56,21 +55,19 @@ let feed t (chunk : string) =
       loop (nl + 1)
     | None ->
       (* keep the trailing partial line for the next chunk *)
-      Buffer.clear t.buf;
-      Buffer.add_string t.buf (String.sub s start (String.length s - start))
+      t.partial <- String.sub s start (String.length s - start)
   in
   loop 0;
   flush stdout
 
 (* Flush any buffered partial line at end of stream. *)
 let finish t =
-  let rem = Buffer.contents t.buf in
-  if rem <> "" then begin
-    let styled, _ = render_line ~in_code:t.in_code rem in
+  if t.partial <> "" then begin
+    let styled, _ = render_line ~in_code:t.in_code t.partial in
     print_string styled;
     print_char '\n'
   end;
-  Buffer.clear t.buf;
+  t.partial <- "";
   t.in_code <- false;
   flush stdout
 

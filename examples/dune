@@ -1,3 +1,3 @@
 (executables
  (names sdk_extension sdk_host)
- (libraries agent_lib unix))
+ (libraries agent_lib))

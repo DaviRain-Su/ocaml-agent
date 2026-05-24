@@ -101,7 +101,7 @@ let image_mime_type path =
       else if String.length s >= 12 && String.sub s 0 4 = "RIFF" && String.sub s 8 4 = "WEBP" then
         Some "image/webp"
       else None
-    with _ -> None
+    with Sys.Break as e -> raise e | _ -> None
   in
   match magic with
   | Some _ as m -> m
@@ -134,15 +134,17 @@ let expand_file_args_rich paths =
       if Sys.file_exists p && not (Sys.is_directory p) then
         match image_mime_type p with
         | Some mime_type -> (
-          match image_of_file p mime_type with
-          | image ->
+          try
+            let image = image_of_file p mime_type in
             images := image :: !images;
             Buffer.add_string text (image_block p mime_type)
-          | exception _ -> ())
+          with
+          | Sys.Break as e -> raise e
+          | _ -> ())
         | None -> (
-          match read_file p with
-          | content -> Buffer.add_string text (file_block p content)
-          | exception _ -> ()))
+          try Buffer.add_string text (file_block p (read_file p)) with
+          | Sys.Break as e -> raise e
+          | _ -> ()))
     paths;
   { text = Buffer.contents text; images = List.rev !images }
 
@@ -173,15 +175,17 @@ let expand_rich input =
       (fun p ->
         match image_mime_type p with
         | Some mime_type -> (
-          match image_of_file p mime_type with
-          | image ->
+          try
+            let image = image_of_file p mime_type in
             images := image :: !images;
             Buffer.add_string buf ("\n\n" ^ image_block p mime_type)
-          | exception _ -> ())
+          with
+          | Sys.Break as e -> raise e
+          | _ -> ())
         | None -> (
-          match read_file p with
-          | exception _ -> ()
-          | content -> Buffer.add_string buf ("\n\n" ^ file_block p content)))
+          try Buffer.add_string buf ("\n\n" ^ file_block p (read_file p)) with
+          | Sys.Break as e -> raise e
+          | _ -> ()))
       paths;
     { text = Buffer.contents buf; images = List.rev !images }
 

@@ -30,7 +30,7 @@ type ui =
     mutable cursor : int; (* byte index into input *)
     mutable history : string list; (* newest first *)
     mutable hist_idx : int; (* -1 = editing a fresh line *)
-    buf : Buffer.t; (* partial streamed assistant line *)
+    mutable partial : string; (* partial streamed assistant line *)
     mutable agent : Agent.t;
     mutable running : bool;
     mutable scroll : int; (* display lines scrolled up from the bottom; 0 = latest *)
@@ -148,6 +148,9 @@ let codepoints s =
   let rec go i acc = if i >= n then List.rev acc else let j = next_cp_start s i in go j (String.sub s i (j - i) :: acc) in
   go 0 []
 
+let display_width ch =
+  if Char.code ch >= 0xE0 then 2 else 1
+
 (* Parse inline **bold** and `code` into styled segments (markers removed). *)
 let style_inline base s =
   let segs = ref [] and buf = Buffer.create 16 and bold = ref false and code = ref false in
@@ -186,7 +189,7 @@ let wrap_segs w segs =
             if cp = "\n" then newline ()
             else if String.length cp = 1 && (Char.code cp.[0] < 0x20 || Char.code cp.[0] = 0x7f) then (
               if cp.[0] = '\t' then add_str "  " 2)
-            else add_str cp 1)
+            else add_str cp (display_width cp.[0]))
           (codepoints s))
       segs;
     flush_run ();
@@ -257,7 +260,8 @@ let cursor_row_col input cursor =
         if ch = '\n' then (
           incr row;
           col := 0)
-        else if not (is_cont ch) then incr col)
+        else if ch = '\t' then col := !col + 2
+        else if not (is_cont ch) then col := !col + display_width ch)
     input;
   (!row, !col)
 
@@ -378,11 +382,10 @@ let asst_segs ui line =
 
 (* --- frontend callbacks --- *)
 let feed_assistant ui s =
-  Buffer.add_string ui.buf s;
-  let content = Buffer.contents ui.buf in
+  let content = ui.partial ^ s in
   let parts = String.split_on_char '\n' content in
   let rec loop = function
-    | [ last ] -> Buffer.clear ui.buf; Buffer.add_string ui.buf last
+    | [ last ] -> ui.partial <- last
     | line :: rest -> push_segs ui (asst_segs ui line); loop rest
     | [] -> ()
   in
@@ -390,9 +393,8 @@ let feed_assistant ui s =
   redraw ui
 
 let flush_assistant ui =
-  let rem = Buffer.contents ui.buf in
-  if rem <> "" then push_segs ui (asst_segs ui rem);
-  Buffer.clear ui.buf;
+  if ui.partial <> "" then push_segs ui (asst_segs ui ui.partial);
+  ui.partial <- "";
   ui.asst_in_code <- false;
   redraw ui
 
@@ -873,6 +875,7 @@ and run_turn ui line =
   in
   (try ignore (Agent.send ui.agent line) with
    | Llm.Api_error m -> push ui (tfg "error") ("API error: " ^ m)
+   | Sys.Break as e -> raise e
    | e -> push ui (tfg "error") ("Error: " ^ Printexc.to_string e));
   ui.turn_active <- false;
   Thread.join spinner_thread;
@@ -895,6 +898,8 @@ and run_bang ui line =
     true
   end
 
+let max_history = 1000
+
 let submit ui =
   let line = String.trim ui.input in
   ui.input <- "";
@@ -903,14 +908,22 @@ let submit ui =
   ui.scroll <- 0;
   if line <> "" then begin
     ui.history <- line :: ui.history;
+    if List.length ui.history > max_history then
+      ui.history <- List.filteri (fun i _ -> i < max_history) ui.history;
     (* echo the (possibly multi-line) input under the prompt *)
     let indent = String.make (String.length prompt_label) ' ' in
     List.iteri
       (fun i l -> push ui (tfg "accent") ((if i = 0 then prompt_label else indent) ^ l))
       (String.split_on_char '\n' line);
     redraw ui;
-    if line.[0] = '!' && run_bang ui line then ()
-    else if line.[0] = '/' then cmd ui line
+    if line.[0] = '!' then (
+      try if run_bang ui line then () else () with
+      | Sys.Break as e -> raise e
+      | e -> push ui (tfg "error") ("Error: " ^ Printexc.to_string e); redraw ui)
+    else if line.[0] = '/' then (
+      try cmd ui line with
+      | Sys.Break as e -> raise e
+      | e -> push ui (tfg "error") ("Error: " ^ Printexc.to_string e); redraw ui)
     else run_turn ui line
   end
 
@@ -934,13 +947,19 @@ let recall ui dir =
   if idx >= 0 && idx < len then (ui.hist_idx <- idx; ui.input <- List.nth ui.history idx; ui.cursor <- String.length ui.input)
   else if idx < 0 then (ui.hist_idx <- -1; ui.input <- ""; ui.cursor <- 0)
 
+(* Scroll the viewport up (positive) or down (negative) by [lines]. *)
+let scroll_by ui lines =
+  ui.scroll <- max 0 (ui.scroll + lines);
+  redraw ui
+
+(* Lines moved per mouse-wheel notch (a page would be jarring for the wheel). *)
+let wheel_step = 3
+
+(* PgUp/PgDn: scroll by a fraction of the screen, not nearly the full height. *)
 let page ui delta =
   let _, h = Term.size ui.term in
-  (* Scroll by a fraction of the screen, not nearly the full height,
-     so users can scroll smoothly even with moderate content. *)
   let step = max 1 (h / 2) in
-  ui.scroll <- max 0 (ui.scroll + (delta * step));
-  redraw ui
+  scroll_by ui (delta * step)
 
 (* Tab completion of the current token (slash command or file path). *)
 let complete ui =
@@ -966,18 +985,18 @@ let kill_word ui =
   ui.cursor <- !i
 
 let run agent =
-  (* Mouse wheel scrolling is enabled by default for a better UX.
-     Set AGENT_TUI_MOUSE=0 to disable if it interferes with terminal
-     selection/copy. *)
+  (* Mouse reporting is OFF by default so the terminal's native click-drag text
+     selection (copy) and paste keep working. Set AGENT_TUI_MOUSE=1 to enable
+     mouse-wheel scrolling, at the cost of terminal selection/copy. *)
   let mouse = match Sys.getenv_opt "AGENT_TUI_MOUSE" with
-    | Some ("0" | "false" | "no") -> false
-    | _ -> true
+    | Some ("1" | "true" | "yes" | "on") -> true
+    | _ -> false
   in
   let term = Term.create ~mouse () in
   ignore (Themes.active ());
   let ui =
-    { term; lines = []; input = ""; cursor = 0; history = []; hist_idx = -1; buf = Buffer.create 256;
-      agent; running = true; scroll = 0; turn_active = false; quiet = false; spin = 0; turn_start = 0.;
+    { term; lines = []; input = ""; cursor = 0; history = []; hist_idx = -1;
+      partial = ""; agent; running = true; scroll = 0; turn_active = false; quiet = false; spin = 0; turn_start = 0.;
       asst_in_code = false; menu_sel = 0; pasting = false; tools_expanded = false;
       extension_surfaces = create_extension_surface_state (); mtx = Mutex.create () }
   in
@@ -985,8 +1004,8 @@ let run agent =
   push ui A.(tfg "accent" ++ st bold) "OCaml Code Agent";
   push ui (tfg "muted") (Llm.describe (Agent.config agent));
   push ui (tfg "muted") "Type your request. /help for commands, Ctrl-P model picker, Ctrl-D to quit.";
-  push ui (tfg "muted") "PgUp/PgDn or mouse wheel to scroll; End to jump to latest.";
-  push ui (tfg "muted") "Set AGENT_TUI_MOUSE=0 if mouse wheel interferes with text selection.";
+  push ui (tfg "muted") "Shift+Up/Down or PgUp/PgDn to scroll; End to jump to latest.";
+  push ui (tfg "muted") "Set AGENT_TUI_MOUSE=1 for mouse-wheel scrolling (disables terminal copy/paste selection).";
   push ui A.empty "";
   let km = Keymap.load () in
   redraw ui;
@@ -1042,11 +1061,22 @@ let run agent =
     in
     match Keymap.lookup km (Char.lowercase_ascii c, ctrl) with
     | Some Keymap.Quit -> ui.running <- false
-    | Some Keymap.Model_picker -> model_picker ui
-    | Some Keymap.Settings -> settings ui
+    | Some Keymap.Model_picker ->
+      (try model_picker ui with
+       | Sys.Break as e -> raise e
+       | e -> push ui (tfg "error") ("Error: " ^ Printexc.to_string e); redraw ui)
+    | Some Keymap.Settings ->
+      (try settings ui with
+       | Sys.Break as e -> raise e
+       | e -> push ui (tfg "error") ("Error: " ^ Printexc.to_string e); redraw ui)
     | Some Keymap.Help -> cmd ui "/help"
     | None ->
-      if handle_extension_shortcut () then ()
+      let handled =
+        try handle_extension_shortcut () with
+        | Sys.Break as e -> raise e
+        | e -> push ui (tfg "error") ("Extension shortcut error: " ^ Printexc.to_string e); false
+      in
+      if handled then ()
       else if ctrl then (
         match Char.lowercase_ascii c with
         | 'a' -> ui.cursor <- 0; redraw ui
@@ -1059,7 +1089,7 @@ let run agent =
       else (insert ui (String.make 1 c); ui.menu_sel <- 0; redraw ui)
   in
   Fun.protect
-    ~finally:(fun () -> try Term.release term with _ -> ())
+    ~finally:(fun () -> try Term.release term with Sys.Break as e -> raise e | _ -> ())
     (fun () ->
       while ui.running do
         match Term.event term with
@@ -1078,13 +1108,17 @@ let run agent =
         | `Key (`End, _) -> ui.scroll <- 0; ui.cursor <- String.length ui.input; redraw ui
         | `Key (`Arrow `Left, _) -> if ui.cursor > 0 then ui.cursor <- prev_cp_start ui.input ui.cursor; redraw ui
         | `Key (`Arrow `Right, _) -> if ui.cursor < String.length ui.input then ui.cursor <- next_cp_start ui.input ui.cursor; redraw ui
+        (* Shift+Up/Down scroll the scrollback a few lines — keyboard scrolling
+           that works without the mouse wheel (handy on Macs that lack PgUp). *)
+        | `Key (`Arrow `Up, mods) when List.mem `Shift mods -> scroll_by ui wheel_step
+        | `Key (`Arrow `Down, mods) when List.mem `Shift mods -> scroll_by ui (-wheel_step)
         | `Key (`Arrow `Up, _) ->
           if menu_items () <> [] then (ui.menu_sel <- max 0 (ui.menu_sel - 1); redraw ui) else (recall ui 1; redraw ui)
         | `Key (`Arrow `Down, _) ->
           let n = List.length (menu_items ()) in
           if n > 0 then (ui.menu_sel <- min (n - 1) (ui.menu_sel + 1); redraw ui) else (recall ui (-1); redraw ui)
-        | `Mouse (`Press (`Scroll `Up), _, _) -> page ui 1
-        | `Mouse (`Press (`Scroll `Down), _, _) -> page ui (-1)
+        | `Mouse (`Press (`Scroll `Up), _, _) -> scroll_by ui wheel_step
+        | `Mouse (`Press (`Scroll `Down), _, _) -> scroll_by ui (-wheel_step)
         | `Key (`ASCII c, mods) -> on_ascii c mods
         | `Key (`Uchar u, mods) when not (List.mem `Ctrl mods) ->
           let b = Buffer.create 4 in Buffer.add_utf_8_uchar b u; insert ui (Buffer.contents b); ui.menu_sel <- 0; redraw ui

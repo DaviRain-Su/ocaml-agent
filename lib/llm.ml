@@ -131,12 +131,15 @@ type client = { providers : providers; tools : Tools.registry }
 let create_client () = { providers = create_providers (); tools = Tools.create_registry () }
 let default_client = { providers = default_providers; tools = Tools.default_registry }
 
+(* The client's tool registry, e.g. to register SDK tools into it. *)
+let client_tools c = c.tools
+
 let pstate = function Some c -> c.providers | None -> default_providers
 
 let normalize_name name = String.lowercase_ascii (String.trim name)
 
 let uniq xs =
-  List.fold_left (fun acc x -> if x = "" || List.mem x acc then acc else acc @ [ x ]) [] xs
+  List.rev (List.fold_left (fun acc x -> if x = "" || List.mem x acc then acc else x :: acc) [] xs)
 
 let set_provider_request_hook ?client hook = (pstate client).request_hook <- hook
 let set_provider_response_hook ?client hook = (pstate client).response_hook <- hook
@@ -302,7 +305,11 @@ let config ?client () : config =
       (Anthropic, "https://api.anthropic.com", [ "ANTHROPIC_API_KEY" ], Some "claude-opus-4-7", [], None)
     | `Generic Openai -> (Openai, "https://api.openai.com/v1", [ "OPENAI_API_KEY" ], None, [], None)
   in
-  let base_url = getenv_or "AGENT_BASE_URL" default_base in
+  let base_url =
+    let url = getenv_or "AGENT_BASE_URL" default_base in
+    let n = String.length url in
+    if n > 0 && url.[n - 1] = '/' then String.sub url 0 (n - 1) else url
+  in
   let api_key =
     match getenv "AGENT_API_KEY" with
     | Some k -> k
@@ -377,7 +384,7 @@ let content_of_json j =
     | "tool_result" ->
       Tool_result { id = j |> member "id" |> to_string; content = j |> member "content" |> to_string }
     | other -> failwith ("unknown content type: " ^ other)
-  with _ -> Text "[unparseable content block]"
+  with Sys.Break as e -> raise e | _ -> Text "[unparseable content block]"
 
 let turn_to_json t =
   `Assoc
@@ -388,7 +395,7 @@ let turn_of_json j =
   try
     let role = match j |> member "role" |> to_string with "assistant" -> Assistant | _ -> User in
     { role; content = j |> member "content" |> to_list |> List.map content_of_json }
-  with _ -> { role = User; content = [ Text "[unparseable turn]" ] }
+  with Sys.Break as e -> raise e | _ -> { role = User; content = [ Text "[unparseable turn]" ] }
 
 (* --- Anthropic protocol --- *)
 
@@ -584,6 +591,13 @@ let openai_messages ~system turns =
         |> List.filter_map (function Text s -> Some s | _ -> None)
         |> String.concat "\n"
       in
+      (* Reasoning models (e.g. DeepSeek) require the prior reasoning_content to
+         be echoed back on the next request. *)
+      let reasoning =
+        t.content
+        |> List.filter_map (function Thinking { text; _ } -> Some text | _ -> None)
+        |> String.concat "\n"
+      in
       let tool_calls =
         t.content
         |> List.filter_map (function
@@ -600,6 +614,7 @@ let openai_messages ~system turns =
       in
       let content_field = if text = "" then `Null else `String text in
       let fields = [ ("role", `String "assistant"); ("content", content_field) ] in
+      let fields = if reasoning = "" then fields else fields @ [ ("reasoning_content", `String reasoning) ] in
       let fields = if tool_calls = [] then fields else fields @ [ ("tool_calls", `List tool_calls) ] in
       [ `Assoc fields ]
   in
@@ -629,6 +644,7 @@ let openai_complete cfg ~system ~on_text ~tools_enabled ?tool_names ~client ~tra
     [ "content-type: application/json"; "Authorization: Bearer " ^ cfg.api_key ] @ cfg.extra_headers
   in
   let text = Buffer.create 256 in
+  let reasoning = Buffer.create 256 in
   (* tool calls accumulate by streamed index *)
   let tools : (int, string ref * string ref * Buffer.t) Hashtbl.t = Hashtbl.create 4 in
   let order = ref [] in
@@ -663,6 +679,9 @@ let openai_complete cfg ~system ~on_text ~tools_enabled ?tool_names ~client ~tra
                 Buffer.add_string text s;
                 on_text s
               | _ -> ());
+             (match d |> member "reasoning_content" with
+              | `String s when s <> "" -> Buffer.add_string reasoning s
+              | _ -> ());
              match d |> member "tool_calls" with
              | `Null -> ()
              | calls ->
@@ -690,6 +709,9 @@ let openai_complete cfg ~system ~on_text ~tools_enabled ?tool_names ~client ~tra
 	   with Transport.Http_error e ->
 	     let msg = if Buffer.length err > 0 then e ^ "\n" ^ Buffer.contents err else e in
 	     raise (Api_error msg));
+  let reasoning_blocks =
+    if Buffer.length reasoning > 0 then [ Thinking { text = Buffer.contents reasoning; signature = "" } ] else []
+  in
   let text_blocks =
     if Buffer.length text > 0 then [ Text (Buffer.contents text) ] else []
   in
@@ -707,7 +729,7 @@ let openai_complete cfg ~system ~on_text ~tools_enabled ?tool_names ~client ~tra
   in
   if text_blocks = [] && tool_blocks = [] && Buffer.length err > 0 then
     raise (Api_error (Buffer.contents err));
-  (text_blocks @ tool_blocks, { input_tokens = !in_tok; output_tokens = !out_tok })
+  (reasoning_blocks @ text_blocks @ tool_blocks, { input_tokens = !in_tok; output_tokens = !out_tok })
 
 (* --- dispatch --- *)
 

@@ -5,11 +5,14 @@
    native transport can raise the same exception. *)
 exception Http_error = Transport.Http_error
 
+let max_http_response_bytes = 50 * 1024 * 1024
+
 let read_all ic =
   let buf = Buffer.create 4096 in
+  let max = max_http_response_bytes in
   (try
-     while true do
-       Buffer.add_channel buf ic 4096
+     while Buffer.length buf < max do
+       Buffer.add_channel buf ic (min 4096 (max - Buffer.length buf))
      done
    with End_of_file -> ());
   Buffer.contents buf
@@ -72,7 +75,7 @@ let run_capture cmd =
   let out, exn =
     try (read_all ic, None) with e -> ("", Some e)
   in
-  let status = try Unix.close_process_in ic with _ -> Unix.WEXITED 1 in
+  let status = try Unix.close_process_in ic with Sys.Break as e -> raise e | _ -> Unix.WEXITED 1 in
   match exn with Some e -> raise e | None -> (out, status)
 
 (* POST [body] as JSON to [url] with the given [headers] (each "Key: Value"). *)
@@ -139,7 +142,7 @@ let post_stream ~url ~(headers : string list) ~(on_line : string -> unit) (body 
           None
         with e -> Some e
       in
-      let status = try Unix.close_process_in ic with _ -> Unix.WEXITED 1 in
+      let status = try Unix.close_process_in ic with Sys.Break as e -> raise e | _ -> Unix.WEXITED 1 in
       match exn with
       | Some e -> raise e
       | None -> (

@@ -98,9 +98,9 @@ let settings_json () =
   settings_files ()
   |> List.fold_left
        (fun acc path ->
-         match Yojson.Safe.from_file path with
-         | json -> merge_json acc json
-         | exception _ -> acc)
+         try merge_json acc (Yojson.Safe.from_file path) with
+         | Sys.Break as e -> raise e
+         | _ -> acc)
        (`Assoc [])
 
 let settings_member path =

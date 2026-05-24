@@ -1,70 +1,61 @@
 (* End-to-end SDK host — runs fully offline (no network, no API key).
 
-   Ties the native-SDK pieces together:
-   - Extension_sdk : the "add" tool lives in a separate native extension binary
-     (sdk_extension.ml); this host invokes it over the extension stdin/stdout
-     protocol, exactly as the agent would drive any native extension.
-   - Llm.client    : an isolated client with its own tool registry + transport.
-   - Transport.t   : a mock HTTP transport standing in for curl, so the agent
-     loop runs deterministically without contacting a provider.
+   Uses only the curated public facade [Ocaml_agent] and the in-process
+   extension API:
+   - Extension_sdk : register an "add" tool, then mount it in-process via
+     [tool_specs] / [invoke_tool] (no subprocess; see sdk_extension.ml for the
+     stdin/stdout protocol variant).
+   - Llm.client / Llm.client_tools : an isolated client whose tool registry we
+     populate with the bridged tool.
+   - Transport.t : a mock HTTP transport standing in for curl, so the agent loop
+     runs deterministically.
    - Llm.make_config : build a config programmatically (no env vars).
    - Agent.create ~client / Agent.send : drive the agent loop end to end.
 
-   Flow: agent -> "add" tool -> sdk_extension subprocess -> result -> agent ->
-   final answer. The mock provider asks to use "add", then returns a final text
-   answer once it sees the tool result.
+   Flow: agent -> "add" tool -> Extension_sdk.invoke_tool -> result -> agent ->
+   final answer.
 
    Build & run:  dune exec examples/sdk_host.exe *)
 
-open Agent_lib
+open Agent_lib.Ocaml_agent
 module J = Yojson.Safe
 module U = Yojson.Safe.Util
 
-(* The extension binary is built alongside this host in the same directory. *)
-let extension_exe = Filename.concat (Filename.dirname Sys.executable_name) "sdk_extension.exe"
+(* --- 1. Define a custom tool with the extension SDK (in this process) --- *)
 
-let read_all ic =
-  let buf = Buffer.create 256 in
-  (try
-     while true do
-       Buffer.add_channel buf ic 4096
-     done
-   with End_of_file -> ());
-  Buffer.contents buf
+let () =
+  Extension_sdk.register_tool ~name:"add" ~description:"Add two integers and return the sum."
+    ~parameters:
+      (`Assoc
+        [ ("type", `String "object");
+          ( "properties",
+            `Assoc
+              [ ("a", `Assoc [ ("type", `String "number") ]);
+                ("b", `Assoc [ ("type", `String "number") ]) ] );
+          ("required", `List [ `String "a"; `String "b" ]) ])
+    ~execute:(fun input ->
+      let n key = match U.member key input with `Int i -> i | `Float f -> int_of_float f | _ -> 0 in
+      string_of_int (n "a" + n "b"))
+    ()
 
-(* Send one JSON request to the extension on stdin, read its one JSON reply. *)
-let call_extension (request : J.t) : J.t =
-  let ic, oc = Unix.open_process extension_exe in
-  output_string oc (J.to_string request);
-  close_out oc;
-  let out = read_all ic in
-  ignore (Unix.close_process (ic, oc));
-  try J.from_string (String.trim out) with _ -> `Null
+(* --- 2. Mount every registered SDK tool into a client's registry --- *)
 
-(* --- bridge a tool from the native extension into a client's registry --- *)
+(* The agent's registry holds Tools.tool values whose [execute] returns a string;
+   extension-SDK tools return JSON {ok; text}. We bridge each registered tool by
+   calling Extension_sdk.invoke_tool in-process and extracting the text. *)
+let install_sdk_tools ~reg =
+  List.iter
+    (fun (name, description, parameters) ->
+      let execute input =
+        let resp = Extension_sdk.invoke_tool name input in
+        match (U.member "ok" resp, U.member "text" resp) with
+        | `Bool true, `String text -> text
+        | _ -> ( match U.member "error" resp with `String e -> "Error: " ^ e | _ -> J.to_string resp)
+      in
+      ignore (Tools.register ~reg { Tools.name; description; parameters; requires_approval = false; execute }))
+    (Extension_sdk.tool_specs ())
 
-let add_name = "add"
-let add_description = "Add two integers and return the sum."
-
-let add_parameters =
-  `Assoc
-    [ ("type", `String "object");
-      ( "properties",
-        `Assoc
-          [ ("a", `Assoc [ ("type", `String "number") ]);
-            ("b", `Assoc [ ("type", `String "number") ]) ] );
-      ("required", `List [ `String "a"; `String "b" ]) ]
-
-let bridge_extension_tool ~reg ~name ~description ~parameters =
-  let execute input =
-    let resp = call_extension (`Assoc [ ("mode", `String "execute"); ("tool", `String name); ("input", input) ]) in
-    match (U.member "ok" resp, U.member "text" resp) with
-    | `Bool true, `String text -> text
-    | _ -> ( match U.member "error" resp with `String e -> "Error: " ^ e | _ -> "Error: bad extension response")
-  in
-  ignore (Tools.register ~reg { Tools.name; description; parameters; requires_approval = false; execute })
-
-(* --- a mock HTTP transport (stands in for curl) --- *)
+(* --- 3. A mock HTTP transport (stands in for curl) --- *)
 
 let request_has_tool_result body =
   match U.member "messages" body with
@@ -121,21 +112,17 @@ let mock_transport : Transport.t =
         emit (`Assoc [ ("type", `String "message_delta"); ("usage", `Assoc [ ("output_tokens", `Int 6) ]) ]));
     post_json = (fun ~url:_ ~headers:_ _ -> `Assoc []) }
 
-(* --- assemble an isolated client and run the agent --- *)
+(* --- 4. Assemble an isolated client and run the agent --- *)
 
 let () =
-  (* Show the raw extension protocol once, for illustration. *)
-  let probe = call_extension (`Assoc [ ("mode", `String "command"); ("command", `String "greet"); ("args", `String "Ada") ]) in
-  Printf.printf "extension /greet -> %s\n" (J.to_string probe);
-
   let client = Llm.create_client () in
-  bridge_extension_tool ~reg:client.Llm.tools ~name:add_name ~description:add_description ~parameters:add_parameters;
+  install_sdk_tools ~reg:(Llm.client_tools client);
   Llm.set_transport ~client mock_transport;
   let cfg =
     Llm.make_config ~provider:Llm.Anthropic ~base_url:"https://mock.invalid" ~api_key:"demo-key"
       ~model:"demo-model" ()
   in
   let agent = Agent.create ~client cfg in
-  print_endline "=== running agent (offline mock transport; tool runs in extension subprocess) ===";
+  print_endline "=== running agent (offline mock transport; tool runs in-process via Extension_sdk) ===";
   let answer = Agent.send agent "What is 2 + 3? Use the add tool." in
   Printf.printf "\n=== final answer ===\n%s\n" answer
