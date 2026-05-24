@@ -19,6 +19,10 @@ let () =
   (* Work in an isolated temp directory. *)
   let dir = Filename.temp_dir "agent_test" "" in
   Sys.chdir dir;
+  Unix.putenv "AGENT_SESSION_DIR" "";
+  Unix.putenv "AGENT_SCOPED_MODELS" "";
+  Unix.putenv "PI_CODING_AGENT_DIR" (Filename.concat dir "pi-agent");
+  Unix.putenv "PI_CODING_AGENT_SESSION_DIR" (Filename.concat dir "pi-agent/sessions");
 
   let r = run "write_file" {|{"path":"sub/a.txt","content":"hello\nworld\n"}|} in
   check "write_file reports bytes" (Str.string_match (Str.regexp "Wrote ") r 0);
@@ -39,6 +43,10 @@ let () =
   let contains0 hay needle =
     try ignore (Str.search_forward (Str.regexp_string needle) hay 0); true with Not_found -> false
   in
+  let session_context_leaf session turns =
+    Extensions.session_context_json ?info:(Some (Session.info_of session)) ~entries:session.Session.entries turns
+    |> Yojson.Safe.Util.member "leafId"
+  in
   let r = run "edit_file" {|{"path":"sub/a.txt","old_str":"hello","new_str":"hi"}|} in
   check "edit_file returns diff" (contains0 r "-hello" && contains0 r "+hi");
   let _ = run "write_file" {|{"path":"multi.txt","content":"a\nb\nc\n"}|} in
@@ -54,8 +62,72 @@ let () =
   let r2 = run "read_file" {|{"path":"atomic.txt"}|} in
   check "edit_file atomic multi no partial" (r2 = "x\ny\nz\n");
 
+  let _ = run "write" {|{"file_path":"alias/path.txt","content":"alias body"}|} in
+  let r = run "read" {|{"file_path":"alias/path.txt"}|} in
+  check "Pi file_path aliases work for read/write" (r = "alias body");
+
+  let _ = run "write_file" {|{"path":"pi-edit.txt","content":"one\ntwo\nthree\n"}|} in
+  let r =
+    run "edit"
+      {|{"path":"pi-edit.txt","edits":[{"oldText":"one\n","newText":"ONE\n"}],"oldText":"three\n","newText":"THREE\n"}|}
+  in
+  check "edit accepts Pi oldText/newText and appends legacy top-level edit"
+    (contains0 r "Successfully replaced 2 blocks" && contains0 r "2 changes");
+  let r = run "read_file" {|{"path":"pi-edit.txt"}|} in
+  check "edit Pi fields applied" (r = "ONE\ntwo\nTHREE\n");
+
+  let _ = run "write_file" {|{"path":"string-edits.txt","content":"a\nb\n"}|} in
+  let _ = run "edit_file" {|{"path":"string-edits.txt","edits":"[{\"oldText\":\"a\\n\",\"newText\":\"A\\n\"}]"}|} in
+  let r = run "read_file" {|{"path":"string-edits.txt"}|} in
+  check "edit parses JSON-string edits" (r = "A\nb\n");
+
+  let _ = run "write_file" {|{"path":"original-match.txt","content":"foo\nbar\nbaz\n"}|} in
+  let _ =
+    run "edit"
+      {|{"path":"original-match.txt","edits":[{"oldText":"foo\n","newText":"foo bar\n"},{"oldText":"bar\n","newText":"BAR\n"}]}|}
+  in
+  let r = run "read_file" {|{"path":"original-match.txt"}|} in
+  check "edit multi matches against original file" (r = "foo bar\nBAR\nbaz\n");
+
+  let _ = run "write_file" {|{"path":"dups.txt","content":"foo foo foo"}|} in
+  let r = run "edit" {|{"path":"dups.txt","edits":[{"oldText":"foo","newText":"bar"}]}|} in
+  check "edit rejects duplicate oldText" (contains0 r "Found 3 occurrences");
+
+  let _ = run "write_file" {|{"path":"overlap.txt","content":"one\ntwo\nthree\n"}|} in
+  let r =
+    run "edit"
+      {|{"path":"overlap.txt","edits":[{"oldText":"one\ntwo\n","newText":"ONE\nTWO\n"},{"oldText":"two\nthree\n","newText":"TWO\nTHREE\n"}]}|}
+  in
+  check "edit rejects overlapping multi edits" (contains0 r "overlap");
+
+  let bom = "\239\187\191" in
+  Tools.write_file_contents "bom-crlf.txt" (bom ^ "first\r\nsecond\r\nthird\r\n");
+  let _ = run "edit" {|{"path":"bom-crlf.txt","edits":[{"oldText":"second\n","newText":"SECOND\n"}]}|} in
+  let r = Tools.read_file_contents "bom-crlf.txt" in
+  check "edit preserves BOM and CRLF" (r = bom ^ "first\r\nSECOND\r\nthird\r\n");
+
+  Tools.write_file_contents "fuzzy-ws.txt" "line one   \nline two  \nline three\n";
+  let _ = run "edit" {|{"path":"fuzzy-ws.txt","edits":[{"oldText":"line one\nline two\n","newText":"replaced\n"}]}|} in
+  let r = run "read_file" {|{"path":"fuzzy-ws.txt"}|} in
+  check "edit fuzzy matches trailing whitespace" (r = "replaced\nline three\n");
+
+  Tools.write_file_contents "fuzzy-unicode.txt"
+    ("\239\188\161\239\188\162\239\188\163\239\188\145\239\188\146\239\188\147\n"
+     ^ "console.log(\226\128\152hello\226\128\153);\n");
+  let _ =
+    run "edit"
+      {|{"path":"fuzzy-unicode.txt","edits":[{"oldText":"ABC123\n","newText":"XYZ789\n"},{"oldText":"console.log('hello');\n","newText":"console.log('world');\n"}]}|}
+  in
+  let r = run "read_file" {|{"path":"fuzzy-unicode.txt"}|} in
+  check "edit fuzzy matches Unicode compatibility variants" (r = "XYZ789\nconsole.log('world');\n");
+
   let r = run "list_dir" {|{"path":"sub"}|} in
   check "list_dir lists file" (r = "a.txt");
+  let _ = run "write_file" {|{"path":"sub/.hidden","content":"secret"}|} in
+  let _ = run "write_file" {|{"path":"sub/nested/file.txt","content":"nested"}|} in
+  let r = run "ls" {|{"path":"sub","limit":2}|} in
+  check "ls supports dotfiles, directories, and limit"
+    (contains0 r ".hidden" && contains0 r "a.txt" && contains0 r "2 entries limit reached");
 
   let r = run "read_file" {|{"path":"does_not_exist"}|} in
   check "read_file error" (Str.string_match (Str.regexp "Error:") r 0);
@@ -64,13 +136,44 @@ let () =
     try ignore (Str.search_forward (Str.regexp_string needle) hay 0); true
     with Not_found -> false
   in
+  let large_lines = List.init 2500 (fun i -> Printf.sprintf "Line %d" (i + 1)) in
+  Tools.write_file_contents "large-read.txt" (String.concat "\n" large_lines);
+  let r = run "read_file" {|{"path":"large-read.txt"}|} in
+  check "read_file truncates large files by line"
+    (contains r "Line 1" && contains r "Line 2000" && not (contains r "Line 2001")
+     && contains r "[Showing lines 1-2000 of 2500. Use offset=2001 to continue.]");
+  let r = run "read_file" {|{"path":"large-read.txt","offset":2001,"limit":3}|} in
+  check "read_file supports offset and limit"
+    (not (contains r "Line 2000") && contains r "Line 2001" && contains r "Line 2003"
+     && not (contains r "Line 2004"));
+  let r = run "read_file" {|{"path":"large-read.txt","limit":10}|} in
+  check "read_file limit includes continuation"
+    (contains r "Line 10" && not (contains r "Line 11") && contains r "[2490 more lines in file. Use offset=11 to continue.]");
+  let r = run "read_file" {|{"path":"large-read.txt","offset":9999}|} in
+  check "read_file reports offset beyond EOF" (contains r "Offset 9999 is beyond end of file");
+  let byte_lines = List.init 500 (fun i -> Printf.sprintf "Line %d: %s" (i + 1) (String.make 200 'x')) in
+  Tools.write_file_contents "large-bytes.txt" (String.concat "\n" byte_lines);
+  let r = run "read_file" {|{"path":"large-bytes.txt"}|} in
+  check "read_file truncates large files by bytes" (contains r "Line 1:" && contains r "50KB limit" && contains r "Use offset=");
   let r = run "run_bash" {|{"command":"echo hi && exit 3"}|} in
   check "run_bash captures output" (contains r "hi");
   check "run_bash reports exit code" (contains r "(exit 3)");
+  let r = run "run_bash" {|{"command":"sleep 2","timeout":1}|} in
+  check "run_bash honors timeout argument" (contains r "(exit 124)" && contains r "timed out");
   let code, out = Tools.run_process ~timeout_s:1 "sleep 2" in
   check "run_process enforces timeout" (code = 124 && contains out "timed out");
   let code, out = Tools.run_process ~stdin_data:{|{"x":1}|} "cat" in
   check "run_process passes stdin data" (code = 0 && out = {|{"x":1}|});
+  Unix.putenv "AGENT_SHELL_COMMAND_PREFIX" "export OCAML_AGENT_PREFIXED=ok";
+  let code, out = Tools.run_process {|printf "$OCAML_AGENT_PREFIXED"|} in
+  check "run_process ignores shell prefix by default" (code = 0 && out = "");
+  let code, out = Tools.run_process ~use_shell_settings:true {|printf "$OCAML_AGENT_PREFIXED"|} in
+  check "run_process applies shellCommandPrefix for bash mode" (code = 0 && out = "ok");
+  Unix.putenv "AGENT_SHELL_COMMAND_PREFIX" "";
+  Unix.putenv "AGENT_SHELL_PATH" "/bin/echo";
+  let code, out = Tools.run_process ~use_shell_settings:true "shell-path-marker" in
+  check "run_process uses configured shellPath" (code = 0 && contains out "shell-path-marker");
+  Unix.putenv "AGENT_SHELL_PATH" "";
 
   (* --- grep --- *)
   let _ = run "write_file" {|{"path":"src/foo.ml","content":"let answer = 42\nlet x = 1\n"}|} in
@@ -80,16 +183,33 @@ let () =
   check "grep finds in .txt" (contains r "src/bar.txt:1:");
   let r = run "grep" {|{"pattern":"answer","include":"*.ml"}|} in
   check "grep include filters" (contains r "foo.ml" && not (contains r "bar.txt"));
+  let r = run "grep" {|{"pattern":"ANSWER","path":"src","glob":"*.txt","ignoreCase":true}|} in
+  check "grep supports glob and ignoreCase" (contains r "bar.txt:1:" && not (contains r "foo.ml"));
+  let _ = run "write_file" {|{"path":"context.txt","content":"before\nmatch one\nafter\nmiddle\nmatch two\nafter two\n"}|} in
+  let r = run "grep" {|{"pattern":"match","path":"context.txt","context":1,"limit":1}|} in
+  check "grep supports context and limit"
+    (contains r "context.txt-1- before" && contains r "context.txt:2: match one"
+     && contains r "1 matches limit reached" && not (contains r "match two"));
+  let r = run "grep" {|{"pattern":"--pre=/tmp/should-not-run","path":"src","literal":true}|} in
+  check "grep treats flag-like literal patterns as text" (r = "No matches found");
   let r = run "grep" {|{"pattern":"zzz_nomatch"}|} in
-  check "grep no match" (r = "No matches.");
+  check "grep no match" (r = "No matches found");
 
   (* --- find --- *)
+  let _ = run "write_file" {|{"path":"src/.secret/hidden.txt","content":"hidden"}|} in
+  let _ = run "write_file" {|{"path":"src/ignored.txt","content":"ignored"}|} in
+  let _ = run "write_file" {|{"path":"src/.gitignore","content":"ignored.txt\n"}|} in
   let r = run "find" {|{"pattern":"*.ml"}|} in
   check "find by basename glob" (contains r "src/foo.ml" && not (contains r "bar.txt"));
   let r = run "find" {|{"pattern":"src/**/*.txt"}|} in
   check "find by path glob" (contains r "src/bar.txt");
+  let r = run "find" {|{"pattern":"**/*.txt","path":"src"}|} in
+  check "find includes hidden files and respects .gitignore"
+    (contains r ".secret/hidden.txt" && not (contains r "ignored.txt"));
+  let r = run "find" {|{"pattern":"**/*.txt","path":"src","limit":1}|} in
+  check "find supports limit" (contains r "1 results limit reached");
   let r = run "find" {|{"pattern":"*.nope"}|} in
-  check "find no match" (r = "No files found.");
+  check "find no match" (r = "No files found matching pattern");
 
   (* --- Llm turn <-> JSON round-trip --- *)
   let turns =
@@ -99,11 +219,19 @@ let () =
           [ Llm.Thinking { text = "let me think"; signature = "sig123" };
             Llm.Text "thinking";
             Llm.Tool_use { id = "t1"; name = "read_file"; input = j {|{"path":"a.txt"}|} } ] };
+      { Llm.role = User; content = [ Llm.Image { mime_type = "image/png"; data = "iVBORw0KGgo=" } ] };
       { Llm.role = User; content = [ Llm.Tool_result { id = "t1"; content = "file body" } ] } ]
   in
   let roundtrip = List.map (fun t -> Llm.turn_of_json (Llm.turn_to_json t)) turns in
   check "turn json round-trips"
     (List.map Llm.turn_to_json turns = List.map Llm.turn_to_json roundtrip);
+  let anthropic_image_json = Yojson.Safe.to_string (`List (Llm.anthropic_messages [ List.nth turns 2 ])) in
+  check "Anthropic messages preserve image blocks"
+    (contains0 anthropic_image_json "\"type\":\"image\"" && contains0 anthropic_image_json "\"media_type\":\"image/png\"");
+  let openai_image_json = Yojson.Safe.to_string (`List (Llm.openai_messages ~system:"sys" [ List.nth turns 2 ])) in
+  check "OpenAI messages preserve image blocks"
+    (contains0 openai_image_json "\"type\":\"image_url\""
+     && contains0 openai_image_json "data:image/png;base64,iVBORw0KGgo=");
 
   (* --- Session save/load --- *)
   let spath = "session.jsonl" in
@@ -146,6 +274,7 @@ let () =
       model = "test-model";
       max_tokens = 4096;
       extra_headers = [];
+      runtime = None;
       thinking = "off" }
   in
   let reset_session = Session.create_new ~name:"reset" () in
@@ -168,14 +297,177 @@ let () =
   let hidden_result = Agent.run_user_bash ~exclude_from_context:true bang_agent "printf hidden" in
   check "hidden bang shell captures output" (contains hidden_result "hidden");
   check "hidden bang shell does not record context" (Agent.turn_count bang_agent = hidden_count);
+
+  (* --- RPC command compatibility --- *)
+  let rpc_field json key =
+    match json with `Assoc fields -> List.assoc_opt key fields | _ -> None
+  in
+  let rpc_last out = match List.rev out with last :: _ -> last | [] -> `Null in
+  let rpc_success out command =
+    let r = rpc_last out in
+    rpc_field r "type" = Some (`String "response")
+    && rpc_field r "command" = Some (`String command)
+    && rpc_field r "success" = Some (`Bool true)
+  in
+  let rpc_content =
+    Rpc.prompt_content ~prefix:[ Llm.Text "file context" ]
+      (j {|{"images":[{"mimeType":"image/png","data":"abc"}]}|})
+      "rpc prompt"
+  in
+  check "rpc prompt content preserves CLI prefix and images"
+    (match rpc_content with
+     | [ Llm.Text "file context"; Llm.Text "rpc prompt"; Llm.Image { mime_type = "image/png"; data = "abc" } ] -> true
+     | _ -> false);
+  let rpc_agent = Agent.create cfg_for_reset in
+  let out = Rpc.handle_command_for_test rpc_agent (j {|{"id":"state-1","type":"get_state"}|}) in
+  let state_ok =
+    match rpc_field (rpc_last out) "data" with
+    | Some (`Assoc fields) ->
+      List.assoc_opt "thinkingLevel" fields = Some (`String "off")
+      && List.assoc_opt "messageCount" fields = Some (`Int 0)
+    | _ -> false
+  in
+  check "rpc Pi get_state response" (rpc_success out "get_state" && state_ok);
+  let out = Rpc.handle_command_for_test rpc_agent (j {|{"type":"set_auto_compaction","enabled":false}|}) in
+  check "rpc Pi set_auto_compaction toggles agent" (rpc_success out "set_auto_compaction" && not (Agent.auto_compact rpc_agent));
+  let out = Rpc.handle_command_for_test rpc_agent (j {|{"type":"set_auto_retry","enabled":false}|}) in
+  check "rpc Pi set_auto_retry toggles agent" (rpc_success out "set_auto_retry" && not (Agent.auto_retry rpc_agent));
+  let out = Rpc.handle_command_for_test rpc_agent (j {|{"type":"set_steering_mode","mode":"one-at-a-time"}|}) in
+  check "rpc Pi set_steering_mode persists" (rpc_success out "set_steering_mode" && Agent.steering_mode rpc_agent = "one-at-a-time");
+  let out = Rpc.handle_command_for_test rpc_agent (j {|{"type":"set_follow_up_mode","mode":"one-at-a-time"}|}) in
+  check "rpc Pi set_follow_up_mode persists" (rpc_success out "set_follow_up_mode" && Agent.follow_up_mode rpc_agent = "one-at-a-time");
+  let out = Rpc.handle_command_for_test rpc_agent (j {|{"type":"get_state"}|}) in
+  let queue_state_ok =
+    match rpc_field (rpc_last out) "data" with
+    | Some (`Assoc fields) ->
+      List.assoc_opt "steeringMode" fields = Some (`String "one-at-a-time")
+      && List.assoc_opt "followUpMode" fields = Some (`String "one-at-a-time")
+      && List.assoc_opt "autoRetryEnabled" fields = Some (`Bool false)
+    | _ -> false
+  in
+  check "rpc Pi get_state reflects queue/retry controls" (rpc_success out "get_state" && queue_state_ok);
+  let out = Rpc.handle_command_for_test rpc_agent (j {|{"type":"abort_retry"}|}) in
+  check "rpc Pi abort_retry acks" (rpc_success out "abort_retry");
+  let out = Rpc.handle_command_for_test rpc_agent (j {|{"type":"abort_bash"}|}) in
+  check "rpc Pi abort_bash acks" (rpc_success out "abort_bash");
+  let out = Rpc.handle_command_for_test rpc_agent (j {|{"type":"abort"}|}) in
+  check "rpc Pi abort acks" (rpc_success out "abort");
+  let out = Rpc.handle_command_for_test rpc_agent (j {|{"type":"set_thinking_level","level":"high"}|}) in
+  check "rpc Pi set_thinking_level applies" (rpc_success out "set_thinking_level" && (Agent.config rpc_agent).Llm.thinking = "high");
+  Agent.set_thinking rpc_agent "off";
+  let before_cycle_model = (Agent.config rpc_agent).Llm.model in
+  let out = Rpc.handle_command_for_test rpc_agent (j {|{"type":"cycle_model"}|}) in
+  let cycle_model_ok =
+    match rpc_field (rpc_last out) "data" with
+    | Some (`Assoc fields) -> (
+      match List.assoc_opt "model" fields, List.assoc_opt "thinkingLevel" fields, List.assoc_opt "isScoped" fields with
+      | Some (`Assoc model_fields), Some (`String "off"), Some (`Bool false) ->
+        List.assoc_opt "id" model_fields <> Some (`String before_cycle_model)
+        && List.assoc_opt "provider" model_fields <> None
+      | _ -> false)
+    | _ -> false
+  in
+  check "rpc Pi cycle_model switches model and returns metadata"
+    (rpc_success out "cycle_model" && cycle_model_ok && (Agent.config rpc_agent).Llm.model <> before_cycle_model);
+  let out = Rpc.handle_command_for_test rpc_agent (j {|{"type":"get_available_models"}|}) in
+  let models_ok =
+    match rpc_field (rpc_last out) "data" with
+    | Some (`Assoc fields) -> (
+      match List.assoc_opt "models" fields with Some (`List (_ :: _)) -> true | _ -> false)
+    | _ -> false
+  in
+  check "rpc Pi get_available_models lists catalog" (rpc_success out "get_available_models" && models_ok);
+  let out = Rpc.handle_command_for_test rpc_agent (j {|{"type":"bash","command":"printf rpc && exit 7"}|}) in
+  let bash_ok =
+    match rpc_field (rpc_last out) "data" with
+    | Some (`Assoc fields) ->
+      List.assoc_opt "output" fields = Some (`String "rpc")
+      && List.assoc_opt "exitCode" fields = Some (`Int 7)
+    | _ -> false
+  in
+  check "rpc Pi bash returns BashResult shape" (rpc_success out "bash" && bash_ok && Agent.turn_count rpc_agent = 1);
+  let out = Rpc.handle_command_for_test rpc_agent (j {|{"type":"new_session"}|}) in
+  check "rpc Pi new_session attaches empty session"
+    (rpc_success out "new_session" && Agent.turn_count rpc_agent = 0 && Agent.session rpc_agent <> None);
+  let out = Rpc.handle_command_for_test rpc_agent (j {|{"type":"set_session_name","name":"rpc-name"}|}) in
+  let named =
+    match Agent.session rpc_agent with
+    | Some s -> (Session.info_of s).Session.name = "rpc-name"
+    | None -> false
+  in
+  check "rpc Pi set_session_name persists" (rpc_success out "set_session_name" && named);
+  let out = Rpc.handle_command_for_test rpc_agent (j {|{"type":"export_html","outputPath":"rpc-export.html"}|}) in
+  check "rpc Pi export_html writes file" (rpc_success out "export_html" && Sys.file_exists "rpc-export.html");
+  let switch_target = Session.create_new ~name:"rpc-switch" () in
+  Session.append switch_target { Llm.role = Llm.User; content = [ Llm.Text "switch turn" ] };
+  let switch_json =
+    Printf.sprintf {|{"type":"switch_session","sessionPath":"%s"}|} switch_target.Session.id |> j
+  in
+  let out = Rpc.handle_command_for_test rpc_agent switch_json in
+  let switched =
+    match Agent.session rpc_agent with
+    | Some s -> s.Session.id = switch_target.Session.id && Agent.turn_count rpc_agent = 1
+    | None -> false
+  in
+  check "rpc Pi switch_session resolves id" (rpc_success out "switch_session" && switched);
+  Session.close switch_target;
+  let out =
+    Rpc.handle_command_for_test rpc_agent
+      (j {|{"id":"ui-1","type":"extension_ui_response","requestId":"ui-1","response":true}|})
+  in
+  check "rpc Pi extension_ui_response accepts fallback ack" (rpc_success out "extension_ui_response");
+  let out = Rpc.handle_command_for_test rpc_agent (j {|{"method":"session"}|}) in
+  check "rpc legacy method still emits ok" (rpc_field (rpc_last out) "type" = Some (`String "ok"));
+  Option.iter Session.close (Agent.session rpc_agent);
+
   let cl = Session.clone_from turns in
   check "clone duplicates turns" (List.length (Session.load_turns cl.Session.path) = List.length turns);
   check "clone is a new id" (cl.Session.id <> ns.Session.id);
+  let import_path = "import-source.jsonl" in
+  Session.export_jsonl turns import_path;
+  let import_agent = Agent.create cfg_for_reset in
+  let import_msg = Commands.import_session import_agent import_path in
+  check "import command reports imported session" (contains import_msg "Imported import-source.jsonl");
+  check "import command loads turns into agent" (Agent.turn_count import_agent = List.length turns);
+  let imported_session =
+    match Agent.session import_agent with
+    | Some s -> s
+    | None -> failwith "import did not attach session"
+  in
+  check "import command creates managed session" (imported_session.Session.path <> import_path);
+  check "imported managed session persists turns"
+    (List.length (Session.load_turns imported_session.Session.path) = List.length turns);
+  Session.close imported_session;
+  let fork_msg = Commands.fork import_agent (Some ns.Session.id) in
+  check "fork command forks named session" (contains fork_msg "Forked" && Agent.turn_count import_agent = List.length turns);
+  let fork_current_msg = Commands.fork import_agent None in
+  check "fork command defaults to current session" (contains fork_current_msg "Cloned to new session");
+  Unix.putenv "AGENT_SCOPED_MODELS" "";
+  check "scoped-models reports all by default" (Commands.scoped_models None = "Scoped models: all");
+  check "scoped-models sets patterns" (contains (Commands.scoped_models (Some "anthropic/*,gpt-4o")) "anthropic/*");
+  check "scoped-models writes env"
+    (match Sys.getenv_opt "AGENT_SCOPED_MODELS" with Some s -> contains s "gpt-4o" | None -> false);
+  check "scoped-models clears patterns" (Commands.scoped_models (Some "clear") = "Scoped models cleared.");
+  let _ = run "write_file" {|{"path":"CHANGELOG.md","content":"# Changelog\n\n- Added parity\n"}|} in
+  check "changelog command reads file" (contains (Commands.changelog ()) "Added parity");
+  check "hotkeys command mentions slash commands" (contains (Commands.hotkeys ()) "slash commands");
+  Option.iter Session.close (Agent.session import_agent);
   Session.close ns;
   Session.close cl;
 
   (* --- system prompt context injection + identity --- *)
   let _ = run "write_file" {|{"path":"AGENTS.md","content":"PROJECT_RULE_XYZ"}|} in
+  let _ = run "write_file" {|{"path":"CLAUDE.md","content":"PROJECT_CLAUDE_RULE_XYZ"}|} in
+  let _ =
+    run "write_file"
+      (Printf.sprintf {|{"path":"%s","content":"GLOBAL_RULE_XYZ"}|}
+         (Filename.concat (Sys.getenv "PI_CODING_AGENT_DIR") "AGENTS.md"))
+  in
+  let _ =
+    run "write_file"
+      (Printf.sprintf {|{"path":"%s","content":"GLOBAL_CLAUDE_RULE_XYZ"}|}
+         (Filename.concat (Sys.getenv "PI_CODING_AGENT_DIR") "CLAUDE.md"))
+  in
   let cfg =
     { Llm.provider = Llm.Openai;
       base_url = "https://api.deepseek.com";
@@ -183,10 +475,14 @@ let () =
       model = "deepseek-v4-pro";
       max_tokens = 4096;
       extra_headers = [];
+      runtime = None;
       thinking = "off" }
   in
   let prompt = Agent.build_system_prompt cfg in
   check "system prompt injects AGENTS.md" (contains prompt "PROJECT_RULE_XYZ");
+  check "system prompt injects CLAUDE.md" (contains prompt "PROJECT_CLAUDE_RULE_XYZ");
+  check "system prompt injects global AGENTS.md" (contains prompt "GLOBAL_RULE_XYZ");
+  check "system prompt injects global CLAUDE.md" (contains prompt "GLOBAL_CLAUDE_RULE_XYZ");
   check "system prompt includes cwd" (contains prompt "Current working directory:");
   check "system prompt includes date" (contains prompt "Current date:");
   check "system prompt states model identity" (contains prompt "deepseek-v4-pro");
@@ -218,6 +514,16 @@ let () =
   let expanded = Mentions.expand "Review @mention.txt." in
   check "mentions expand file references" (contains expanded "<file name=\"mention.txt\">" && contains expanded "MENTION_BODY");
   check "file args expand as file blocks" (contains (Mentions.expand_file_args [ "mention.txt" ]) "MENTION_BODY");
+  Tools.write_file_contents "tiny.png" "\137PNG\r\n\026\n";
+  let image_args = Mentions.expand_file_args_rich [ "tiny.png"; "mention.txt" ] in
+  check "file args attach image blocks"
+    (contains image_args.text "<file name=\"tiny.png\">[Image: image/png]</file>"
+     && List.length image_args.images = 1
+     && (List.hd image_args.images).Mentions.mime_type = "image/png"
+     && (List.hd image_args.images).Mentions.data = "iVBORw0KGgo=");
+  let image_mention = Mentions.expand_rich "Look at @tiny.png" in
+  check "mentions attach image files"
+    (contains image_mention.text "[Image: image/png]" && List.length image_mention.images = 1);
 
   (* --- Render --- *)
   let has hay needle =
@@ -239,10 +545,17 @@ let () =
   in
   let _ =
     run "write_file"
+      (Printf.sprintf
+         {|{"path":"%s","content":"---\nname: global_skill\ndescription: Global Pi skill\n---\nGlobal details."}|}
+         (Filename.concat (Filename.concat (Sys.getenv "PI_CODING_AGENT_DIR") "skills") "global.md"))
+  in
+  let _ =
+    run "write_file"
       {|{"path":".ocaml-agent/skills/hidden.md","content":"---\nname: hidden\ndescription: nope\ndisable-model-invocation: true\n---\nx"}|}
   in
   let skills = Skills.discover () in
   check "skills discovered" (List.exists (fun (s : Skills.t) -> s.name = "deploy") skills);
+  check "global Pi skills discovered" (List.exists (fun (s : Skills.t) -> s.name = "global_skill") skills);
   check "skills honor disable flag" (not (List.exists (fun (s : Skills.t) -> s.name = "hidden") skills));
   let sf = Skills.format skills in
   check "skills format has name + location"
@@ -265,9 +578,16 @@ let () =
     run "write_file"
       {|{"path":".ocaml-agent/prompts/component.md","content":"---\ndescription: Create a component\nargument-hint: <name> [features]\n---\nBuild component $1 with: ${@:2}\nAll: $ARGUMENTS"}|}
   in
+  let _ =
+    run "write_file"
+      (Printf.sprintf {|{"path":"%s","content":"---\ndescription: Global prompt\n---\nGlobal says $1"}|}
+         (Filename.concat (Filename.concat (Sys.getenv "PI_CODING_AGENT_DIR") "prompts") "global_prompt.md"))
+  in
   let prompts = Prompts.discover () in
   check "prompt templates discovered" (List.exists (fun (p : Prompts.t) -> p.name = "component") prompts);
+  check "global Pi prompt templates discovered" (List.exists (fun (p : Prompts.t) -> p.name = "global_prompt") prompts);
   check "prompt templates appear in completion" (List.mem_assoc "/component" (Complete.menu "/co"));
+  check "global Pi prompt expands" (Prompts.expand_command "/global_prompt hi" = Some "Global says hi");
   let expanded = Prompts.expand_command {|/component Button "click handler" disabled|} in
   check "prompt template expands positional and rest args"
     (expanded = Some "Build component Button with: click handler disabled\nAll: Button click handler disabled");
@@ -282,18 +602,215 @@ let () =
   Unix.putenv "AGENT_NO_PROMPT_TEMPLATES" "";
   Unix.putenv "AGENT_PROMPT_TEMPLATE_PATHS" "";
 
+  (* --- Pi-style settings.json --- *)
+  let _ =
+    run "write_file"
+      {|{"path":"settings_skill.md","content":"---\nname: settings-skill\ndescription: From settings\n---\nSettings skill."}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":"settings_prompt.md","content":"---\ndescription: From settings\n---\nSettings prompt $1"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":"settings-tools.json","content":"{\"tools\":[{\"name\":\"from_settings_manifest\",\"description\":\"settings\",\"parameters\":{\"type\":\"object\",\"properties\":{}},\"command\":\"cat\"}]}"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":"settings-theme.json","content":"{\"name\":\"settings-theme\",\"colors\":{\"accent\":\"#abcdef\"}}"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":".pi/settings.json","content":"{\"defaultProvider\":\"openai\",\"defaultModel\":\"gpt-4o\",\"defaultThinkingLevel\":\"high\",\"sessionDir\":\"settings-sessions\",\"enabledModels\":[\"zai/*\"],\"skills\":[\"settings_skill.md\"],\"prompts\":[\"settings_prompt.md\"],\"extensions\":[\"settings-tools.json\"],\"themes\":[\"settings-theme.json\"],\"quietStartup\":true,\"shellPath\":\"/bin/sh\",\"shellCommandPrefix\":\"export OCAML_AGENT_FROM_SETTINGS=from-settings\",\"compaction\":{\"enabled\":false}}"}|}
+  in
+  check "settings skill path loads"
+    (List.exists (fun (s : Skills.t) -> s.name = "settings-skill") (Skills.discover ()));
+  check "settings prompt path expands"
+    (Prompts.expand_command "/settings_prompt hi" = Some "Settings prompt hi");
+  check "settings extension path loads" (List.mem "from_settings_manifest" (Extensions.load ()));
+  check "settings theme path loads"
+    (List.exists (fun (t : Themes.t) -> t.name = "settings-theme") (Themes.discover ()));
+  Unix.putenv "AGENT_SCOPED_MODELS" "";
+  check "settings enabledModels scopes model picker"
+    (List.for_all (fun (e : Models.entry) -> e.provider = "zai") (Models.scoped_from_env ()));
+  Unix.putenv "AGENT_PROVIDER" "";
+  Unix.putenv "AGENT_MODEL" "";
+  Unix.putenv "AGENT_THINKING" "";
+  Unix.putenv "AGENT_API_KEY" "sk-test";
+  let settings_cfg = Llm.config () in
+  check "settings default provider/model/thinking"
+    (settings_cfg.Llm.provider = Llm.Openai && settings_cfg.model = "gpt-4o" && settings_cfg.thinking = "high");
+  Unix.putenv "AGENT_AUTO_COMPACT" "";
+  let settings_agent = Agent.create settings_cfg in
+  check "settings compaction flag applies" (not (Agent.auto_compact settings_agent));
+  let settings_bash = Agent.run_user_bash ~exclude_from_context:true settings_agent {|printf "$OCAML_AGENT_FROM_SETTINGS"|} in
+  check "settings shellCommandPrefix applies to user bash" (contains settings_bash "from-settings");
+  let saved_pi_session_dir = Sys.getenv_opt "PI_CODING_AGENT_SESSION_DIR" in
+  Unix.putenv "AGENT_SESSION_DIR" "";
+  Unix.putenv "PI_CODING_AGENT_SESSION_DIR" "";
+  check "settings sessionDir applies" (Session.default_dir () = "settings-sessions");
+  (match saved_pi_session_dir with Some s -> Unix.putenv "PI_CODING_AGENT_SESSION_DIR" s | None -> ());
+  Unix.putenv "AGENT_API_KEY" "";
+  Unix.putenv "AGENT_SCOPED_MODELS" "";
+
+  (* --- Pi package local resource discovery --- *)
+  let _ =
+    run "write_file"
+      {|{"path":"local-pkg/package.json","content":"{\"name\":\"local-pkg\",\"pi\":{\"extensions\":[\"extensions\",\"extensions/ts-extension.ts\"],\"skills\":[\"skills\"],\"prompts\":[\"prompts\"],\"themes\":[\"themes\"]}}"}|}
+  in
+  let _ = run "write_file" {|{"path":"local-pkg/extensions/ts-extension.ts","content":"export default function(pi) {}"}|} in
+  let _ =
+    run "write_file"
+      {|{"path":"local-pkg/extensions/pkg-tools.json","content":"{\"tools\":[{\"name\":\"from_pkg_manifest\",\"description\":\"package\",\"parameters\":{\"type\":\"object\",\"properties\":{}},\"command\":\"cat\"}]}"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":"local-pkg/skills/pkg-skill/SKILL.md","content":"---\nname: pkg-skill\ndescription: Package skill\n---\nPackage skill body."}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":"local-pkg/skills/pkg-disabled/SKILL.md","content":"---\nname: pkg-disabled\ndescription: Disabled package skill\n---\nDisabled package skill body."}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":"local-pkg/prompts/pkg_prompt.md","content":"---\ndescription: Package prompt\n---\nPackage prompt $1"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":"local-pkg/themes/pkg-theme.json","content":"{\"name\":\"pkg-theme\",\"colors\":{\"accent\":\"#123456\"}}"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":".pi/settings.json","content":"{\"packages\":[\"../local-pkg\"]}"}|}
+  in
+  check "package manifest extension loads" (List.mem "from_pkg_manifest" (Extensions.load ()));
+  check "package manifest recursive skill loads"
+    (List.exists (fun (s : Skills.t) -> s.name = "pkg-skill") (Skills.discover ()));
+  check "package manifest prompt expands" (Prompts.expand_command "/pkg_prompt hi" = Some "Package prompt hi");
+  check "package manifest theme loads"
+    (List.exists (fun (t : Themes.t) -> t.name = "pkg-theme") (Themes.discover ()));
+  let pkg_abs = Unix.realpath "local-pkg" in
+  let install_msg = Packages.install_source ~local:true "local-pkg" in
+  check "package install persists local project source"
+    (contains0 install_msg "Installed local package" && contains0 (Tools.read_file_contents ".pi/settings.json") pkg_abs);
+  check "package list shows project package"
+    (contains0 (Packages.format_configured_packages ()) "project" && contains0 (Packages.format_configured_packages ()) pkg_abs);
+  let disable_msg =
+    Packages.set_resource_enabled ~local:true ~source:"local-pkg" ~kind:Packages.Skill
+      ~path:"skills/pkg-disabled/SKILL.md" ~enabled:false ()
+  in
+  let package_resource_config = Packages.format_config_resources () in
+  check "package config disables package resources with Pi patterns"
+    (contains0 disable_msg "Disabled skills"
+     && contains0 (Tools.read_file_contents ".pi/settings.json") "-skills/pkg-disabled/SKILL.md"
+     && contains0 package_resource_config "[ ] project"
+     && contains0 package_resource_config "pkg-disabled");
+  check "package disabled resources are not discovered"
+    (List.exists (fun (s : Skills.t) -> s.name = "pkg-skill") (Skills.discover ())
+     && not (List.exists (fun (s : Skills.t) -> s.name = "pkg-disabled") (Skills.discover ())));
+  let enable_msg =
+    Packages.set_resource_enabled ~local:true ~source:"local-pkg" ~kind:Packages.Skill
+      ~path:"skills/pkg-disabled/SKILL.md" ~enabled:true ()
+  in
+  check "package config re-enables package resources"
+    (contains0 enable_msg "Enabled skills"
+     && contains0 (Tools.read_file_contents ".pi/settings.json") "+skills/pkg-disabled/SKILL.md"
+     && List.exists (fun (s : Skills.t) -> s.name = "pkg-disabled") (Skills.discover ()));
+  check "package npm source parser handles scopes and pins"
+    (Packages.parse_source_kind_for_test "npm:@example/pkg@1.2.3" = "npm:@example/pkg:true");
+  check "package git source parser handles ssh shorthand ref"
+    (Packages.parse_source_kind_for_test "git:git@github.com:user/repo@main" = "git:github.com/user/repo:true");
+  check "package npm install path uses Pi agent npm root"
+    (Packages.installed_path_for_test "npm:@example/pkg" Packages.User
+     = Filename.concat
+         (Filename.concat (Filename.concat (Sys.getenv "PI_CODING_AGENT_DIR") "npm") "node_modules")
+         "@example/pkg");
+  check "package update missing source reports no match"
+    (contains0 (Packages.update_source ~source:"npm:@missing/pkg" ()) "No matching package found");
+  let remove_msg = Packages.remove_source ~local:true "local-pkg" in
+  check "package remove deletes local project source"
+    (contains0 remove_msg "Removed package" && not (contains0 (Tools.read_file_contents ".pi/settings.json") pkg_abs));
+
+  (* --- themes --- *)
+  let global_theme_path =
+    Filename.concat (Filename.concat (Sys.getenv "PI_CODING_AGENT_DIR") "themes") "collision.json"
+  in
+  let project_theme_path = ".pi/themes/collision.json" in
+  let _ =
+    run "write_file"
+      (Printf.sprintf
+         {|{"path":"%s","content":"{\"name\":\"collision\",\"vars\":{\"accent\":\"#111111\"},\"colors\":{\"accent\":\"accent\",\"selectedBg\":17}}"}|}
+         global_theme_path)
+  in
+  let _ =
+    run "write_file"
+      {|{"path":".pi/themes/collision.json","content":"{\"name\":\"collision\",\"vars\":{\"accent\":\"#22cc88\"},\"colors\":{\"accent\":\"accent\",\"selectedBg\":18}}"}|}
+  in
+  let themes = Themes.discover () in
+  check "themes discovered"
+    (List.exists (fun (t : Themes.t) -> t.name = "dark") themes
+     && List.exists (fun (t : Themes.t) -> t.name = "collision") themes);
+  check "project theme overrides global by name"
+    (match List.find_opt (fun (t : Themes.t) -> t.name = "collision") themes with
+     | Some t -> t.location = project_theme_path
+     | None -> false);
+  check "theme token resolves vars" (Themes.color ~theme:(List.find (fun (t : Themes.t) -> t.name = "collision") themes) "accent" <> None);
+  let _ = run "write_file" {|{"path":".pi/settings.json","content":"{\"theme\":\"collision\"}"}|} in
+  Unix.putenv "AGENT_THEME" "";
+  check "active theme reads Pi settings" ((Themes.active ()).Themes.name = "collision");
+  ignore (Themes.set_active_name ~persist:true "dark");
+  check "theme selection persists to Pi settings"
+    (contains (run "read_file"
+                 (Printf.sprintf {|{"path":"%s"}|} (Config_paths.user_settings_file ())))
+       "\"theme\":\"dark\"");
+  Unix.putenv "AGENT_THEME" "";
+  let _ =
+    run "write_file"
+      {|{"path":"extra_theme.json","content":"{\"name\":\"extra-theme\",\"colors\":{\"accent\":\"#abcdef\"}}"}|}
+  in
+  Unix.putenv "AGENT_NO_THEMES" "1";
+  Unix.putenv "AGENT_THEME_PATHS" "extra_theme.json";
+  let explicit_themes = Themes.discover () in
+  check "theme CLI path works when discovery disabled"
+    (List.exists (fun (t : Themes.t) -> t.name = "extra-theme") explicit_themes
+     && not (List.exists (fun (t : Themes.t) -> t.location = project_theme_path) explicit_themes));
+  Unix.putenv "AGENT_NO_THEMES" "";
+  Unix.putenv "AGENT_THEME_PATHS" "";
+
   (* --- task tool registered --- *)
   check "task tool present" (Tools.find "task" <> None);
   check "Pi tool aliases resolve" (Tools.find "bash" <> None && Tools.canonical_name "ls" = "list_dir");
   let readonly_schema = Yojson.Safe.to_string (`List (Tools.openai_schemas ~allowed:[ "read"; "grep"; "ls" ] ())) in
   check "tool schemas honor Pi allowlist aliases"
-    (contains0 readonly_schema "read_file" && contains0 readonly_schema "list_dir" && not (contains0 readonly_schema "write_file"));
+    (contains0 readonly_schema "\"name\":\"read\"" && contains0 readonly_schema "\"name\":\"ls\""
+     && not (contains0 readonly_schema "\"name\":\"write\"") && not (contains0 readonly_schema "read_file"));
+  let builtin_schema = Yojson.Safe.to_string (`List (Tools.openai_schemas ())) in
+  check "builtin schemas expose Pi wire names"
+    (contains0 builtin_schema "\"name\":\"read\"" && contains0 builtin_schema "\"name\":\"write\""
+     && contains0 builtin_schema "\"name\":\"edit\"" && contains0 builtin_schema "\"name\":\"bash\""
+     && not (contains0 builtin_schema "\"name\":\"read_file\"")
+     && not (contains0 builtin_schema "\"name\":\"run_bash\""));
 
   (* --- model catalog --- *)
   check "model context window lookup" (Models.context_window "deepseek-v4-pro" = Some 1000000);
   check "model unknown -> None" (Models.context_window "no-such-model" = None);
   check "model list filters" (List.for_all (fun (e : Models.entry) -> contains0 e.Models.id "glm" || contains0 e.Models.provider "zai") (Models.list ~pat:"zai" ()));
   check "model list nonempty" (Models.list () <> []);
+  let parsed = Model_spec.parse (Some "openai/gpt-4o:high") in
+  check "model spec parses provider prefix"
+    (parsed.Model_spec.provider = Some "openai" && parsed.model = Some "gpt-4o" && parsed.thinking = Some "high");
+  let parsed = Model_spec.parse (Some "openai") in
+  check "model spec preserves provider-only switch" (parsed.Model_spec.provider = Some "openai" && parsed.model = None);
+  let parsed = Model_spec.parse ~provider:"openrouter" (Some "openai/gpt-4o") in
+  check "explicit provider keeps slash model id"
+    (parsed.Model_spec.provider = Some "openrouter" && parsed.model = Some "openai/gpt-4o");
+  Unix.putenv "AGENT_SCOPED_MODELS" "anthropic/*\nglm:high";
+  let scoped = Models.scoped_from_env () in
+  check "scoped models match globs and strip thinking suffix"
+    (List.exists (fun (e : Models.entry) -> e.provider = "anthropic") scoped
+     && List.exists (fun (e : Models.entry) -> contains0 e.id "glm") scoped
+     && not (List.exists (fun (e : Models.entry) -> e.provider = "openai") scoped));
+  Unix.putenv "AGENT_SCOPED_MODELS" "";
 
   (* --- extensions: custom tool from manifest --- *)
   let oc = open_out ".ocaml-agent/tools.json" in
@@ -316,10 +833,2350 @@ let () =
     {|{"tools":[{"name":"run_bash","description":"override","parameters":{"type":"object","properties":{}},"command":"cat"}]}|};
   close_out oc;
   let names = Extensions.load () in
-  check "extension cannot override builtin" (not (List.mem "run_bash" names));
+  check "extension can override builtin canonical name" (List.mem "run_bash" names);
   (match Tools.find "run_bash" with
-   | Some t -> check "builtin run_bash still requires approval" t.Tools.requires_approval
-   | None -> check "builtin run_bash still requires approval" false);
+   | Some t ->
+     check "builtin canonical override executes extension"
+       (t.Tools.description = "override" && contains0 (t.Tools.execute (`Assoc [ ("x", `Int 1) ])) "\"x\":1")
+   | None -> check "builtin canonical override executes extension" false);
+  let oc = open_out ".ocaml-agent/tools.json" in
+  output_string oc
+    {|{"tools":[{"name":"bash","description":"override alias","parameters":{"type":"object","properties":{}},"command":"cat"}]}|};
+  close_out oc;
+  let names = Extensions.load () in
+  check "extension can override Pi alias builtin" (List.mem "bash" names);
+  (match Tools.find "bash" with
+   | Some t ->
+     check "builtin alias override executes extension"
+       (t.Tools.description = "override alias" && contains0 (t.Tools.execute (`Assoc [ ("command", `String "echo hi") ])) "echo hi")
+   | None -> check "builtin alias override executes extension" false);
+  let _ =
+    run "write_file"
+      {|{"path":"extra-tools.json","content":"{\"tools\":[{\"name\":\"from_explicit_manifest\",\"description\":\"explicit\",\"parameters\":{\"type\":\"object\",\"properties\":{}},\"command\":\"cat\"}]}"}|}
+  in
+  Unix.putenv "AGENT_NO_EXTENSIONS" "1";
+  Unix.putenv "AGENT_EXTENSION_PATHS" "extra-tools.json";
+  let names = Extensions.load () in
+  check "explicit extension loads when defaults disabled" (List.mem "from_explicit_manifest" names);
+  check "extension reload restores unloaded builtin overrides"
+    (match Tools.find "bash" with
+     | Some t -> t.Tools.description <> "override alias"
+     | None -> false);
+  let ext_schema = Yojson.Safe.to_string (`List (Tools.openai_schemas ~allowed:(Tools.extension_names ()) ())) in
+  check "extension-only schema excludes builtins"
+    (contains0 ext_schema "from_explicit_manifest" && not (contains0 ext_schema "\"name\":\"read\""));
+  Unix.putenv "AGENT_NO_EXTENSIONS" "";
+  Unix.putenv "AGENT_EXTENSION_PATHS" "";
+  let _ =
+    run "write_file"
+      (Printf.sprintf
+         {|{"path":"%s","content":"{\"tools\":[{\"name\":\"from_pi_agent_dir\",\"description\":\"global\",\"parameters\":{\"type\":\"object\",\"properties\":{}},\"command\":\"cat\"}]}"}|}
+         (Filename.concat (Sys.getenv "PI_CODING_AGENT_DIR") "tools.json"))
+  in
+  let names = Extensions.load () in
+  check "global Pi extension manifest loads" (List.mem "from_pi_agent_dir" names);
+  let node_available = Sys.command "command -v node >/dev/null 2>&1" = 0 in
+  let _ =
+    run "write_file"
+      {|{"path":".pi/extensions/hello.ts","content":"import { Type } from \"typebox\";\nimport { createLocalBashOperations, createLocalFileOperations } from \"@earendil-works/pi-coding-agent\";\nexport default function(pi) {\n  pi.registerTool({\n    name: \"ts_greet\",\n    label: \"TS Greet\",\n    description: \"Greet from a Pi TypeScript extension\",\n    parameters: Type.Object({ name: Type.String({ description: \"Name\" }) }),\n    async execute(_id, params) {\n      return { content: [{ type: \"text\", text: `Hello ${params.name}` }], details: {} };\n    },\n  });\n  pi.registerTool({\n    name: \"ops_file\",\n    label: \"Operations File\",\n    description: \"Use Pi-style tool operations\",\n    parameters: Type.Object({}),\n    async execute(_id, _params, operations, _system, ctx) {\n      await operations.writeFile(\"ops-dir/out.txt\", \"ops body\");\n      const body = await operations.readFile(\"ops-dir/out.txt\");\n      const listing = await ctx.operations.listDir(\"ops-dir\");\n      const stat = await operations.stat(\"ops-dir/out.txt\");\n      return { content: [{ type: \"text\", text: `${body}:${listing.join(\",\")}:${stat.isFile}` }], details: {} };\n    },\n  });\n  pi.registerFlag(\"voice\", { description: \"Voice flag\", type: \"string\", defaultValue: \"calm\" });\n  pi.registerFlag({ name: \"dry-run\", description: \"Dry run\", type: \"boolean\", default: false });\n  pi.registerShortcut(\"ctrl+g\", { description: \"Show voice shortcut\", handler: async () => `shortcut ${pi.getFlag(\"voice\")}` });\n  pi.registerShortcut({ key: \"ctrl+h\", description: \"Run tshello shortcut\", command: \"/tshello Shortcut\" });\n  pi.registerMessageRenderer(\"tagger\", {\n    description: \"Tag assistant and tool text\",\n    target: \"all\",\n    render: async (event) => `[${event.kind}:${event.toolName || event.role}] ${event.text}`,\n  });\n  pi.registerCommand(\"tshello\", {\n    description: \"Say hello from TypeScript\",\n    handler: async (args, ctx) => {\n      ctx.ui.notify(`notified ${args || \"world\"}`);\n      return { content: [{ type: \"text\", text: `Command ${args || \"world\"}` }] };\n    },\n  });\n  pi.registerCommand(\"flagshow\", {\n    description: \"Show registered flags\",\n    handler: async () => `${pi.getFlag(\"voice\")}:${pi.getFlag(\"dry-run\")}`,\n  });\n  pi.registerCommand(\"toolscope\", {\n    description: \"Show and set active tools\",\n    handler: async () => {\n      const before = pi.getActiveTools();\n      const all = pi.getAllTools().map((tool) => tool.name);\n      pi.setActiveTools([\"read\", \"ts_greet\"]);\n      const after = pi.getActiveTools();\n      return `${before.includes(\"read\")}:${all.includes(\"read\")}:${all.includes(\"ts_greet\")}:${after.join(\",\")}`;\n    },\n  });\n  pi.registerCommand(\"thinkscope\", {\n    description: \"Show and set thinking level\",\n    handler: async () => {\n      const before = pi.getThinkingLevel();\n      pi.setThinkingLevel(\"high\");\n      return `${before}:${pi.getThinkingLevel()}`;\n    },\n  });\n  pi.on(\"input\", async (event) => {\n    if (event.text === \"handled\") return { action: \"handled\" };\n    if (event.text.startsWith(\"brief:\")) return { action: \"transform\", text: `Respond briefly: ${event.text.slice(6).trim()}` };\n  });\n  pi.on(\"tool_call\", async (event) => {\n    if (event.toolName === \"ts_greet\") event.input.name = `${event.input.name}!`;\n    if (event.toolName === \"bash\" && event.input.command === \"blocked\") return { block: true, reason: \"blocked by ts\" };\n  });\n  pi.on(\"tool_result\", async (event) => {\n    if (event.toolName === \"ts_greet\") return { content: [{ type: \"text\", text: `${event.content[0].text} hooked` }] };\n  });\n  pi.on(\"user_bash\", async (event) => {\n    if (event.command === \"virtual\") return { result: { output: `virtual ${event.excludeFromContext}`, exitCode: 7 } };\n    if (event.command === \"ops\") return { operations: { exec: async (command, _cwd, options) => {\n      options.onData(Buffer.from(`ops ${command}`));\n      return { exitCode: 9 };\n    } } };\n    if (event.command === \"localops\") {\n      const local = createLocalBashOperations();\n      return { operations: { exec: async (_command, cwd, options) => {\n        options.onData(Buffer.from(\"wrapped\\n\"));\n        return local.exec(\"printf localops\", cwd, options);\n      } } };\n    }\n    if (event.command === \"fileops\") {\n      const files = createLocalFileOperations();\n      await files.writeFile(\"ops-dir/local-fileops.txt\", \"fileops\");\n      return { result: { output: await files.readFile(\"ops-dir/local-fileops.txt\"), exitCode: 0 } };\n    }\n  });\n  pi.on(\"session_start\", async (event) => {\n    pi.registerTool({\n      name: \"session_dynamic\",\n      label: \"Session Dynamic\",\n      description: \"Tool registered from session_start\",\n      parameters: Type.Object({}),\n      async execute() {\n        return { content: [{ type: \"text\", text: `session ${event.reason}` }], details: {} };\n      },\n    });\n    pi.registerCommand(\"sessioncmd\", {\n      description: \"Command registered from session_start\",\n      handler: async () => ({ content: [{ type: \"text\", text: `session command ${event.reason}` }] }),\n    });\n  });\n}\n"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":".pi/extensions/tool-signature.ts","content":"export default function(pi) {\n  pi.registerTool({\n    name: \"tool_signature\",\n    label: \"Tool Signature\",\n    description: \"Probe Pi tool execute signature\",\n    parameters: { type: \"object\", properties: {} },\n    async execute(_id, _params, signal, onUpdate, ctx) {\n      onUpdate?.({ content: [{ type: \"text\", text: \"partial update\" }], details: { phase: 1 } });\n      await ctx.operations.writeFile(\"ops-dir/signature.txt\", \"sig\");\n      const body = await signal.readFile(\"ops-dir/signature.txt\");\n      return { content: [{ type: \"text\", text: `sig:${signal.aborted === false}:${ctx.signal === signal}:${typeof onUpdate}:${body}` }], details: {} };\n    },\n  });\n}\n"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":".pi/extensions/prepared-tool.ts","content":"export default function(pi) {\n  pi.registerTool({\n    name: \"prepared_tool\",\n    label: \"Prepared Tool\",\n    description: \"Probe prepareArguments support\",\n    parameters: { type: \"object\", properties: {} },\n    prepareArguments(args) {\n      return { text: `prepared:${args.raw || \"none\"}`, count: Number(args.count || 0) + 1 };\n    },\n    async execute(_id, params) {\n      return { content: [{ type: \"text\", text: `${params.text}:${params.count}` }], details: {} };\n    },\n  });\n}\n"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":".pi/extensions/command-complete.ts","content":"export default function(pi) {\n  pi.registerCommand(\"argcomplete\", {\n    description: \"Probe command argument completion\",\n    argumentHint: \"<source>\",\n    getArgumentCompletions(prefix) {\n      return [\"extension\", \"prompt\", \"skill\"]\n        .filter((item) => item.startsWith(prefix))\n        .map((item) => ({ value: item, label: item, description: `source ${item}` }));\n    },\n    handler: async (args) => `arg ${args}`,\n  });\n}\n"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":".pi/extensions/event-bus.ts","content":"export default function(pi) {\n  const seen = [];\n  pi.events.on(\"probe\", (data) => {\n    seen.push(`${data.kind}:${data.value}`);\n  });\n  const off = pi.events.on(\"probe-off\", () => {\n    seen.push(\"off-called\");\n  });\n  off();\n  pi.registerCommand(\"eventbus\", {\n    description: \"Probe pi.events EventBus\",\n    handler: async () => {\n      pi.events.emit(\"probe\", { kind: \"cmd\", value: 1 });\n      pi.events.emit(\"probe-off\", { kind: \"cmd\", value: 2 });\n      pi.events.emit(\"probe\", { kind: \"cmd\", value: 3 });\n      return seen.join(\",\");\n    },\n  });\n}\n"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":".pi/extensions/event-listener.ts","content":"const fs = require(\"node:fs\");\nexport default function(pi) {\n  pi.events.on(\"cross:probe\", (data) => {\n    fs.appendFileSync(\"event-bus.log\", `${data.from}:${data.value}\\n`);\n  });\n}\n"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":".pi/extensions/event-emitter.ts","content":"export default function(pi) {\n  pi.registerCommand(\"eventemit\", {\n    description: \"Emit cross-extension event\",\n    handler: async () => {\n      pi.events.emit(\"cross:probe\", { from: \"emitter\", value: 42 });\n      return \"emitted\";\n    },\n  });\n}\n"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":".pi/extensions/exec.ts","content":"export default function(pi) {\n  pi.registerCommand(\"execprobe\", {\n    description: \"Probe pi.exec result shape\",\n    handler: async () => {\n      const ok = await pi.exec(process.execPath, [\"-e\", \"process.stdout.write('out'); process.stderr.write('err')\"]);\n      const fail = await pi.exec(process.execPath, [\"-e\", \"process.exit(7)\"]);\n      return `${ok.stdout}:${ok.stderr}:${ok.code}:${ok.exitCode}:${ok.killed}:${fail.code}:${fail.exitCode}:${fail.killed}`;\n    },\n  });\n}\n"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":".pi/extensions/model.ts","content":"export default function(pi) {\n  pi.registerCommand(\"modelscope\", {\n    description: \"Set runtime model\",\n    handler: async () => `${await pi.setModel({ provider: \"runtime\", id: \"runtime-small\" })}`,\n  });\n}\n"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":".pi/extensions/session.ts","content":"export default function(pi) {\n  pi.registerCommand(\"sessionmeta\", {\n    description: \"Get and set session metadata\",\n    handler: async () => {\n      const before = pi.getSessionName() || \"\";\n      pi.setSessionName(\"from-extension\");\n      return `${before}:${pi.getSessionName() || \"\"}`;\n    },\n  });\n}\n"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":".pi/extensions/session-entry.ts","content":"export default function(pi) {\n  pi.registerCommand(\"sessionentry\", {\n    description: \"Persist extension session entries\",\n    handler: async () => {\n      pi.appendEntry(\"state-note\", { ok: true });\n      pi.setLabel(\"entry-target\", \"checkpoint\");\n      return \"entries\";\n    },\n  });\n}\n"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":".pi/extensions/theme.ts","content":"export default function(pi) {\n  pi.registerCommand(\"themectl\", {\n    description: \"Use extension theme API\",\n    handler: async (_args, ctx) => {\n      const names = ctx.ui.getAllThemes().map((theme) => theme.name).sort().join(\",\");\n      const before = ctx.ui.theme.name;\n      const found = ctx.ui.getTheme(\"light\");\n      const set = ctx.ui.setTheme({ name: \"light\" });\n      const missing = ctx.ui.setTheme(\"no-such-theme\");\n      return `${before}:${names}:${found ? found.name : \"none\"}:${set.success}:${missing.success}`;\n    },\n  });\n}\n"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":".pi/extensions/tools-expanded.ts","content":"export default function(pi) {\n  pi.registerCommand(\"toolsexpanded\", {\n    description: \"Toggle tools expanded UI state\",\n    handler: async (_args, ctx) => {\n      const before = ctx.ui.getToolsExpanded();\n      ctx.ui.setToolsExpanded(!before);\n      return `${before}:${ctx.ui.getToolsExpanded()}`;\n    },\n  });\n}\n"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":".pi/extensions/runtime-actions.ts","content":"export default function(pi) {\n  pi.registerCommand(\"runtimeactions\", {\n    description: \"Request runtime actions\",\n    handler: async (_args, ctx) => {\n      ctx.abort();\n      ctx.compact({ reason: \"test\" });\n      await ctx.reload();\n      ctx.shutdown();\n      return \"actions\";\n    },\n  });\n}\n"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":".pi/extensions/context.ts","content":"export default function(pi) {\n  pi.registerCommand(\"ctxinfo\", {\n    description: \"Read extension context runtime state\",\n    handler: async (_args, ctx) => {\n      const usage = ctx.getContextUsage();\n      return `${ctx.hasUI}:${ctx.isIdle()}:${ctx.hasPendingMessages()}:${ctx.model ? ctx.model.id : \"none\"}:${usage ? usage.tokens : \"none\"}:${ctx.getSystemPrompt().includes(\"CTX-SYSTEM\")}`;\n    },\n  });\n}\n"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":".pi/extensions/session-manager.ts","content":"export default function(pi) {\n  pi.registerCommand(\"sessionview\", {\n    description: \"Read readonly session manager\",\n    handler: async (_args, ctx) => {\n      const sm = ctx.sessionManager;\n      const entries = sm.getEntries();\n      const leaf = sm.getLeafId() || \"none\";\n      const leafEntry = sm.getLeafEntry();\n      const turn = sm.getEntry(\"turn-0\");\n      const branch = sm.getBranch().map((entry) => entry.id).join(\",\");\n      const header = sm.getHeader();\n      const tree = sm.getTree();\n      const children = sm.getChildren(\"turn-0\").map((entry) => entry.id).join(\",\");\n      return `${sm.getSessionId() || \"none\"}:${sm.getSessionName() || \"\"}:${!!sm.getSessionFile()}:${!!sm.getSessionDir()}:${entries.length}:${leaf}:${leafEntry ? leafEntry.type : \"none\"}:${turn && turn.message ? turn.message.role : \"none\"}:${sm.getLabel(\"turn-0\") || \"\"}:${branch}:${header ? header.id : \"none\"}:${tree.length}:${children}:${sm.getCwd() === ctx.cwd}`;\n    },\n  });\n}\n"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":".pi/extensions/model-registry.ts","content":"export default function(pi) {\n  pi.registerCommand(\"modelregistry\", {\n    description: \"Read model registry\",\n    handler: async (_args, ctx) => {\n      const registry = ctx.modelRegistry;\n      const all = registry.getAll();\n      const available = registry.getAvailable();\n      const current = ctx.model;\n      const found = current ? registry.find(current.provider, current.id) : undefined;\n      const status = current ? registry.getProviderAuthStatus(current.provider) : { configured: false };\n      const auth = found ? await registry.getApiKeyAndHeaders(found) : { ok: false };\n      return `${all.length}:${available.length}:${found ? found.id : \"none\"}:${found ? registry.hasConfiguredAuth(found) : false}:${status.configured}:${current ? registry.getProviderDisplayName(current.provider) : \"none\"}:${auth.ok}:${registry.getError() || \"none\"}`;\n    },\n  });\n}\n"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":".pi/extensions/session-actions.ts","content":"export default function(pi) {\n  pi.registerCommand(\"sessionaction\", {\n    description: \"Request command session actions\",\n    handler: async (args, ctx) => {\n      await ctx.waitForIdle();\n      const [mode, value] = String(args || \"new\").trim().split(/\\s+/, 2);\n      if (mode === \"fork\") {\n        const result = await ctx.fork(value || \"turn-0\", { position: \"at\" });\n        return `fork:${result.cancelled}`;\n      }\n      if (mode === \"forkwith\") {\n        const result = await ctx.fork(value || \"turn-0\", {\n          position: \"at\",\n          withSession: async (next) => {\n            await next.sendMessage({ customType: \"fork-note\", content: \"body\", display: false, details: { ok: true } }, { triggerTurn: false });\n          },\n        });\n        return `forkwith:${result.cancelled}`;\n      }\n      if (mode === \"nav\") {\n        const result = await ctx.navigateTree(value || \"turn-0\", { label: \"from-extension\" });\n        return `nav:${result.cancelled}`;\n      }\n      if (mode === \"navhook\") {\n        const result = await ctx.navigateTree(value || \"turn-0\", { label: \"from-hook\" });\n        return `navhook:${result.cancelled}`;\n      }\n      if (mode === \"navsummary\") {\n        const result = await ctx.navigateTree(value || \"turn-0\", { summarize: true, label: \"summary-request\" });\n        return `navsummary:${result.cancelled}`;\n      }\n      if (mode === \"navcancel\") {\n        const result = await ctx.navigateTree(value || \"turn-0\", { label: \"cancel-tree\" });\n        return `navcancel:${result.cancelled}`;\n      }\n      if (mode === \"switch\") {\n        const result = await ctx.switchSession(value || \"\");\n        return `switch:${result.cancelled}`;\n      }\n      if (mode === \"with\") {\n        const result = await ctx.newSession({\n          setup: async (sm) => {\n            sm.appendCustomEntry(\"setup-note\", { ok: true });\n            sm.appendSessionInfo(\"with-session-name\");\n            const setupMessage = sm.appendMessage({ role: \"user\", content: [{ type: \"text\", text: \"setup user\" }] });\n            sm.appendLabelChange(setupMessage, \"setup-label\");\n            sm.appendCustomMessageEntry(\"setup-message\", \"setup body\", true, { setup: true });\n            sm.appendThinkingLevelChange(\"high\");\n            sm.appendModelChange(\"runtime\", \"runtime-small\");\n            sm.appendCompaction(\"setup compacted\", \"callback-custom-message-5\", 77, { compact: true }, true);\n          },\n          withSession: async (next) => {\n            await next.sendMessage({ customType: \"with-note\", content: \"body\", display: false, details: { ok: true } }, { triggerTurn: false });\n          },\n        });\n        return `with:${result.cancelled}`;\n      }\n      const result = await ctx.newSession(value ? { parentSession: value } : undefined);\n      return `new:${result.cancelled}`;\n    },\n  });\n}\n"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":".pi/extensions/session-branch-actions.ts","content":"export default function(pi) {\n  pi.registerCommand(\"sessionbranch\", {\n    description: \"Request setup-time session tree writes\",\n    handler: async (_args, ctx) => {\n      const result = await ctx.newSession({\n        setup: async (sm) => {\n          const root = sm.appendMessage({ role: \"user\", content: [{ type: \"text\", text: \"branch root\" }] });\n          sm.appendMessage({ role: \"assistant\", content: [{ type: \"text\", text: \"branch old\" }] });\n          sm.branch(root);\n          sm.appendMessage({ role: \"user\", content: [{ type: \"text\", text: \"branch child\" }] });\n          sm.branchWithSummary(root, \"setup branch summary\", { setup: true }, true);\n        },\n      });\n      return `branch:${result.cancelled}`;\n    },\n  });\n}\n"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":".pi/extensions/session-alias-actions.ts","content":"export default function(pi) {\n  pi.registerCommand(\"sessionalias\", {\n    description: \"Request harness-style session manager aliases\",\n    handler: async (_args, ctx) => {\n      const result = await ctx.newSession({\n        setup: async (sm) => {\n          const root = sm.appendMessage({ role: \"user\", content: [{ type: \"text\", text: \"alias root\" }] });\n          sm.appendSessionName(\"alias-session\");\n          sm.appendLabel(root, \"alias-label\");\n        },\n      });\n      return `alias:${result.cancelled}`;\n    },\n  });\n}\n"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":".pi/extensions/lifecycle.ts","content":"const fs = require(\"node:fs\");\nexport default function(pi) {\n  pi.on(\"before_agent_start\", async (event) => {\n    fs.appendFileSync(\"lifecycle.log\", `before_agent_start ${event.prompt}\\n`);\n    return {\n      message: { role: \"user\", content: [{ type: \"text\", text: `injected ${event.prompt}` }] },\n      systemPrompt: `${event.systemPrompt}\\nBEFORE:${event.prompt}`,\n    };\n  });\n  pi.on(\"context\", async (event) => {\n    fs.appendFileSync(\"lifecycle.log\", `context ${event.messages.length}\\n`);\n    return { messages: event.messages.concat([{ role: \"user\", content: [{ type: \"text\", text: \"context extra\" }] }]) };\n  });\n  pi.on(\"agent_start\", async () => {\n    fs.appendFileSync(\"lifecycle.log\", \"agent_start\\n\");\n  });\n  pi.on(\"agent_end\", async (event) => {\n    fs.appendFileSync(\"lifecycle.log\", `agent_end ${event.messages.length}\\n`);\n  });\n  pi.on(\"model_select\", async (event) => {\n    fs.appendFileSync(\"lifecycle.log\", `model_select ${event.source} ${event.previousModel ? event.previousModel.id : \"none\"} ${event.model.id}\\n`);\n  });\n  pi.on(\"thinking_level_select\", async (event) => {\n    fs.appendFileSync(\"lifecycle.log\", `thinking_level_select ${event.previousLevel} ${event.level}\\n`);\n  });\n  pi.on(\"turn_start\", async (event) => {\n    fs.appendFileSync(\"lifecycle.log\", `turn_start ${event.turnIndex}\\n`);\n  });\n  pi.on(\"turn_end\", async (event) => {\n    fs.appendFileSync(\"lifecycle.log\", `turn_end ${event.turnIndex} ${event.toolResults.length}\\n`);\n  });\n  pi.on(\"message_start\", async (event) => {\n    fs.appendFileSync(\"lifecycle.log\", `message_start ${event.message.role}\\n`);\n  });\n  pi.on(\"message_update\", async (event) => {\n    fs.appendFileSync(\"lifecycle.log\", `message_update ${event.assistantMessageEvent.text}\\n`);\n  });\n  pi.on(\"message_end\", async (event) => {\n    fs.appendFileSync(\"lifecycle.log\", `message_end ${event.message.role}\\n`);\n    if (event.message.role === \"assistant\") {\n      return { message: { ...event.message, content: [{ type: \"text\", text: \"rewritten assistant\" }] } };\n    }\n  });\n  pi.on(\"tool_execution_start\", async (event) => {\n    fs.appendFileSync(\"lifecycle.log\", `tool_start ${event.toolName}\\n`);\n  });\n  pi.on(\"tool_execution_update\", async (event) => {\n    fs.appendFileSync(\"lifecycle.log\", `tool_update ${event.toolName}\\n`);\n  });\n  pi.on(\"tool_execution_end\", async (event) => {\n    fs.appendFileSync(\"lifecycle.log\", `tool_end ${event.toolName} ${event.isError}\\n`);\n  });\n}\n"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":".pi/extensions/session-hooks.ts","content":"const fs = require(\"node:fs\");\nexport default function(pi) {\n  pi.on(\"session_before_switch\", async (event) => {\n    fs.appendFileSync(\"lifecycle.log\", `session_before_switch ${event.reason} ${event.targetSessionFile || \"\"}\\n`);\n    if (event.reason === \"blocked\") return { cancel: true, reason: \"no switch\" };\n    if ((event.targetSessionFile || \"\").includes(\"cancel-target\")) return { cancel: true, reason: \"no switch\" };\n  });\n  pi.on(\"session_before_fork\", async (event) => {\n    fs.appendFileSync(\"lifecycle.log\", `session_before_fork ${event.reason} ${event.entryId || \"\"}\\n`);\n    if (event.entryId === \"blocked-fork\") return { cancelled: true, message: \"no fork\" };\n  });\n  pi.on(\"session_before_compact\", async (event) => {\n    fs.appendFileSync(\"lifecycle.log\", `session_before_compact ${event.turnCount}\\n`);\n    if (event.turnCount === 99) return { cancel: true, reason: \"no compact\" };\n  });\n  pi.on(\"session_before_tree\", async (event) => {\n    const prep = event.preparation || {};\n    fs.appendFileSync(\"lifecycle.log\", `session_before_tree ${prep.targetId || \"\"} ${prep.oldLeafId || \"\"} ${prep.userWantsSummary} ${prep.label || \"\"}\\n`);\n    if (prep.label === \"cancel-tree\") return { cancel: true, reason: \"no tree\" };\n    if (prep.userWantsSummary) return { summary: { summary: `summary from tree ${prep.entriesToSummarize.length}`, details: { source: \"hook\" } }, label: \"summary-hook-label\" };\n    if (prep.label === \"from-hook\") return { label: \"hook-label\" };\n    return { label: prep.label };\n  });\n  pi.on(\"session_tree\", async (event) => {\n    fs.appendFileSync(\"lifecycle.log\", `session_tree ${event.newLeafId || \"\"} ${event.oldLeafId || \"\"} ${event.summaryEntry ? event.summaryEntry.type : \"\"}\\n`);\n  });\n  pi.on(\"session_shutdown\", async (event) => {\n    fs.appendFileSync(\"lifecycle.log\", `session_shutdown ${event.reason} ${event.sessionId || \"\"}\\n`);\n  });\n  pi.on(\"session_start\", async (event) => {\n    fs.appendFileSync(\"lifecycle.log\", `session_start ${event.reason} ${event.sessionId || \"\"}\\n`);\n  });\n  pi.on(\"session_compact\", async (event) => {\n    fs.appendFileSync(\"lifecycle.log\", `session_compact ${event.beforeTurnCount} ${event.afterTurnCount}\\n`);\n  });\n}\n"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":".pi/extensions/provider.ts","content":"export default function(pi) {\n  pi.registerProvider({\n    name: \"localai\",\n    aliases: [\"local\"],\n    protocol: \"openai\",\n    baseUrl: \"https://local.invalid/v1\",\n    apiKeyEnvVar: \"LOCALAI_API_KEY\",\n    defaultModel: \"local-large\",\n    headers: { \"X-Local\": \"1\" },\n    models: [{ id: \"local-large\", contextWindow: 4242 }, \"local-small\"],\n  });\n}\n"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":".pi/extensions/provider-hooks.ts","content":"const fs = require(\"node:fs\");\nexport default function(pi) {\n  pi.on(\"before_provider_request\", async (event) => {\n    fs.appendFileSync(\"provider-hooks.log\", `before ${event.payload.model}\\n`);\n    return { ...event.payload, model: \"hook-model\", metadata: { hooked: true } };\n  });\n  pi.on(\"after_provider_response\", async (event) => {\n    fs.appendFileSync(\"provider-hooks.log\", `after ${event.status} ${event.headers[\"x-test\"] || \"\"}\\n`);\n  });\n}\n"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":"dynamic-resources/skills/auto/SKILL.md","content":"---\nname: resource-skill\ndescription: from resources_discover\n---\nUse dynamic skill.\n"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":"dynamic-resources/prompts/dynamic-prompt.md","content":"---\ndescription: Dynamic prompt\nargument-hint: <topic>\n---\nDynamic prompt says $1 and $@.\n"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":"dynamic-resources/themes/resource-theme.json","content":"{\"name\":\"resource-theme\",\"colors\":{\"accent\":\"#123456\"}}"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":".pi/extensions/resources.ts","content":"const fs = require(\"node:fs\");\nexport default function(pi) {\n  pi.on(\"resources_discover\", async (event) => {\n    fs.appendFileSync(\"resources.log\", `resources_discover ${event.reason}\\n`);\n    return {\n      skillPaths: [\"dynamic-resources/skills\"],\n      promptPaths: [\"dynamic-resources/prompts\"],\n      themePaths: [\"dynamic-resources/themes\"],\n    };\n  });\n}\n"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":".pi/extensions/ui.ts","content":"import { Text } from \"@earendil-works/pi-tui\";\n\nexport default function(pi) {\n  pi.registerMessageRenderer(\"notice\", (message, { expanded }, theme) => {\n    const text = message.content.filter((part) => part.type === \"text\").map((part) => part.text).join(\"\\n\");\n    return new Text(`${theme.fg(\"accent\", \"NOTICE\")} ${text}${expanded ? \" expanded\" : \"\"}`, 0, 0);\n  });\n  pi.registerTool({\n    name: \"ui_tool\",\n    label: \"UI Tool\",\n    description: \"Use extension UI fallback\",\n    parameters: { type: \"object\", properties: {} },\n    async execute(_id, _params, _operations, _system, ctx) {\n      ctx.ui.notify(\"tool notice\");\n      const ok = await ctx.ui.confirm(\"continue?\");\n      const name = await ctx.ui.input(\"name?\", { defaultValue: \"anon\" });\n      const pick = await ctx.ui.select(\"pick?\", [\"one\", \"two\"], { defaultIndex: 1 });\n      return { content: [{ type: \"text\", text: `tool ${ok}:${name}:${pick}` }], details: {} };\n    },\n  });\n  pi.registerCommand(\"uicmd\", {\n    description: \"Use extension UI fallback\",\n    handler: async (_args, ctx) => {\n      ctx.ui.notify(\"command notice\");\n      const ok = await ctx.ui.confirm(\"continue?\");\n      const name = await ctx.ui.input(\"name?\", { defaultValue: \"anon\" });\n      const pick = await ctx.ui.select(\"pick?\", [\"one\", \"two\"], { defaultIndex: 1 });\n      return `ui ${ok}:${name}:${pick}`;\n    },\n  });\n  pi.registerCommand(\"surfacecmd\", {\n    description: \"Use extension UI surfaces\",\n    handler: async (_args, ctx) => {\n      ctx.ui.setStatus(\"sync\", \"ready\");\n      ctx.ui.setWidget(\"hint\", [\"first\", \"second\"], { placement: \"belowEditor\" });\n      ctx.ui.setTitle(\"Surface Title\");\n      ctx.ui.setWorkingMessage(\"surface work\");\n      ctx.ui.setWorkingVisible(false);\n      ctx.ui.setHiddenThinkingLabel(\"surface hidden\");\n      ctx.ui.pasteToEditor(\" pasted\");\n      ctx.ui.setEditorText(\"editor body\");\n      const current = ctx.ui.getEditorText();\n      const edited = await ctx.ui.editor(\"Edit body\", \"prefill\");\n      return `surface ${current}:${edited}`;\n    },\n  });\n  pi.registerCommand(\"messagecmd\", {\n    description: \"Send custom messages\",\n    handler: async (_args, ctx) => {\n      await ctx.sendMessage({ customType: \"notice\", content: [{ type: \"text\", text: \"message body\" }], display: true, details: { count: 1 } }, { triggerTurn: false });\n      await ctx.sendUserMessage(\"queued user\", { deliverAs: \"followUp\" });\n      pi.sendMessage({ customType: \"api-note\", content: \"api body\", display: false });\n      pi.appendEntry(\"state-note\", { ok: true });\n      return \"message sent\";\n    },\n  });\n  pi.registerShortcut(\"ctrl+u\", {\n    description: \"Use UI fallback shortcut\",\n    handler: async (ctx) => {\n      ctx.ui.notify(\"shortcut notice\");\n      return await ctx.ui.input(\"label?\", { defaultValue: \"fallback\" });\n    },\n  });\n}\n"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":".pi/extensions/component-ui.ts","content":"import { CustomEditor } from \"@earendil-works/pi-coding-agent\";\n\nexport default function(pi) {\n  pi.registerCommand(\"componentcmd\", {\n    description: \"Use component factories\",\n    handler: async (_args, ctx) => {\n      ctx.ui.setStatus(\"sync\", \"ready\");\n      ctx.ui.setWidget(\"factory\", () => ({ render: () => [\"factory widget\"] }), { placement: \"belowEditor\" });\n      ctx.ui.setHeader(() => ({ render: () => [\"header component\"] }));\n      ctx.ui.setFooter((_tui, _theme, footer) => ({ render: () => [`footer ${footer.getStatus(\"sync\") || \"none\"}`] }));\n      const result = await ctx.ui.custom((_tui, _theme, _keybindings, done) => {\n        done(\"done-value\");\n        return { render: () => [\"custom component\"] };\n      });\n      class MiniEditor extends CustomEditor {\n        render() { return [\"mini editor\"]; }\n      }\n      ctx.ui.setEditorComponent((tui, theme, keybindings) => new MiniEditor(tui, theme, keybindings));\n      const hasEditor = typeof ctx.ui.getEditorComponent() === \"function\";\n      return `component ${result}:${hasEditor}`;\n    },\n  });\n}\n"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":".pi/extensions/component-overlay.ts","content":"export default function(pi) {\n  pi.registerCommand(\"overlaycmd\", {\n    description: \"Use overlay component handles\",\n    handler: async (_args, ctx) => {\n      const result = await ctx.ui.custom((tui, _theme, _keybindings, done) => {\n        const direct = tui.showOverlay({ width: 33, render: () => [\"direct overlay\"] }, { width: 33, nonCapturing: true });\n        direct.setHidden(true);\n        direct.hide();\n        done(\"overlay-done\");\n        return { width: 41, render: () => [\"overlay component\"] };\n      }, {\n        overlay: true,\n        overlayOptions: () => ({ width: 42, nonCapturing: true }),\n        onHandle: (handle) => {\n          handle.focus();\n          handle.setHidden(true);\n          handle.unfocus();\n          handle.hide();\n        },\n      });\n      return `overlay ${result}`;\n    },\n  });\n}\n"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":".pi/extensions/runtime-provider.ts","content":"const fs = require(\"node:fs\");\nexport default function(pi) {\n  pi.registerProvider({\n    name: \"runtimeai\",\n    aliases: [\"runtime\"],\n    defaultModel: \"runtime-small\",\n    models: [{ id: \"runtime-small\", contextWindow: 9001 }],\n    complete: async (request) => {\n      fs.appendFileSync(\"runtime-request.log\", JSON.stringify(request.messages) + \"\\n\");\n      return {\n        content: [{ type: \"text\", text: `runtime ${request.model}:${request.system}:${request.messages.length}:${request.toolsEnabled}` }],\n        usage: { inputTokens: 12, outputTokens: 3 },\n      };\n    },\n  });\n}\n"}|}
+  in
+  let _ =
+    run "write_file"
+      {|{"path":".pi/extensions/rich-renderer.ts","content":"export default function(pi) {\n  pi.registerRenderer(\"richbox\", {\n    description: \"Rich renderer fallback\",\n    target: \"rich_component\",\n    render: async (event) => ({\n      type: \"panel\",\n      children: [\n        { type: \"markdown\", markdown: `**Rich** ${event.text}` },\n        { type: \"text\", text: \"tail\" },\n      ],\n    }),\n  });\n}\n"}|}
+  in
+  let names = Extensions.load () in
+  check "TypeScript extension registers tool"
+    ((not node_available) || List.mem "ts_greet" names);
+  check "TypeScript extension resources_discover adds skills/prompts/themes"
+    ((not node_available)
+     ||
+     let skill_ok =
+       Skills.discover ()
+       |> List.exists (fun (skill : Skills.t) -> skill.name = "resource-skill")
+     in
+     let prompt_ok =
+       match Prompts.expand_command "/dynamic-prompt topic extra" with
+       | Some body -> contains0 body "Dynamic prompt says topic and topic extra."
+       | None -> false
+     in
+     let theme_ok =
+       Themes.discover ()
+       |> List.exists (fun (theme : Themes.t) -> theme.name = "resource-theme")
+     in
+     skill_ok && prompt_ok && theme_ok);
+  check "TypeScript extension resources_discover receives reload reason"
+    ((not node_available)
+     ||
+     let _ = Extensions.load ~reason:"reload" () in
+     let log = Tools.read_file_contents "resources.log" in
+     contains0 log "resources_discover startup" && contains0 log "resources_discover reload");
+  check "TypeScript extension before_provider_request mutates provider payload"
+    ((not node_available)
+     ||
+     let original = j {|{"model":"base-model","messages":[]}|} in
+     let mutated = Llm.apply_provider_request_hooks original in
+     let log = Tools.read_file_contents "provider-hooks.log" in
+     Yojson.Safe.Util.member "model" mutated = `String "hook-model"
+     && Yojson.Safe.Util.member "hooked" (Yojson.Safe.Util.member "metadata" mutated) = `Bool true
+     && contains0 log "before base-model");
+  check "TypeScript extension after_provider_response receives response metadata"
+    ((not node_available)
+     ||
+     (Llm.emit_provider_response_hooks ~status:201 ~headers:[ ("x-test", "ok") ];
+      let log = Tools.read_file_contents "provider-hooks.log" in
+      contains0 log "after 201 ok"));
+  check "TypeScript extension executes registered tool"
+    ((not node_available)
+     ||
+     match Tools.find "ts_greet" with
+     | Some t -> contains0 (t.Tools.execute (`Assoc [ ("name", `String "Pi") ])) "Hello Pi"
+     | None -> false);
+  check "TypeScript extension tool execute receives file operations"
+    ((not node_available)
+     ||
+     match Tools.find "ops_file" with
+     | Some t -> t.Tools.execute (`Assoc []) = "ops body:out.txt:true"
+     | None -> false);
+  check "TypeScript extension tool execute receives Pi signal/update/context signature"
+    ((not node_available)
+     ||
+     match Tools.find "tool_signature" with
+     | Some t -> t.Tools.execute (`Assoc []) = "sig:true:true:function:sig"
+     | None -> false);
+  check "TypeScript extension tool onUpdate captures surface metadata"
+    ((not node_available)
+     ||
+     match
+       Extensions.run_node_bridge
+         (j
+            {|{"mode":"execute","path":".pi/extensions/tool-signature.ts","tool":"tool_signature","toolCallId":"sig-call","input":{}}|})
+     with
+     | Ok json ->
+       let ui = Yojson.Safe.Util.member "ui" json in
+       let surfaces = Yojson.Safe.Util.member "surfaces" ui in
+       (match surfaces with
+        | `List items ->
+          List.exists
+            (fun surface ->
+              Yojson.Safe.Util.member "kind" surface = `String "tool_update"
+              && Yojson.Safe.Util.member "toolCallId" surface = `String "sig-call"
+              &&
+              match Yojson.Safe.Util.member "text" surface with
+              | `String text -> contains0 text "partial update"
+              | _ -> false)
+            items
+        | _ -> false)
+     | Error _ -> false);
+  check "TypeScript extension tool prepareArguments normalizes execute params"
+    ((not node_available)
+     ||
+     match Tools.find "prepared_tool" with
+     | Some t -> t.Tools.execute (`Assoc [ ("raw", `String "input"); ("count", `Int 4) ]) = "prepared:input:5"
+     | None -> false);
+  check "TypeScript extension command appears in completion"
+    ((not node_available) || List.mem_assoc "/tshello" (Complete.menu "/tsh"));
+  check "TypeScript extension command argument hint appears in completion"
+    ((not node_available)
+     ||
+     match List.assoc_opt "/argcomplete" (Complete.menu "/argc") with
+     | Some detail -> contains0 detail "<source>"
+     | None -> false);
+  check "TypeScript extension command argument completions feed Tab candidates"
+    ((not node_available)
+     ||
+     let start, cands = Complete.completion "/argcomplete p" in
+     start = String.length "/argcomplete " && cands = [ "prompt" ]);
+  check "TypeScript extension command executes"
+    ((not node_available)
+     ||
+     match Extensions.execute_command "/tshello Pi" with
+     | Some output -> contains0 output "Command Pi"
+     | None -> false);
+  check "TypeScript extension pi.events emits and unsubscribes handlers"
+    ((not node_available)
+     ||
+     match Extensions.execute_command "/eventbus" with
+     | Some output -> output = "cmd:1,cmd:3"
+     | None -> false);
+  check "TypeScript extension pi.events is shared across loaded extensions"
+    ((not node_available)
+     ||
+     let _ = Tools.write_file_contents "event-bus.log" "" in
+     match Extensions.execute_command "/eventemit" with
+     | Some output ->
+       output = "emitted" && contains0 (Tools.read_file_contents "event-bus.log") "emitter:42"
+     | None -> false);
+  check "TypeScript extension pi.exec returns stdout stderr and status"
+    ((not node_available)
+     ||
+     match Extensions.execute_command "/execprobe" with
+     | Some output -> output = "out:err:0:0:false:7:7:false"
+     | None -> false);
+  check "TypeScript extension get/setThinkingLevel updates runtime state"
+    ((not node_available)
+     ||
+     let ok =
+       Extensions.clear_active_thinking ();
+       match Extensions.execute_command_response "/thinkscope" with
+       | Some response ->
+         response.Extensions.text = "off:high"
+         && response.Extensions.thinking_level = Some "high"
+         && Extensions.active_thinking () = Some "high"
+       | None -> false
+     in
+     Extensions.clear_active_thinking ();
+     ok);
+  check "TypeScript extension setModel updates runtime state"
+    ((not node_available)
+     ||
+     let ok =
+       Extensions.clear_active_model ();
+       match Extensions.execute_command_response "/modelscope" with
+       | Some response -> (
+         match response.Extensions.model_choice with
+         | Some choice ->
+           response.Extensions.text = "true"
+           && choice.Extensions.provider = Some "runtime"
+           && choice.Extensions.model = Some "runtime-small"
+           && Extensions.active_model () = Some choice
+         | None -> false)
+       | None -> false
+     in
+     Extensions.clear_active_model ();
+     ok);
+  check "TypeScript extension get/setSessionName returns runtime state"
+    ((not node_available)
+     ||
+     match Extensions.execute_command_response ~session_name:"before-name" "/sessionmeta" with
+     | Some response ->
+       response.Extensions.text = "before-name:from-extension"
+       && response.Extensions.session_name = Some "from-extension"
+     | None -> false);
+  check "TypeScript extension appendEntry/setLabel returns session entries"
+    ((not node_available)
+     ||
+     match Extensions.execute_command_response "/sessionentry" with
+     | Some response ->
+       let has_custom =
+         List.exists
+           (function
+             | `Assoc fields ->
+               List.assoc_opt "type" fields = Some (`String "custom")
+               && List.assoc_opt "customType" fields = Some (`String "state-note")
+             | _ -> false)
+           response.Extensions.session_entries
+       in
+       let has_label =
+         List.exists
+           (function
+             | `Assoc fields ->
+               List.assoc_opt "type" fields = Some (`String "label")
+               && List.assoc_opt "targetId" fields = Some (`String "entry-target")
+               && List.assoc_opt "label" fields = Some (`String "checkpoint")
+             | _ -> false)
+           response.Extensions.session_entries
+       in
+       response.Extensions.text = "entries" && has_custom && has_label
+     | None -> false);
+  check "TypeScript extension theme API returns and sets runtime theme"
+    ((not node_available)
+     ||
+     let themes =
+       [ `Assoc [ ("name", `String "dark"); ("path", `Null) ];
+         `Assoc [ ("name", `String "light"); ("path", `Null) ] ]
+     in
+     match Extensions.execute_command_response ~themes ~theme_name:"dark" "/themectl" with
+     | Some response ->
+       response.Extensions.text = "dark:dark,light:light:true:false"
+       && response.Extensions.theme_name = Some "light"
+     | None -> false);
+  check "TypeScript extension get/setToolsExpanded returns runtime UI state"
+    ((not node_available)
+     ||
+     match Extensions.execute_command_response ~tools_expanded:true "/toolsexpanded" with
+     | Some response ->
+       response.Extensions.text = "true:false"
+       && response.Extensions.tools_expanded = Some false
+     | None -> false);
+  check "TypeScript extension runtime actions return requests"
+    ((not node_available)
+     ||
+     match Extensions.execute_command_response "/runtimeactions" with
+     | Some response ->
+       let compact_ok =
+         match response.Extensions.compact_requests with
+         | [ `Assoc fields ] -> List.assoc_opt "reason" fields = Some (`String "test")
+         | _ -> false
+       in
+       response.Extensions.text = "actions"
+       && response.Extensions.abort_requested
+       && response.Extensions.shutdown_requested
+       && response.Extensions.reload_requested
+       && compact_ok
+     | None -> false);
+  check "TypeScript extension command context exposes runtime state"
+    ((not node_available)
+     ||
+     let model = `Assoc [ ("id", `String "ctx-model"); ("provider", `String "ctx-provider") ] in
+     let usage = `Assoc [ ("tokens", `Int 42); ("contextWindow", `Int 100); ("percent", `Float 42.) ] in
+     match
+       Extensions.execute_command_response ~model ~context_usage:usage ~system_prompt:"CTX-SYSTEM"
+         ~has_ui:true ~is_idle:false ~has_pending_messages:true "/ctxinfo"
+     with
+     | Some response -> response.Extensions.text = "true:false:true:ctx-model:42:true"
+     | None -> false);
+  check "TypeScript extension readonly sessionManager exposes session snapshot"
+    ((not node_available)
+     ||
+     let info : Session.info =
+       { id = "session-id"; path = "/tmp/dir/session.jsonl"; name = "Session Name"; created = 0.; cwd = Sys.getcwd () }
+     in
+     let turns = [ { Llm.role = Llm.User; content = [ Llm.Text "hello" ] } ] in
+     let entries =
+       [ `Assoc
+           [ ("type", `String "label");
+             ("id", `String "label-1");
+             ("parentId", `String "turn-0");
+             ("targetId", `String "turn-0");
+             ("label", `String "mark") ] ]
+     in
+     let session_context = Extensions.session_context_json ~entries ~info turns in
+     match Extensions.execute_command_response ~session_context "/sessionview" with
+     | Some response ->
+       response.Extensions.text
+       = "session-id:Session Name:true:true:2:turn-0:message:user:mark:turn-0:session-id:1:label-1:true"
+     | None -> false);
+  check "TypeScript extension modelRegistry exposes current and catalog models"
+    ((not node_available)
+     ||
+     let model = `Assoc [ ("id", `String "ctx-model"); ("provider", `String "ctx-provider") ] in
+     let models =
+       [ `Assoc [ ("id", `String "ctx-model"); ("provider", `String "ctx-provider") ];
+         `Assoc [ ("id", `String "other-model"); ("provider", `String "other-provider") ] ]
+     in
+     match Extensions.execute_command_response ~model ~models "/modelregistry" with
+     | Some response -> response.Extensions.text = "2:2:ctx-model:true:true:ctx-provider:true:none"
+     | None -> false);
+  check "TypeScript extension command session actions return requests"
+    ((not node_available)
+     ||
+     match Extensions.execute_command_response "/sessionaction fork turn-0" with
+     | Some response -> (
+       match response.Extensions.session_actions with
+       | [ `Assoc fields ] ->
+         response.Extensions.text = "fork:false"
+         && List.assoc_opt "kind" fields = Some (`String "fork")
+         && List.assoc_opt "entryId" fields = Some (`String "turn-0")
+         && List.assoc_opt "position" fields = Some (`String "at")
+       | _ -> false)
+     | None -> false);
+  check "TypeScript extension fork withSession uses fork leaf"
+    ((not node_available)
+     ||
+     let info : Session.info =
+       { id = "fork-session"; path = "/tmp/dir/fork.jsonl"; name = "Fork Session"; created = 0.; cwd = Sys.getcwd () }
+     in
+     let turns =
+       [ { Llm.role = Llm.User; content = [ Llm.Text "one" ] };
+         { Llm.role = Llm.Assistant; content = [ Llm.Text "two" ] } ]
+     in
+     let session_context = Extensions.session_context_json ~info turns in
+     match Extensions.execute_command_response ~session_context "/sessionaction forkwith turn-0" with
+     | Some response -> (
+       match response.Extensions.session_actions with
+       | [ `Assoc fields ] ->
+         let entries =
+           match List.assoc_opt "sessionEntries" fields with
+           | Some (`List values) -> values
+           | _ -> []
+         in
+         let has_fork_note =
+           List.exists
+             (function
+               | `Assoc entry_fields ->
+                 List.assoc_opt "type" entry_fields = Some (`String "custom_message")
+                 && List.assoc_opt "id" entry_fields = Some (`String "message-1")
+                 && List.assoc_opt "parentId" entry_fields = Some (`String "turn-0")
+                 && List.assoc_opt "customType" entry_fields = Some (`String "fork-note")
+               | _ -> false)
+             entries
+         in
+         response.Extensions.text = "forkwith:false"
+         && List.assoc_opt "kind" fields = Some (`String "fork")
+         && List.assoc_opt "entryId" fields = Some (`String "turn-0")
+         && List.assoc_opt "position" fields = Some (`String "at")
+         && has_fork_note
+       | _ -> false)
+     | None -> false);
+  check "TypeScript extension session action callbacks capture side effects"
+    ((not node_available)
+     ||
+     match Extensions.execute_command_response "/sessionaction with" with
+     | Some response -> (
+       match response.Extensions.session_actions with
+       | [ `Assoc fields ] ->
+         let entries =
+           match List.assoc_opt "sessionEntries" fields with
+           | Some (`List values) -> values
+           | _ -> []
+         in
+         let has_entry typ =
+           List.exists
+             (function
+               | `Assoc entry_fields -> List.assoc_opt "type" entry_fields = Some (`String typ)
+               | _ -> false)
+             entries
+         in
+         let entry_has expected =
+           List.exists
+             (function
+               | `Assoc entry_fields ->
+                 List.for_all
+                   (fun (key, value) -> List.assoc_opt key entry_fields = Some value)
+                   expected
+               | _ -> false)
+             entries
+         in
+         let has_custom_message custom_type =
+           List.exists
+             (function
+               | `Assoc entry_fields ->
+                 List.assoc_opt "type" entry_fields = Some (`String "custom_message")
+                 && List.assoc_opt "customType" entry_fields = Some (`String custom_type)
+               | _ -> false)
+             entries
+         in
+         response.Extensions.text = "with:false"
+         && List.assoc_opt "kind" fields = Some (`String "new_session")
+         && List.assoc_opt "sessionName" fields = Some (`String "with-session-name")
+         && has_entry "custom" && has_entry "session_info" && has_entry "label"
+         && entry_has
+              [ ("type", `String "custom");
+                ("id", `String "callback-entry-1");
+                ("parentId", `Null);
+                ("customType", `String "setup-note") ]
+         && entry_has
+              [ ("type", `String "label");
+                ("id", `String "callback-label-4");
+                ("parentId", `String "callback-message-3");
+                ("targetId", `String "callback-message-3");
+                ("label", `String "setup-label") ]
+         && has_entry "message"
+         && has_entry "thinking_level_change" && has_entry "model_change"
+         && has_entry "compaction"
+         && has_custom_message "setup-message" && has_custom_message "with-note"
+       | _ -> false)
+     | None -> false);
+  check "TypeScript extension setup session manager supports branch writes"
+    ((not node_available)
+     ||
+     match Extensions.execute_command_response "/sessionbranch" with
+     | Some response -> (
+       match response.Extensions.session_actions with
+       | [ `Assoc fields ] ->
+         let entries =
+           match List.assoc_opt "sessionEntries" fields with
+           | Some (`List values) -> values
+           | _ -> []
+         in
+         let entry_has expected =
+           List.exists
+             (function
+               | `Assoc entry_fields ->
+                 List.for_all
+                   (fun (key, value) -> List.assoc_opt key entry_fields = Some value)
+                   expected
+               | _ -> false)
+             entries
+         in
+         response.Extensions.text = "branch:false"
+         && List.assoc_opt "kind" fields = Some (`String "new_session")
+         && entry_has
+              [ ("type", `String "leaf");
+                ("id", `String "callback-leaf-3");
+                ("parentId", `String "callback-message-2");
+                ("targetId", `String "callback-message-1") ]
+         && entry_has
+              [ ("type", `String "message");
+                ("id", `String "callback-message-4");
+                ("parentId", `String "callback-message-1") ]
+         && entry_has
+              [ ("type", `String "branch_summary");
+                ("id", `String "callback-branch-summary-5");
+                ("parentId", `String "callback-message-1");
+                ("fromId", `String "callback-message-1");
+                ("summary", `String "setup branch summary");
+                ("fromHook", `Bool true) ]
+       | _ -> false)
+     | None -> false);
+  check "TypeScript extension setup session manager supports harness aliases"
+    ((not node_available)
+     ||
+     match Extensions.execute_command_response "/sessionalias" with
+     | Some response -> (
+       match response.Extensions.session_actions with
+       | [ `Assoc fields ] ->
+         let entries =
+           match List.assoc_opt "sessionEntries" fields with
+           | Some (`List values) -> values
+           | _ -> []
+         in
+         let entry_has expected =
+           List.exists
+             (function
+               | `Assoc entry_fields ->
+                 List.for_all
+                   (fun (key, value) -> List.assoc_opt key entry_fields = Some value)
+                   expected
+               | _ -> false)
+             entries
+         in
+         response.Extensions.text = "alias:false"
+         && List.assoc_opt "kind" fields = Some (`String "new_session")
+         && List.assoc_opt "sessionName" fields = Some (`String "alias-session")
+         && entry_has
+              [ ("type", `String "session_info");
+                ("id", `String "callback-session-info-2");
+                ("parentId", `String "callback-message-1");
+                ("name", `String "alias-session") ]
+         && entry_has
+              [ ("type", `String "label");
+                ("id", `String "callback-label-3");
+                ("parentId", `String "callback-session-info-2");
+                ("targetId", `String "callback-message-1");
+                ("label", `String "alias-label") ]
+       | _ -> false)
+     | None -> false);
+  check "TypeScript extension setActiveTools scopes runtime tools"
+    ((not node_available)
+     ||
+     let ok =
+       match Extensions.execute_command "/toolscope" with
+       | Some output ->
+         let active = Extensions.active_tools () in
+         let scoped_schema =
+           Yojson.Safe.to_string (`List (Tools.openai_schemas ?allowed:(Extensions.effective_tool_names None) ()))
+         in
+         contains0 output "true:true:true:read,ts_greet"
+         && active = Some [ "read_file"; "ts_greet" ]
+         && contains0 scoped_schema "\"name\":\"read\""
+         && contains0 scoped_schema "\"name\":\"ts_greet\""
+         && not (contains0 scoped_schema "\"name\":\"bash\"")
+       | None -> false
+     in
+     Extensions.clear_active_tools ();
+     ok);
+  check "TypeScript extension command ctx.ui fallback returns defaults"
+    ((not node_available)
+     ||
+     match Extensions.execute_command "/uicmd" with
+     | Some output -> contains0 output "command notice" && contains0 output "ui false:anon:two"
+     | None -> false);
+  check "TypeScript extension command exposes structured UI requests"
+    ((not node_available)
+     ||
+     match Extensions.execute_command_response "/uicmd" with
+     | Some response ->
+       let ui : Extensions.ui_capture = response.ui in
+       let kinds =
+         ui.requests
+         |> List.filter_map (fun request ->
+                match Yojson.Safe.Util.member "kind" request with
+                | `String kind -> Some kind
+                | _ -> None)
+       in
+       contains0 response.text "ui false:anon:two"
+       && List.mem "notify" kinds && List.mem "confirm" kinds && List.mem "input" kinds
+       && List.mem "select" kinds
+     | None -> false);
+  check "TypeScript extension command exposes custom UI surfaces"
+    ((not node_available)
+     ||
+     match Extensions.execute_command_response "/surfacecmd" with
+     | Some response ->
+       let ui : Extensions.ui_capture = response.ui in
+       let kinds =
+         ui.surfaces
+         |> List.filter_map (fun surface ->
+                match Yojson.Safe.Util.member "kind" surface with
+                | `String kind -> Some kind
+                | _ -> None)
+       in
+       contains0 response.text "surface editor body:prefill"
+       && List.mem "status" kinds
+       && List.mem "widget" kinds
+       && List.mem "title" kinds
+       && List.mem "working_message" kinds
+       && List.mem "working_visible" kinds
+       && List.mem "hidden_thinking_label" kinds
+       && List.mem "paste" kinds
+       && List.mem "editor_text" kinds
+     | None -> false);
+  check "TypeScript extension component factories expose rendered lines"
+    ((not node_available)
+     ||
+     match Extensions.execute_command_response "/componentcmd" with
+     | Some response ->
+       let ui : Extensions.ui_capture = response.ui in
+       let lines_for kind =
+         ui.surfaces
+         |> List.find_map (fun surface ->
+                match Yojson.Safe.Util.member "kind" surface with
+                | `String got when got = kind -> (
+                  match Yojson.Safe.Util.member "lines" surface with
+                  | `List lines ->
+                    Some
+                      (List.filter_map
+                         (function `String line -> Some line | _ -> None)
+                         lines)
+                  | _ -> Some [])
+                | _ -> None)
+         |> Option.value ~default:[]
+       in
+       contains0 response.text "component done-value:true"
+       && List.mem "factory widget" (lines_for "widget")
+       && List.mem "header component" (lines_for "header")
+       && List.mem "footer ready" (lines_for "footer")
+       && List.mem "custom component" (lines_for "custom")
+       && List.mem "mini editor" (lines_for "editor_component")
+     | None -> false);
+  check "TypeScript extension custom overlay exposes handle surfaces"
+    ((not node_available)
+     ||
+     match Extensions.execute_command_response "/overlaycmd" with
+     | Some response ->
+       let ui : Extensions.ui_capture = response.ui in
+       let lines_contain text surface =
+         match Yojson.Safe.Util.member "lines" surface with
+         | `List lines -> List.exists (function `String line -> line = text | _ -> false) lines
+         | _ -> false
+       in
+       let custom_overlay =
+         ui.surfaces
+         |> List.exists (fun surface ->
+                Yojson.Safe.Util.member "kind" surface = `String "custom"
+                && Yojson.Safe.Util.member "overlay" surface = `Bool true
+                && lines_contain "overlay component" surface
+                &&
+                match Yojson.Safe.Util.member "overlayOptions" surface with
+                | `Assoc opts -> List.assoc_opt "width" opts = Some (`Int 42)
+                | _ -> false)
+       in
+       let direct_overlay =
+         ui.surfaces
+         |> List.exists (fun surface ->
+                Yojson.Safe.Util.member "kind" surface = `String "overlay"
+                && lines_contain "direct overlay" surface
+                &&
+                match Yojson.Safe.Util.member "options" surface with
+                | `Assoc opts -> List.assoc_opt "width" opts = Some (`Int 33)
+                | _ -> false)
+       in
+       let custom_methods =
+         ui.surfaces
+         |> List.filter_map (fun surface ->
+                match Yojson.Safe.Util.member "kind" surface, Yojson.Safe.Util.member "overlayId" surface with
+                | `String "overlay_handle", `String "custom-overlay-1" -> (
+                  match Yojson.Safe.Util.member "method" surface with
+                  | `String method_ -> Some method_
+                  | _ -> None)
+                | _ -> None)
+       in
+       contains0 response.text "overlay overlay-done"
+       && custom_overlay && direct_overlay
+       && List.mem "focus" custom_methods
+       && List.mem "setHidden" custom_methods
+       && List.mem "hide" custom_methods
+     | None -> false);
+  check "TypeScript extension sendMessage captures custom messages"
+    ((not node_available)
+     ||
+     match Extensions.execute_command_response "/messagecmd" with
+     | Some response ->
+       let ui : Extensions.ui_capture = response.ui in
+       let custom_types =
+         ui.messages
+         |> List.filter_map (fun message ->
+                match Yojson.Safe.Util.member "customType" message with
+                | `String custom_type -> Some custom_type
+                | _ -> None)
+       in
+       contains0 response.text "message sent"
+       && List.mem "notice" custom_types
+       && List.mem "user" custom_types
+       && List.mem "api-note" custom_types
+       && List.mem "state-note" custom_types
+     | None -> false);
+  check "TypeScript extension registerMessageRenderer renders custom messages"
+    ((not node_available)
+     ||
+     match Extensions.execute_command_response "/messagecmd" with
+     | Some response ->
+       let notice =
+         response.ui.messages
+         |> List.find_opt (fun message ->
+                Yojson.Safe.Util.member "customType" message = `String "notice")
+       in
+       (match notice with
+        | Some message ->
+          let rendered =
+            match Yojson.Safe.Util.member "rendered" message with
+            | `String s -> s
+            | _ -> ""
+          in
+          let lines =
+            match Yojson.Safe.Util.member "lines" message with
+            | `List xs -> List.filter_map (function `String s -> Some s | _ -> None) xs
+            | _ -> []
+          in
+          contains0 rendered "NOTICE message body" && List.mem "NOTICE message body" lines
+        | None -> false)
+     | None -> false);
+  check "rpc Pi get_commands lists extension slash commands"
+    ((not node_available)
+     ||
+     let out = Rpc.handle_command_for_test (Agent.create cfg_for_reset) (j {|{"type":"get_commands"}|}) in
+     rpc_success out "get_commands"
+     &&
+     match rpc_field (rpc_last out) "data" with
+     | Some (`Assoc fields) -> (
+       match List.assoc_opt "commands" fields with
+       | Some (`List commands) ->
+         List.exists
+           (function
+             | `Assoc fields ->
+               List.assoc_opt "name" fields = Some (`String "tshello")
+               && List.assoc_opt "source" fields = Some (`String "extension_command")
+             | _ -> false)
+           commands
+       | _ -> false)
+     | _ -> false);
+  check "rpc Pi execute_command runs extension slash command with UI metadata"
+    ((not node_available)
+     ||
+     let out =
+       Rpc.handle_command_for_test (Agent.create cfg_for_reset)
+         (j {|{"type":"execute_command","command":"/uicmd"}|})
+     in
+     rpc_success out "execute_command"
+     &&
+     match rpc_field (rpc_last out) "data" with
+     | Some (`Assoc fields) -> (
+       match List.assoc_opt "text" fields, List.assoc_opt "ui" fields with
+       | Some (`String text), Some (`Assoc ui_fields) -> (
+         match List.assoc_opt "requests" ui_fields with
+         | Some (`List requests) ->
+           contains0 text "ui false:anon:two"
+           && List.exists
+                (fun request -> Yojson.Safe.Util.member "kind" request = `String "confirm")
+                requests
+         | _ -> false)
+       | _ -> false)
+     | _ -> false);
+  check "rpc Pi execute_command applies extension thinking level"
+    ((not node_available)
+     ||
+     let agent = Agent.create cfg_for_reset in
+     Extensions.clear_active_thinking ();
+     let out = Rpc.handle_command_for_test agent (j {|{"type":"execute_command","command":"/thinkscope"}|}) in
+     let data_ok =
+       match rpc_field (rpc_last out) "data" with
+       | Some (`Assoc fields) ->
+         List.assoc_opt "text" fields = Some (`String "off:high")
+         && List.assoc_opt "thinkingLevel" fields = Some (`String "high")
+       | _ -> false
+     in
+     let ok = rpc_success out "execute_command" && data_ok && (Agent.config agent).Llm.thinking = "high" in
+     Extensions.clear_active_thinking ();
+     ok);
+  check "rpc Pi execute_command applies extension model"
+    ((not node_available)
+     ||
+     let agent = Agent.create cfg_for_reset in
+     Extensions.clear_active_model ();
+     let out = Rpc.handle_command_for_test agent (j {|{"type":"execute_command","command":"/modelscope"}|}) in
+     let data_ok =
+       match rpc_field (rpc_last out) "data" with
+       | Some (`Assoc fields) -> (
+         match List.assoc_opt "model" fields with
+         | Some (`Assoc model_fields) ->
+           List.assoc_opt "text" fields = Some (`String "true")
+           && List.assoc_opt "id" model_fields = Some (`String "runtime-small")
+           && List.assoc_opt "provider" model_fields = Some (`String "runtimeai")
+         | _ -> false)
+       | _ -> false
+     in
+     let ok = rpc_success out "execute_command" && data_ok && (Agent.config agent).Llm.model = "runtime-small" in
+     Extensions.clear_active_model ();
+     ok);
+  check "rpc Pi execute_command applies extension session name"
+    ((not node_available)
+     ||
+     let session = Session.create_new ~name:"rpc-before" () in
+     let agent = Agent.create ~session cfg_for_reset in
+     let out = Rpc.handle_command_for_test agent (j {|{"type":"execute_command","command":"/sessionmeta"}|}) in
+     let data_ok =
+       match rpc_field (rpc_last out) "data" with
+       | Some (`Assoc fields) ->
+         List.assoc_opt "text" fields = Some (`String "rpc-before:from-extension")
+         && List.assoc_opt "sessionName" fields = Some (`String "from-extension")
+       | _ -> false
+     in
+     let persisted =
+       match Session.read_header session.Session.path with
+       | Some info -> info.Session.name = "from-extension"
+       | None -> false
+     in
+     rpc_success out "execute_command" && data_ok && Agent.session_name agent = Some "from-extension" && persisted);
+  check "rpc Pi execute_command persists extension session entries"
+    ((not node_available)
+     ||
+     let session = Session.create_new ~name:"entry-session" () in
+     let agent = Agent.create ~session cfg_for_reset in
+     let out = Rpc.handle_command_for_test agent (j {|{"type":"execute_command","command":"/sessionentry"}|}) in
+     let data_ok =
+       match rpc_field (rpc_last out) "data" with
+       | Some (`Assoc fields) -> (
+         match List.assoc_opt "sessionEntries" fields with
+         | Some (`List entries) -> List.length entries = 2
+         | _ -> false)
+       | _ -> false
+     in
+     let entries = Session.load_entries session.Session.path in
+     let has_custom =
+       List.exists
+         (function
+           | `Assoc fields ->
+             List.assoc_opt "type" fields = Some (`String "custom")
+             && List.assoc_opt "customType" fields = Some (`String "state-note")
+           | _ -> false)
+         entries
+     in
+     let has_label =
+       List.exists
+         (function
+           | `Assoc fields ->
+             List.assoc_opt "type" fields = Some (`String "label")
+             && List.assoc_opt "targetId" fields = Some (`String "entry-target")
+           | _ -> false)
+         entries
+     in
+     Session.set_name session "entry-session-renamed" (Agent.turns agent);
+     rpc_success out "execute_command" && data_ok && has_custom && has_label
+     && Session.load_turns session.Session.path = [] && List.length (Session.load_entries session.Session.path) = 2);
+  check "rpc Pi execute_command applies extension theme"
+    ((not node_available)
+     ||
+     let _ = Themes.set_active_name ~persist:true "dark" in
+     let out = Rpc.handle_command_for_test (Agent.create cfg_for_reset) (j {|{"type":"execute_command","command":"/themectl"}|}) in
+     let data_ok =
+       match rpc_field (rpc_last out) "data" with
+       | Some (`Assoc fields) ->
+         List.assoc_opt "themeName" fields = Some (`String "light")
+         && (match List.assoc_opt "text" fields with
+             | Some (`String text) -> contains0 text "dark:" && contains0 text ":light:true:false"
+             | _ -> false)
+       | _ -> false
+     in
+     rpc_success out "execute_command" && data_ok && (Themes.current_theme ()).Themes.name = "light");
+  check "rpc Pi execute_command exposes extension tools expanded state"
+    ((not node_available)
+     ||
+     let out = Rpc.handle_command_for_test (Agent.create cfg_for_reset) (j {|{"type":"execute_command","command":"/toolsexpanded"}|}) in
+     match rpc_field (rpc_last out) "data" with
+     | Some (`Assoc fields) ->
+       rpc_success out "execute_command"
+       && List.assoc_opt "text" fields = Some (`String "false:true")
+       && List.assoc_opt "toolsExpanded" fields = Some (`Bool true)
+     | _ -> false);
+  check "rpc Pi execute_command exposes extension runtime action requests"
+    ((not node_available)
+     ||
+     let out = Rpc.handle_command_for_test (Agent.create cfg_for_reset) (j {|{"type":"execute_command","command":"/runtimeactions"}|}) in
+     match rpc_field (rpc_last out) "data" with
+     | Some (`Assoc fields) ->
+       let compact_ok =
+         match List.assoc_opt "compactResults" fields with
+         | Some (`List [ `Assoc result_fields ]) -> (
+           match List.assoc_opt "request" result_fields, List.assoc_opt "text" result_fields with
+           | Some (`Assoc request_fields), Some (`String text) ->
+             List.assoc_opt "reason" request_fields = Some (`String "test")
+             && contains0 text "Nothing to compact"
+           | _ -> false)
+         | _ -> false
+       in
+       rpc_success out "execute_command"
+       && List.assoc_opt "text" fields = Some (`String "actions")
+       && List.assoc_opt "abortRequested" fields = Some (`Bool true)
+       && List.assoc_opt "shutdownRequested" fields = Some (`Bool true)
+       && List.assoc_opt "reloadRequested" fields = Some (`Bool true)
+       && compact_ok
+     | _ -> false);
+  check "rpc Pi execute_command exposes extension context runtime state"
+    ((not node_available)
+     ||
+     let out = Rpc.handle_command_for_test (Agent.create cfg_for_reset) (j {|{"type":"execute_command","command":"/ctxinfo"}|}) in
+     match rpc_field (rpc_last out) "data" with
+     | Some (`Assoc fields) -> (
+       match List.assoc_opt "text" fields with
+       | Some (`String text) ->
+         rpc_success out "execute_command"
+         && contains0 text "false:true:false:test-model:"
+         && contains0 text ":true"
+       | _ -> false)
+     | _ -> false);
+  check "rpc Pi execute_command exposes readonly sessionManager snapshot"
+    ((not node_available)
+     ||
+     let session = Session.create_new ~name:"Rpc Session" () in
+     let agent =
+       Agent.create ~session ~initial_turns:[ { Llm.role = Llm.User; content = [ Llm.Text "hello" ] } ] cfg_for_reset
+     in
+     let out = Rpc.handle_command_for_test agent (j {|{"type":"execute_command","command":"/sessionview"}|}) in
+     let ok =
+       match rpc_field (rpc_last out) "data" with
+       | Some (`Assoc fields) -> (
+         match List.assoc_opt "text" fields with
+         | Some (`String text) ->
+           let parts = String.split_on_char ':' text in
+           rpc_success out "execute_command"
+           && List.length parts = 14
+           && List.nth parts 1 = "Rpc Session"
+           && List.nth parts 2 = "true"
+           && List.nth parts 3 = "true"
+           && List.nth parts 4 = "1"
+           && List.nth parts 5 = "turn-0"
+           && List.nth parts 6 = "message"
+           && List.nth parts 7 = "user"
+           && List.nth parts 9 = "turn-0"
+           && List.nth parts 11 = "1"
+           && List.nth parts 12 = ""
+           && List.nth parts 13 = "true"
+         | _ -> false)
+       | _ -> false
+     in
+     Session.close session;
+     ok);
+  check "rpc Pi execute_command exposes readonly modelRegistry snapshot"
+    ((not node_available)
+     ||
+     let out = Rpc.handle_command_for_test (Agent.create cfg_for_reset) (j {|{"type":"execute_command","command":"/modelregistry"}|}) in
+     match rpc_field (rpc_last out) "data" with
+     | Some (`Assoc fields) -> (
+       match List.assoc_opt "text" fields with
+       | Some (`String text) ->
+         let parts = String.split_on_char ':' text in
+         rpc_success out "execute_command"
+         && List.length parts = 8
+         && Option.value (int_of_string_opt (List.nth parts 0)) ~default:0 > 0
+         && Option.value (int_of_string_opt (List.nth parts 1)) ~default:0 > 0
+         && List.nth parts 2 = "test-model"
+         && List.nth parts 3 = "true"
+         && List.nth parts 4 = "true"
+         && List.nth parts 5 = "openai"
+         && List.nth parts 6 = "true"
+         && List.nth parts 7 = "none"
+       | _ -> false)
+     | _ -> false);
+  check "rpc Pi execute_command applies extension newSession action"
+    ((not node_available)
+     ||
+     let session = Session.create_new ~name:"before-action" () in
+     let agent =
+       Agent.create ~session ~initial_turns:[ { Llm.role = Llm.User; content = [ Llm.Text "hello" ] } ] cfg_for_reset
+     in
+     let before_id = session.Session.id in
+     let out = Rpc.handle_command_for_test agent (j {|{"type":"execute_command","command":"/sessionaction new"}|}) in
+     let current_id = match Agent.session agent with Some s -> s.Session.id | None -> "" in
+     let ok =
+       match rpc_field (rpc_last out) "data" with
+       | Some (`Assoc fields) ->
+         let result_ok =
+           match List.assoc_opt "sessionActionResults" fields with
+           | Some (`List [ `Assoc result_fields ]) ->
+             List.assoc_opt "kind" result_fields = Some (`String "new_session")
+             &&
+             (match List.assoc_opt "text" result_fields with
+              | Some (`String text) -> contains0 text "Started new session"
+              | _ -> false)
+           | _ -> false
+         in
+         rpc_success out "execute_command"
+         && List.assoc_opt "text" fields = Some (`String "new:false")
+         && result_ok
+         && current_id <> "" && current_id <> before_id
+         && Agent.turn_count agent = 0
+       | _ -> false
+     in
+     Option.iter Session.close (Agent.session agent);
+     ok);
+  check "rpc Pi execute_command applies extension fork withSession action"
+    ((not node_available)
+     ||
+     let turns =
+       [ { Llm.role = Llm.User; content = [ Llm.Text "one" ] };
+         { Llm.role = Llm.Assistant; content = [ Llm.Text "two" ] } ]
+     in
+     let session = Session.create_new ~name:"before-fork-with" () in
+     List.iter (Session.append session) turns;
+     let agent = Agent.create ~session ~initial_turns:turns cfg_for_reset in
+     let out = Rpc.handle_command_for_test agent (j {|{"type":"execute_command","command":"/sessionaction forkwith turn-0"}|}) in
+     let current = Agent.session agent in
+     let entries = match current with Some s -> s.Session.entries | None -> [] in
+     let has_fork_note =
+       List.exists
+         (function
+           | `Assoc fields ->
+             List.assoc_opt "type" fields = Some (`String "custom_message")
+             && List.assoc_opt "id" fields = Some (`String "message-1")
+             && List.assoc_opt "parentId" fields = Some (`String "turn-0")
+             && List.assoc_opt "customType" fields = Some (`String "fork-note")
+           | _ -> false)
+         entries
+     in
+     let ok =
+       match rpc_field (rpc_last out) "data", current with
+       | Some (`Assoc fields), Some _ ->
+         let result_ok =
+           match List.assoc_opt "sessionActionResults" fields with
+           | Some (`List [ `Assoc result_fields ]) ->
+             List.assoc_opt "kind" result_fields = Some (`String "fork")
+             &&
+             (match List.assoc_opt "text" result_fields with
+              | Some (`String text) -> contains0 text "Forked turn-0"
+              | _ -> false)
+           | _ -> false
+         in
+         rpc_success out "execute_command"
+         && List.assoc_opt "text" fields = Some (`String "forkwith:false")
+         && result_ok && Agent.turn_count agent = 1 && has_fork_note
+       | _ -> false
+     in
+     Option.iter Session.close current;
+     ok);
+  check "rpc Pi execute_command applies extension navigateTree action"
+    ((not node_available)
+     ||
+     let turns =
+       [ { Llm.role = Llm.User; content = [ Llm.Text "one" ] };
+         { Llm.role = Llm.Assistant; content = [ Llm.Text "two" ] } ]
+     in
+     let session = Session.create_new ~name:"nav-action" () in
+     List.iter (Session.append session) turns;
+     let agent = Agent.create ~session ~initial_turns:turns cfg_for_reset in
+     let out = Rpc.handle_command_for_test agent (j {|{"type":"execute_command","command":"/sessionaction nav turn-0"}|}) in
+     let has_leaf_reset =
+       List.exists
+         (function
+           | `Assoc entry_fields ->
+             List.assoc_opt "type" entry_fields = Some (`String "leaf")
+             && List.assoc_opt "parentId" entry_fields = Some (`String "turn-1")
+             && List.assoc_opt "targetId" entry_fields = Some (`Null)
+           | _ -> false)
+         session.Session.entries
+     in
+     let ok =
+       match rpc_field (rpc_last out) "data" with
+       | Some (`Assoc fields) ->
+         let result_ok =
+           match List.assoc_opt "sessionActionResults" fields with
+           | Some (`List [ `Assoc result_fields ]) ->
+             List.assoc_opt "kind" result_fields = Some (`String "navigate_tree")
+             && List.assoc_opt "editorText" result_fields = Some (`String "one")
+             &&
+             (match List.assoc_opt "text" result_fields with
+              | Some (`String text) -> contains0 text "Navigated to turn-0"
+              | _ -> false)
+           | _ -> false
+         in
+         rpc_success out "execute_command"
+         && List.assoc_opt "text" fields = Some (`String "nav:false")
+         && result_ok && Agent.turn_count agent = 0
+         && session_context_leaf session (Agent.turns agent) = `Null
+         && has_leaf_reset
+         && contains0 (Tools.read_file_contents "lifecycle.log") "session_tree  turn-1"
+         &&
+         List.exists
+           (function
+             | `Assoc entry_fields ->
+               List.assoc_opt "type" entry_fields = Some (`String "label")
+               && List.assoc_opt "targetId" entry_fields = Some (`String "turn-0")
+               && List.assoc_opt "label" entry_fields = Some (`String "from-extension")
+             | _ -> false)
+           session.Session.entries
+       | _ -> false
+     in
+     Option.iter Session.close (Agent.session agent);
+     ok);
+  check "rpc Pi execute_command keeps assistant navigateTree target in context"
+    ((not node_available)
+     ||
+     let turns =
+       [ { Llm.role = Llm.User; content = [ Llm.Text "one" ] };
+         { Llm.role = Llm.Assistant; content = [ Llm.Text "two" ] } ]
+     in
+     let session = Session.create_new ~name:"nav-assistant-action" () in
+     List.iter (Session.append session) turns;
+     let agent = Agent.create ~session ~initial_turns:turns cfg_for_reset in
+     let out = Rpc.handle_command_for_test agent (j {|{"type":"execute_command","command":"/sessionaction nav turn-1"}|}) in
+     let ok =
+       match rpc_field (rpc_last out) "data" with
+       | Some (`Assoc fields) ->
+         let result_ok =
+           match List.assoc_opt "sessionActionResults" fields with
+           | Some (`List [ `Assoc result_fields ]) ->
+             List.assoc_opt "kind" result_fields = Some (`String "navigate_tree")
+             && List.assoc_opt "editorText" result_fields = None
+             &&
+             (match List.assoc_opt "text" result_fields with
+              | Some (`String text) -> contains0 text "Navigated to turn-1"
+              | _ -> false)
+           | _ -> false
+         in
+         rpc_success out "execute_command"
+         && List.assoc_opt "text" fields = Some (`String "nav:false")
+         && result_ok && Agent.turn_count agent = 2
+       | _ -> false
+     in
+     Option.iter Session.close (Agent.session agent);
+     ok);
+  check "rpc Pi navigateTree custom_message target returns editor text"
+    (let turns =
+       [ { Llm.role = Llm.User; content = [ Llm.Text "one" ] };
+         { Llm.role = Llm.Assistant; content = [ Llm.Text "two" ] } ]
+     in
+     let session = Session.create_new ~name:"nav-custom-message" () in
+     List.iter (Session.append session) turns;
+     Session.append_entry session
+       (`Assoc
+         [ ("type", `String "custom_message");
+           ("id", `String "custom-1");
+           ("parentId", `String "turn-0");
+           ("timestamp", `String "");
+           ("customType", `String "note");
+           ("content", `String "custom body");
+           ("display", `Bool true) ]);
+     let agent = Agent.create ~session ~initial_turns:turns cfg_for_reset in
+     let results =
+       Commands.apply_extension_session_actions agent
+         [ j {|{"kind":"navigate_tree","targetId":"custom-1","options":{"label":"custom-label"}}|} ]
+     in
+     let result_ok =
+       match results with
+       | [ `Assoc fields ] ->
+         List.assoc_opt "kind" fields = Some (`String "navigate_tree")
+         && List.assoc_opt "editorText" fields = Some (`String "custom body")
+         && List.assoc_opt "cancelled" fields = Some (`Bool false)
+       | _ -> false
+     in
+     let has_label =
+       List.exists
+         (function
+           | `Assoc fields ->
+             List.assoc_opt "type" fields = Some (`String "label")
+             && List.assoc_opt "targetId" fields = Some (`String "custom-1")
+             && List.assoc_opt "label" fields = Some (`String "custom-label")
+           | _ -> false)
+         session.Session.entries
+     in
+     let ok = result_ok && Agent.turn_count agent = 1 && has_label in
+     Option.iter Session.close (Agent.session agent);
+     ok);
+  check "rpc Pi navigateTree branch_summary target becomes model context leaf"
+    ((not node_available)
+     ||
+     let turns =
+       [ { Llm.role = Llm.User; content = [ Llm.Text "one" ] };
+         { Llm.role = Llm.Assistant; content = [ Llm.Text "two" ] };
+         { Llm.role = Llm.User; content = [ Llm.Text "three" ] } ]
+     in
+     let session = Session.create_new ~name:"nav-branch-summary-target" () in
+     List.iter (Session.append session) turns;
+     let summary =
+       Session.append_branch_summary session ~parent_id:"turn-0" ~from_hook:false ~from_id:"turn-0"
+         "branch leaf summary"
+     in
+     let summary_id =
+       match summary with
+       | `Assoc fields -> (
+         match List.assoc_opt "id" fields with
+         | Some (`String id) -> id
+         | _ -> "missing")
+       | _ -> "missing"
+     in
+     Tools.write_file_contents "runtime-request.log" "";
+     let agent = Agent.create ~session ~initial_turns:turns (Llm.config_for "runtime") in
+     let results =
+       Commands.apply_extension_session_actions agent
+         [ `Assoc
+             [ ("kind", `String "navigate_tree");
+               ("targetId", `String summary_id);
+               ("options", `Assoc [ ("label", `String "summary-leaf") ]) ] ]
+     in
+     let leaf_after_nav = session_context_leaf session (Agent.turns agent) in
+     let has_leaf_move =
+       List.exists
+         (function
+           | `Assoc fields ->
+             List.assoc_opt "type" fields = Some (`String "leaf")
+             && List.assoc_opt "targetId" fields = Some (`String summary_id)
+           | _ -> false)
+         session.Session.entries
+     in
+     ignore (Agent.send agent "continue from branch summary");
+     let log = Tools.read_file_contents "runtime-request.log" in
+     let result_ok =
+       match results with
+       | [ `Assoc fields ] ->
+         List.assoc_opt "kind" fields = Some (`String "navigate_tree")
+         && List.assoc_opt "editorText" fields = None
+         && List.assoc_opt "cancelled" fields = Some (`Bool false)
+       | _ -> false
+     in
+     let has_label =
+       List.exists
+         (function
+           | `Assoc fields ->
+             List.assoc_opt "type" fields = Some (`String "label")
+             && List.assoc_opt "targetId" fields = Some (`String summary_id)
+             && List.assoc_opt "label" fields = Some (`String "summary-leaf")
+           | _ -> false)
+         session.Session.entries
+     in
+     let ok =
+       result_ok && has_label && has_leaf_move
+       && leaf_after_nav = `String summary_id
+       && Agent.turn_count agent = 4
+       && contains0 log "branch leaf summary"
+       && contains0 log "continue from branch summary"
+     in
+     Option.iter Session.close (Agent.session agent);
+     ok);
+  check "rpc Pi execute_command applies extension session_before_tree label override"
+    ((not node_available)
+     ||
+     let turns =
+       [ { Llm.role = Llm.User; content = [ Llm.Text "one" ] };
+         { Llm.role = Llm.Assistant; content = [ Llm.Text "two" ] } ]
+     in
+     let session = Session.create_new ~name:"nav-hook-action" () in
+     List.iter (Session.append session) turns;
+     let agent = Agent.create ~session ~initial_turns:turns cfg_for_reset in
+     let out = Rpc.handle_command_for_test agent (j {|{"type":"execute_command","command":"/sessionaction navhook turn-0"}|}) in
+     let ok =
+       match rpc_field (rpc_last out) "data" with
+       | Some (`Assoc fields) ->
+         let result_ok =
+           match List.assoc_opt "sessionActionResults" fields with
+           | Some (`List [ `Assoc result_fields ]) ->
+             List.assoc_opt "kind" result_fields = Some (`String "navigate_tree")
+             && List.assoc_opt "cancelled" result_fields = Some (`Bool false)
+           | _ -> false
+         in
+         rpc_success out "execute_command"
+         && List.assoc_opt "text" fields = Some (`String "navhook:false")
+         && result_ok && Agent.turn_count agent = 0
+         &&
+         List.exists
+           (function
+             | `Assoc entry_fields ->
+               List.assoc_opt "type" entry_fields = Some (`String "label")
+               && List.assoc_opt "targetId" entry_fields = Some (`String "turn-0")
+               && List.assoc_opt "label" entry_fields = Some (`String "hook-label")
+             | _ -> false)
+           session.Session.entries
+       | _ -> false
+     in
+     Option.iter Session.close (Agent.session agent);
+     ok);
+  check "rpc Pi execute_command persists extension branch summary from navigateTree"
+    ((not node_available)
+     ||
+     let turns =
+       [ { Llm.role = Llm.User; content = [ Llm.Text "one" ] };
+         { Llm.role = Llm.Assistant; content = [ Llm.Text "two" ] } ]
+     in
+     let session = Session.create_new ~name:"nav-summary-action" () in
+     List.iter (Session.append session) turns;
+     let agent = Agent.create ~session ~initial_turns:turns cfg_for_reset in
+     let out = Rpc.handle_command_for_test agent (j {|{"type":"execute_command","command":"/sessionaction navsummary turn-0"}|}) in
+     let summary_entry =
+       session.Session.entries
+       |> List.find_map (function
+              | `Assoc fields when List.assoc_opt "type" fields = Some (`String "branch_summary") -> Some fields
+              | _ -> None)
+     in
+     let summary_id =
+       match summary_entry with
+       | Some fields -> (
+         match List.assoc_opt "id" fields with
+         | Some (`String id) -> Some id
+         | _ -> None)
+       | None -> None
+     in
+     let has_summary =
+       match summary_entry with
+       | Some fields ->
+         List.assoc_opt "parentId" fields = Some `Null
+         && List.assoc_opt "fromId" fields = Some (`String "root")
+         && List.assoc_opt "summary" fields = Some (`String "summary from tree 1")
+         && List.assoc_opt "fromHook" fields = Some (`Bool true)
+         &&
+         (match List.assoc_opt "details" fields with
+          | Some (`Assoc detail_fields) -> List.assoc_opt "source" detail_fields = Some (`String "hook")
+          | _ -> false)
+       | None -> false
+     in
+     let has_label =
+       match summary_id with
+       | None -> false
+       | Some id ->
+         List.exists
+           (function
+             | `Assoc entry_fields ->
+               List.assoc_opt "type" entry_fields = Some (`String "label")
+               && List.assoc_opt "targetId" entry_fields = Some (`String id)
+               && List.assoc_opt "label" entry_fields = Some (`String "summary-hook-label")
+             | _ -> false)
+           session.Session.entries
+     in
+     let summary_is_leaf =
+       match summary_id with
+       | Some id -> session_context_leaf session (Agent.turns agent) = `String id
+       | None -> false
+     in
+     let ok =
+       match rpc_field (rpc_last out) "data" with
+       | Some (`Assoc fields) ->
+         let result_ok =
+           match List.assoc_opt "sessionActionResults" fields with
+           | Some (`List [ `Assoc result_fields ]) ->
+             List.assoc_opt "kind" result_fields = Some (`String "navigate_tree")
+             && List.assoc_opt "cancelled" result_fields = Some (`Bool false)
+           | _ -> false
+         in
+         rpc_success out "execute_command"
+         && List.assoc_opt "text" fields = Some (`String "navsummary:false")
+         && result_ok && Agent.turn_count agent = 0 && has_summary && has_label && summary_is_leaf
+         && contains0 (Tools.read_file_contents "lifecycle.log") "turn-1 branch_summary"
+       | _ -> false
+     in
+     Option.iter Session.close (Agent.session agent);
+     ok);
+  check "rpc Pi navigateTree branch summary feeds next model context"
+    ((not node_available)
+     ||
+     let turns =
+       [ { Llm.role = Llm.User; content = [ Llm.Text "one" ] };
+         { Llm.role = Llm.Assistant; content = [ Llm.Text "two" ] } ]
+     in
+     let session = Session.create_new ~name:"nav-summary-context" () in
+     List.iter (Session.append session) turns;
+     let agent = Agent.create ~session ~initial_turns:turns cfg_for_reset in
+     let _ = Rpc.handle_command_for_test agent (j {|{"type":"execute_command","command":"/sessionaction navsummary turn-0"}|}) in
+     Tools.write_file_contents "runtime-request.log" "";
+     Agent.set_config agent (Llm.config_for "runtime");
+     ignore (Agent.send agent "next question");
+     let log = Tools.read_file_contents "runtime-request.log" in
+     let ok =
+       Agent.turn_count agent = 3
+       && contains0 log "The following is a summary of a branch that this conversation came back from"
+       && contains0 log "summary from tree 1"
+       && contains0 log "next question"
+     in
+     Option.iter Session.close (Agent.session agent);
+     ok);
+  check "rpc Pi execute_command cancels extension navigateTree action via session_before_tree"
+    ((not node_available)
+     ||
+     let turns =
+       [ { Llm.role = Llm.User; content = [ Llm.Text "one" ] };
+         { Llm.role = Llm.Assistant; content = [ Llm.Text "two" ] } ]
+     in
+     let session = Session.create_new ~name:"nav-cancel-action" () in
+     List.iter (Session.append session) turns;
+     let agent = Agent.create ~session ~initial_turns:turns cfg_for_reset in
+     let out = Rpc.handle_command_for_test agent (j {|{"type":"execute_command","command":"/sessionaction navcancel turn-0"}|}) in
+     let ok =
+       match rpc_field (rpc_last out) "data" with
+       | Some (`Assoc fields) ->
+         let result_ok =
+           match List.assoc_opt "sessionActionResults" fields with
+           | Some (`List [ `Assoc result_fields ]) ->
+             List.assoc_opt "kind" result_fields = Some (`String "navigate_tree")
+             && List.assoc_opt "cancelled" result_fields = Some (`Bool true)
+             &&
+             (match List.assoc_opt "text" result_fields with
+              | Some (`String text) -> contains0 text "no tree"
+              | _ -> false)
+           | _ -> false
+         in
+         rpc_success out "execute_command"
+         && List.assoc_opt "text" fields = Some (`String "navcancel:false")
+         && result_ok && Agent.turn_count agent = 2
+         && not
+              (List.exists
+                 (function
+                   | `Assoc entry_fields ->
+                     List.assoc_opt "type" entry_fields = Some (`String "label")
+                     && List.assoc_opt "label" entry_fields = Some (`String "cancel-tree")
+                   | _ -> false)
+                 session.Session.entries)
+       | _ -> false
+     in
+     Option.iter Session.close (Agent.session agent);
+     ok);
+  check "rpc Pi execute_command marks cancelled session switch action"
+    ((not node_available)
+     ||
+     let target = Session.open_file (Filename.concat (Session.default_dir ()) "cancel-target.jsonl") in
+     Session.close target;
+     let session = Session.create_new ~name:"before-cancel-switch" () in
+     let agent = Agent.create ~session cfg_for_reset in
+     let before_id = session.Session.id in
+     let out =
+       Rpc.handle_command_for_test agent (j {|{"type":"execute_command","command":"/sessionaction switch cancel-target"}|})
+     in
+     let current_id = match Agent.session agent with Some s -> s.Session.id | None -> "" in
+     let ok =
+       match rpc_field (rpc_last out) "data" with
+       | Some (`Assoc fields) ->
+         let result_ok =
+           match List.assoc_opt "sessionActionResults" fields with
+           | Some (`List [ `Assoc result_fields ]) ->
+             List.assoc_opt "kind" result_fields = Some (`String "switch_session")
+             && List.assoc_opt "cancelled" result_fields = Some (`Bool true)
+             &&
+             (match List.assoc_opt "text" result_fields with
+              | Some (`String text) -> contains0 text "Session switch cancelled"
+              | _ -> false)
+           | _ -> false
+         in
+         rpc_success out "execute_command"
+         && List.assoc_opt "text" fields = Some (`String "switch:false")
+         && result_ok && current_id = before_id
+       | _ -> false
+     in
+     Option.iter Session.close (Agent.session agent);
+     ok);
+  check "rpc Pi execute_command applies extension withSession side effects"
+    ((not node_available)
+     ||
+     let session = Session.create_new ~name:"before-with" () in
+     let agent =
+       Agent.create ~session ~initial_turns:[ { Llm.role = Llm.User; content = [ Llm.Text "hello" ] } ] cfg_for_reset
+     in
+     let out = Rpc.handle_command_for_test agent (j {|{"type":"execute_command","command":"/sessionaction with"}|}) in
+     let current = Agent.session agent in
+     let entries = match current with Some s -> s.Session.entries | None -> [] in
+     let has_entry typ =
+       List.exists
+         (function
+           | `Assoc fields -> List.assoc_opt "type" fields = Some (`String typ)
+           | _ -> false)
+         entries
+     in
+     let entry_has expected =
+       List.exists
+         (function
+           | `Assoc fields ->
+             List.for_all
+               (fun (key, value) -> List.assoc_opt key fields = Some value)
+               expected
+           | _ -> false)
+         entries
+     in
+     let has_custom_message custom_type =
+       List.exists
+         (function
+           | `Assoc fields ->
+             List.assoc_opt "type" fields = Some (`String "custom_message")
+             && List.assoc_opt "customType" fields = Some (`String custom_type)
+           | _ -> false)
+         entries
+     in
+     let context_contains_setup_message =
+       Agent.context_turns agent
+       |> List.exists (fun turn ->
+              List.exists
+                (function
+                  | Llm.Text text -> contains0 text "setup user"
+                  | _ -> false)
+                turn.Llm.content)
+     in
+     let ok =
+       match rpc_field (rpc_last out) "data", current with
+       | Some (`Assoc fields), Some s ->
+         let result_ok =
+           match List.assoc_opt "sessionActionResults" fields with
+           | Some (`List [ `Assoc result_fields ]) ->
+             List.assoc_opt "kind" result_fields = Some (`String "new_session")
+             &&
+             (match List.assoc_opt "text" result_fields with
+              | Some (`String text) -> contains0 text "Started new session"
+              | _ -> false)
+           | _ -> false
+         in
+         rpc_success out "execute_command"
+         && List.assoc_opt "text" fields = Some (`String "with:false")
+         && result_ok && s.Session.name = "with-session-name"
+         && Agent.turn_count agent = 0
+         && has_entry "custom" && has_entry "session_info" && has_entry "label"
+         && entry_has
+              [ ("type", `String "custom");
+                ("id", `String "callback-entry-1");
+                ("parentId", `Null);
+                ("customType", `String "setup-note") ]
+         && entry_has
+              [ ("type", `String "label");
+                ("id", `String "callback-label-4");
+                ("parentId", `String "callback-message-3");
+                ("targetId", `String "callback-message-3");
+                ("label", `String "setup-label") ]
+         && has_entry "message" && context_contains_setup_message
+         && has_entry "thinking_level_change" && has_entry "model_change"
+         && has_entry "compaction"
+         && has_custom_message "setup-message" && has_custom_message "with-note"
+       | _ -> false
+     in
+     Option.iter Session.close current;
+     ok);
+  check "rpc Pi execute_command applies setup session tree branch writes"
+    ((not node_available)
+     ||
+     let agent = Agent.create cfg_for_reset in
+     let out = Rpc.handle_command_for_test agent (j {|{"type":"execute_command","command":"/sessionbranch"}|}) in
+     let current = Agent.session agent in
+     let entries = match current with Some s -> s.Session.entries | None -> [] in
+     let entry_has expected =
+       List.exists
+         (function
+           | `Assoc fields ->
+             List.for_all
+               (fun (key, value) -> List.assoc_opt key fields = Some value)
+               expected
+           | _ -> false)
+         entries
+     in
+     let context_contains text =
+       Agent.context_turns agent
+       |> List.exists (fun turn ->
+              List.exists
+                (function
+                  | Llm.Text value -> contains0 value text
+                  | _ -> false)
+                turn.Llm.content)
+     in
+     let ok =
+       match rpc_field (rpc_last out) "data", current with
+       | Some (`Assoc fields), Some _ ->
+         let result_ok =
+           match List.assoc_opt "sessionActionResults" fields with
+           | Some (`List [ `Assoc result_fields ]) ->
+             List.assoc_opt "kind" result_fields = Some (`String "new_session")
+             &&
+             (match List.assoc_opt "text" result_fields with
+              | Some (`String text) -> contains0 text "Started new session"
+              | _ -> false)
+           | _ -> false
+         in
+         rpc_success out "execute_command"
+         && List.assoc_opt "text" fields = Some (`String "branch:false")
+         && result_ok && Agent.turn_count agent = 0
+         && entry_has
+              [ ("type", `String "leaf");
+                ("id", `String "callback-leaf-3");
+                ("parentId", `String "callback-message-2");
+                ("targetId", `String "callback-message-1") ]
+         && entry_has
+              [ ("type", `String "message");
+                ("id", `String "callback-message-4");
+                ("parentId", `String "callback-message-1") ]
+         && entry_has
+              [ ("type", `String "branch_summary");
+                ("id", `String "callback-branch-summary-5");
+                ("parentId", `String "callback-message-1");
+                ("fromId", `String "callback-message-1");
+                ("summary", `String "setup branch summary");
+                ("fromHook", `Bool true) ]
+         && context_contains "branch child" && context_contains "setup branch summary"
+       | _ -> false
+     in
+     Option.iter Session.close current;
+     ok);
+  check "rpc Pi execute_command applies setup session manager aliases"
+    ((not node_available)
+     ||
+     let agent = Agent.create cfg_for_reset in
+     let out = Rpc.handle_command_for_test agent (j {|{"type":"execute_command","command":"/sessionalias"}|}) in
+     let current = Agent.session agent in
+     let entries = match current with Some s -> s.Session.entries | None -> [] in
+     let entry_has expected =
+       List.exists
+         (function
+           | `Assoc fields ->
+             List.for_all
+               (fun (key, value) -> List.assoc_opt key fields = Some value)
+               expected
+           | _ -> false)
+         entries
+     in
+     let context_contains_alias_root =
+       Agent.context_turns agent
+       |> List.exists (fun turn ->
+              List.exists
+                (function
+                  | Llm.Text value -> contains0 value "alias root"
+                  | _ -> false)
+                turn.Llm.content)
+     in
+     let ok =
+       match rpc_field (rpc_last out) "data", current with
+       | Some (`Assoc fields), Some s ->
+         let result_ok =
+           match List.assoc_opt "sessionActionResults" fields with
+           | Some (`List [ `Assoc result_fields ]) ->
+             List.assoc_opt "kind" result_fields = Some (`String "new_session")
+             &&
+             (match List.assoc_opt "text" result_fields with
+              | Some (`String text) -> contains0 text "Started new session"
+              | _ -> false)
+           | _ -> false
+         in
+         rpc_success out "execute_command"
+         && List.assoc_opt "text" fields = Some (`String "alias:false")
+         && result_ok && s.Session.name = "alias-session"
+         && entry_has
+              [ ("type", `String "session_info");
+                ("id", `String "callback-session-info-2");
+                ("parentId", `String "callback-message-1");
+                ("name", `String "alias-session") ]
+         && entry_has
+              [ ("type", `String "label");
+                ("id", `String "callback-label-3");
+                ("parentId", `String "callback-session-info-2");
+                ("targetId", `String "callback-message-1");
+                ("label", `String "alias-label") ]
+         && context_contains_alias_root
+       | _ -> false
+     in
+     Option.iter Session.close current;
+     ok);
+  check "rpc Pi execute_command emits extension UI request events"
+    ((not node_available)
+     ||
+     let out =
+       Rpc.handle_command_for_test (Agent.create cfg_for_reset)
+         (j {|{"type":"execute_command","command":"/uicmd"}|})
+     in
+     let methods =
+       out
+       |> List.filter_map (fun event ->
+              match rpc_field event "type", rpc_field event "method" with
+              | Some (`String "extension_ui_request"), Some (`String method_) -> Some method_
+              | _ -> None)
+     in
+     rpc_success out "execute_command"
+     && List.mem "notify" methods && List.mem "confirm" methods
+     && List.mem "input" methods && List.mem "select" methods);
+  check "rpc Pi execute_command exposes extension UI surfaces"
+    ((not node_available)
+     ||
+     let out =
+       Rpc.handle_command_for_test (Agent.create cfg_for_reset)
+         (j {|{"type":"execute_command","command":"/surfacecmd"}|})
+     in
+     rpc_success out "execute_command"
+     &&
+     match rpc_field (rpc_last out) "data" with
+     | Some (`Assoc fields) -> (
+       match List.assoc_opt "text" fields, List.assoc_opt "ui" fields with
+       | Some (`String text), Some (`Assoc ui_fields) -> (
+         match List.assoc_opt "surfaces" ui_fields with
+         | Some (`List surfaces) ->
+           let kinds =
+             List.filter_map
+               (fun surface ->
+                 match Yojson.Safe.Util.member "kind" surface with
+                 | `String kind -> Some kind
+                 | _ -> None)
+               surfaces
+           in
+           contains0 text "surface editor body:prefill"
+           && List.mem "status" kinds && List.mem "widget" kinds
+           && List.mem "title" kinds && List.mem "editor_text" kinds
+         | _ -> false)
+       | _ -> false)
+     | _ -> false);
+  check "rpc Pi execute_command emits extension UI surface events"
+    ((not node_available)
+     ||
+     let out =
+       Rpc.handle_command_for_test (Agent.create cfg_for_reset)
+         (j {|{"type":"execute_command","command":"/surfacecmd"}|})
+     in
+     let methods =
+       out
+       |> List.filter_map (fun event ->
+              match rpc_field event "type", rpc_field event "method" with
+              | Some (`String "extension_ui_request"), Some (`String method_) -> Some method_
+              | _ -> None)
+     in
+     rpc_success out "execute_command"
+     && List.mem "setStatus" methods && List.mem "setWidget" methods
+     && List.mem "setTitle" methods && List.mem "set_editor_text" methods);
+  check "rpc Pi execute_command exposes component factory lines"
+    ((not node_available)
+     ||
+     let out =
+       Rpc.handle_command_for_test (Agent.create cfg_for_reset)
+         (j {|{"type":"execute_command","command":"/componentcmd"}|})
+     in
+     rpc_success out "execute_command"
+     &&
+     match rpc_field (rpc_last out) "data" with
+     | Some (`Assoc fields) -> (
+       match List.assoc_opt "text" fields, List.assoc_opt "ui" fields with
+       | Some (`String text), Some (`Assoc ui_fields) -> (
+         match List.assoc_opt "surfaces" ui_fields with
+         | Some (`List surfaces) ->
+           let lines_for kind =
+             surfaces
+             |> List.find_map (fun surface ->
+                    match Yojson.Safe.Util.member "kind" surface with
+                    | `String got when got = kind -> (
+                      match Yojson.Safe.Util.member "lines" surface with
+                      | `List lines ->
+                        Some
+                          (List.filter_map
+                             (function `String line -> Some line | _ -> None)
+                             lines)
+                      | _ -> Some [])
+                    | _ -> None)
+             |> Option.value ~default:[]
+           in
+           contains0 text "component done-value:true"
+           && List.mem "factory widget" (lines_for "widget")
+           && List.mem "custom component" (lines_for "custom")
+	       | _ -> false)
+	     | _ -> false)
+	 | _ -> false);
+  check "rpc Pi execute_command exposes custom overlay handle surfaces"
+    ((not node_available)
+     ||
+     let out =
+       Rpc.handle_command_for_test (Agent.create cfg_for_reset)
+         (j {|{"type":"execute_command","command":"/overlaycmd"}|})
+     in
+     rpc_success out "execute_command"
+     &&
+     match rpc_field (rpc_last out) "data" with
+     | Some (`Assoc fields) -> (
+       match List.assoc_opt "text" fields, List.assoc_opt "ui" fields with
+       | Some (`String text), Some (`Assoc ui_fields) -> (
+         match List.assoc_opt "surfaces" ui_fields with
+         | Some (`List surfaces) ->
+           let lines_contain expected surface =
+             match Yojson.Safe.Util.member "lines" surface with
+             | `List lines -> List.exists (function `String line -> line = expected | _ -> false) lines
+             | _ -> false
+           in
+           let custom_overlay =
+             surfaces
+             |> List.exists (fun surface ->
+                    Yojson.Safe.Util.member "kind" surface = `String "custom"
+                    && Yojson.Safe.Util.member "overlay" surface = `Bool true
+                    && lines_contain "overlay component" surface)
+           in
+           let custom_methods =
+             surfaces
+             |> List.filter_map (fun surface ->
+                    match Yojson.Safe.Util.member "kind" surface, Yojson.Safe.Util.member "overlayId" surface with
+                    | `String "overlay_handle", `String "custom-overlay-1" -> (
+                      match Yojson.Safe.Util.member "method" surface with
+                      | `String method_ -> Some method_
+                      | _ -> None)
+                    | _ -> None)
+           in
+           contains0 text "overlay overlay-done"
+           && custom_overlay
+           && List.mem "focus" custom_methods
+           && List.mem "setHidden" custom_methods
+           && List.mem "hide" custom_methods
+         | _ -> false)
+       | _ -> false)
+     | _ -> false);
+  check "rpc Pi execute_command emits component widget lines"
+    ((not node_available)
+     ||
+     let out =
+       Rpc.handle_command_for_test (Agent.create cfg_for_reset)
+         (j {|{"type":"execute_command","command":"/componentcmd"}|})
+     in
+     let widget_lines =
+       out
+       |> List.find_map (fun event ->
+              match rpc_field event "type", rpc_field event "method", rpc_field event "widgetKey" with
+              | Some (`String "extension_ui_request"), Some (`String "setWidget"), Some (`String "factory") -> (
+                match rpc_field event "widgetLines" with
+                | Some (`List lines) ->
+                  Some (List.filter_map (function `String line -> Some line | _ -> None) lines)
+                | _ -> Some [])
+              | _ -> None)
+       |> Option.value ~default:[]
+     in
+     rpc_success out "execute_command" && List.mem "factory widget" widget_lines);
+  check "rpc Pi execute_command emits custom message events"
+    ((not node_available)
+     ||
+     let out =
+       Rpc.handle_command_for_test (Agent.create cfg_for_reset)
+         (j {|{"type":"execute_command","command":"/messagecmd"}|})
+     in
+     let custom_types =
+       out
+       |> List.filter_map (fun event ->
+              match rpc_field event "type", rpc_field event "customType" with
+              | Some (`String "custom_message"), Some (`String custom_type) -> Some custom_type
+              | _ -> None)
+     in
+     let notice_rendered =
+       out
+       |> List.find_map (fun event ->
+              match rpc_field event "type", rpc_field event "customType", rpc_field event "rendered" with
+              | Some (`String "custom_message"), Some (`String "notice"), Some (`String rendered) -> Some rendered
+              | _ -> None)
+       |> Option.value ~default:""
+     in
+     rpc_success out "execute_command"
+     && List.mem "notice" custom_types
+     && contains0 notice_rendered "NOTICE message body"
+     && List.mem "user" custom_types
+     && List.mem "api-note" custom_types
+     && List.mem "state-note" custom_types);
+  check "TypeScript extension tool ctx.ui fallback returns defaults"
+    ((not node_available)
+     ||
+     match Tools.find "ui_tool" with
+     | Some t ->
+       let output = t.Tools.execute (`Assoc []) in
+       contains0 output "tool notice" && contains0 output "tool false:anon:two"
+     | None -> false);
+  check "TypeScript extension registerProvider appears in provider status"
+    ((not node_available) || List.mem_assoc "localai" (Llm.provider_status ()));
+  check "TypeScript extension registerProvider adds models"
+    ((not node_available)
+     ||
+     Models.context_window "local-large" = Some 4242
+     && List.exists
+          (fun (e : Models.entry) -> e.provider = "localai" && e.id = "local-small")
+          (Models.list ~pat:"localai" ()));
+  Unix.putenv "LOCALAI_API_KEY" "local-key";
+  check "TypeScript extension registerProvider configures LLM provider"
+    ((not node_available)
+     ||
+     let cfg = Llm.config_for "local" in
+     cfg.Llm.provider = Llm.Openai && cfg.base_url = "https://local.invalid/v1"
+     && cfg.api_key = "local-key" && cfg.model = "local-large"
+     && List.mem "X-Local: 1" cfg.extra_headers);
+  Unix.putenv "LOCALAI_API_KEY" "";
+  check "TypeScript extension registerProvider runtime executes without API key"
+    ((not node_available)
+     ||
+     let cfg = Llm.config_for "runtime" in
+     let streamed = Buffer.create 32 in
+     let blocks, usage =
+       Llm.complete cfg ~system:"sys" ~tools_enabled:false
+         ~on_text:(fun text -> Buffer.add_string streamed text)
+         [ { Llm.role = Llm.User; content = [ Llm.Text "hi" ] } ]
+     in
+     cfg.Llm.runtime <> None && cfg.api_key = "" && usage.Llm.input_tokens = 12
+     && usage.Llm.output_tokens = 3
+     &&
+     match blocks with
+     | [ Llm.Text text ] -> text = "runtime runtime-small:sys:1:false" && Buffer.contents streamed = text
+     | _ -> false);
+  check "TypeScript extension registerFlag/getFlag uses default values"
+    ((not node_available)
+     ||
+     match Extensions.execute_command "/flagshow" with
+     | Some output -> output = "calm:false"
+     | None -> false);
+  Unix.putenv "PI_FLAG_VOICE" "loud";
+  Unix.putenv "PI_FLAG_DRY_RUN" "true";
+  check "TypeScript extension getFlag reads Pi env overrides"
+    ((not node_available)
+     ||
+     match Extensions.execute_command "/flagshow" with
+     | Some output -> output = "loud:true"
+     | None -> false);
+  Unix.putenv "PI_FLAG_VOICE" "";
+  Unix.putenv "PI_FLAG_DRY_RUN" "";
+  check "TypeScript extension registerShortcut exposes handler output"
+    ((not node_available)
+     ||
+     match Extensions.execute_shortcut "ctrl+g" with
+     | Some (Extensions.Shortcut_output output) -> output = "shortcut calm"
+     | _ -> false);
+  check "TypeScript extension registerShortcut exposes command action"
+    ((not node_available)
+     ||
+     match Extensions.execute_shortcut "C-h" with
+     | Some (Extensions.Shortcut_command command) -> command = "/tshello Shortcut"
+     | _ -> false);
+  check "TypeScript extension shortcut ctx.ui fallback returns defaults"
+    ((not node_available)
+     ||
+     match Extensions.execute_shortcut "C-u" with
+     | Some (Extensions.Shortcut_output output) -> contains0 output "shortcut notice" && contains0 output "fallback"
+     | _ -> false);
+  check "TypeScript extension shortcut exposes structured UI requests"
+    ((not node_available)
+     ||
+     match Extensions.execute_shortcut_response "C-u" with
+     | Some (Extensions.Shortcut_response_output response) ->
+       let ui : Extensions.ui_capture = response.ui in
+       let kinds =
+         ui.requests
+         |> List.filter_map (fun request ->
+                match Yojson.Safe.Util.member "kind" request with
+                | `String kind -> Some kind
+                | _ -> None)
+       in
+       contains0 response.text "fallback" && List.mem "notify" kinds && List.mem "input" kinds
+     | _ -> false);
+  check "hotkeys include extension shortcuts"
+    ((not node_available) || (contains0 (Commands.hotkeys ()) "ctrl+g" && contains0 (Commands.hotkeys ()) "Show voice shortcut"));
+  check "TypeScript extension registerMessageRenderer transforms assistant display text"
+    ((not node_available)
+     ||
+     Extensions.render_text ~kind:"message" ~role:"assistant" "hello" = "[message:assistant] hello");
+  check "TypeScript extension registerMessageRenderer transforms tool display text"
+    ((not node_available)
+     ||
+     Extensions.render_text ~kind:"tool_result" ~role:"tool" ~tool_name:"bash" "done" = "[tool_result:bash] done");
+  check "TypeScript extension rich renderer object falls back to text"
+    ((not node_available)
+     ||
+     let output = Extensions.render_text ~kind:"rich_component" ~role:"assistant" "hello" in
+     contains0 output "Rich" && contains0 output "hello" && contains0 output "tail");
+  check "TypeScript extension rich renderer exposes structured components"
+    ((not node_available)
+     ||
+     let response = Extensions.render_response ~kind:"rich_component" ~role:"assistant" "hello" in
+     response.components <> []
+     && contains0 response.rendered "+--"
+     && contains0 response.rendered "Rich"
+     && contains0 response.rendered "tail");
+  check "TypeScript extension session_start can register tool"
+    ((not node_available)
+     ||
+     match Tools.find "session_dynamic" with
+     | Some t -> contains0 (t.Tools.execute (`Assoc [])) "session startup"
+     | None -> false);
+  check "TypeScript extension session_start can register command"
+    ((not node_available)
+     ||
+     List.mem_assoc "/sessioncmd" (Complete.menu "/sessionc")
+     &&
+     match Extensions.execute_command "/sessioncmd" with
+     | Some output -> contains0 output "session command startup"
+     | None -> false);
+  let lifecycle_ok, message_replace_ok, user_message_preserved_ok, turn_message_tool_ok, before_context_ok =
+    if not node_available then (true, true, true, true, true)
+    else begin
+      let before_agent = Extensions.emit_before_agent_start ~prompt:"ask" ~system_prompt:"system base" in
+      let context_messages =
+        Extensions.emit_context [ { Llm.role = Llm.User; content = [ Llm.Text "context base" ] } ]
+      in
+      Extensions.emit_agent_start ();
+      Extensions.emit_turn_start ~turn_index:3;
+      Extensions.emit_message_start { Llm.role = Llm.User; content = [ Llm.Text "plain user" ] };
+      Extensions.emit_message_update ~delta:"delta" { Llm.role = Llm.Assistant; content = [ Llm.Text "delta" ] };
+      let user_message =
+        Extensions.emit_message_end { Llm.role = Llm.User; content = [ Llm.Text "plain user" ] }
+      in
+      let assistant_message =
+        Extensions.emit_message_end { Llm.role = Llm.Assistant; content = [ Llm.Text "raw assistant" ] }
+      in
+      Extensions.emit_tool_execution_start ~tool_call_id:"tool-1" ~tool_name:"ts_greet"
+        ~input:(`Assoc [ ("name", `String "Pi") ]);
+      Extensions.emit_tool_execution_update ~tool_call_id:"tool-1" ~tool_name:"ts_greet"
+        ~input:(`Assoc [ ("name", `String "Pi") ])
+        (`Assoc [ ("content", `List [ `Assoc [ ("type", `String "text"); ("text", `String "partial") ] ]) ]);
+      Extensions.emit_tool_execution_end ~tool_call_id:"tool-1" ~tool_name:"ts_greet" ~result:"done" ~is_error:false;
+      Extensions.emit_turn_end ~turn_index:3 ~message:assistant_message
+        ~tool_results:[ Llm.Tool_result { id = "tool-1"; content = "done" } ];
+      Extensions.emit_agent_end ~messages:[ user_message; assistant_message ];
+      let log = Tools.read_file_contents "lifecycle.log" in
+      let lifecycle_ok = contains0 log "agent_start" && contains0 log "agent_end 2" in
+      let message_replace_ok =
+        match assistant_message with
+        | { Llm.content = [ Llm.Text text ]; _ } -> text = "rewritten assistant"
+        | _ -> false
+      in
+      let user_message_preserved_ok =
+        match user_message with
+        | { Llm.content = [ Llm.Text text ]; _ } -> text = "plain user"
+        | _ -> false
+      in
+      let turn_message_tool_ok =
+        contains0 log "turn_start 3" && contains0 log "turn_end 3 1"
+        && contains0 log "message_start user" && contains0 log "message_update delta"
+        && contains0 log "tool_start ts_greet" && contains0 log "tool_update ts_greet"
+        && contains0 log "tool_end ts_greet false"
+      in
+      let before_context_ok =
+        contains0 log "before_agent_start ask" && contains0 log "context 1"
+        && before_agent.Extensions.system_prompt = Some "system base\nBEFORE:ask"
+        && (match before_agent.Extensions.injected_messages with
+            | [ { Llm.content = [ Llm.Text text ]; _ } ] -> text = "injected ask"
+            | _ -> false)
+        && List.length context_messages = 2
+        &&
+        match List.rev context_messages with
+        | { Llm.content = [ Llm.Text "context extra" ]; _ } :: _ -> true
+        | _ -> false
+      in
+      (lifecycle_ok, message_replace_ok, user_message_preserved_ok, turn_message_tool_ok, before_context_ok)
+    end
+  in
+  check "TypeScript extension agent_start/agent_end fire" lifecycle_ok;
+  check "TypeScript extension message_end can replace assistant" message_replace_ok;
+  check "TypeScript extension message_end preserves unchanged user" user_message_preserved_ok;
+  check "TypeScript extension turn/message/tool lifecycle events fire" turn_message_tool_ok;
+  check "TypeScript extension before_agent_start/context can mutate prompt context" before_context_ok;
+  check "TypeScript extension model/thinking selection events fire"
+    ((not node_available)
+     ||
+     let event_agent = Agent.create cfg_for_reset in
+     Agent.set_config event_agent { cfg_for_reset with Llm.model = "event-model"; thinking = "high" };
+     Agent.set_thinking event_agent "low";
+     let log = Tools.read_file_contents "lifecycle.log" in
+     contains0 log "thinking_level_select off high"
+     && contains0 log "model_select set test-model event-model"
+     && contains0 log "thinking_level_select high low");
+  let session_events_ok, switch_cancel_ok, fork_cancel_ok, compact_cancel_ok, command_new_ok =
+    if not node_available then (true, true, true, true, true)
+    else begin
+      let switch_ok =
+        match Extensions.emit_session_before_switch ~reason:"manual" ~target_session_file:"next.jsonl" () with
+        | Extensions.Session_continue -> true
+        | Extensions.Session_cancel _ -> false
+      in
+      let switch_cancel =
+        match Extensions.emit_session_before_switch ~reason:"blocked" () with
+        | Extensions.Session_cancel reason -> contains0 reason "no switch"
+        | Extensions.Session_continue -> false
+      in
+      let fork_cancel =
+        match Extensions.emit_session_before_fork ~reason:"fork" ~entry_id:"blocked-fork" () with
+        | Extensions.Session_cancel reason -> contains0 reason "no fork"
+        | Extensions.Session_continue -> false
+      in
+      let compact_cancel =
+        match Extensions.emit_session_before_compact ~turn_count:99 () with
+        | Extensions.Session_cancel reason -> contains0 reason "no compact"
+        | Extensions.Session_continue -> false
+      in
+      ignore (Extensions.emit_session_start ~reason:"manual" ~session_file:"manual.jsonl" ~session_id:"manual-id" ());
+      Extensions.emit_session_shutdown ~reason:"manual" ~session_file:"manual.jsonl" ~session_id:"manual-id" ();
+      Extensions.emit_session_compact ~session_file:"manual.jsonl" ~session_id:"manual-id" ~before_turn_count:12
+        ~after_turn_count:7 ();
+      let command_session = Session.create_new ~name:"command-new" () in
+      let command_agent = Agent.create ~session:command_session cfg_for_reset in
+      let command_msg = Commands.new_session command_agent in
+      let command_new =
+        contains0 command_msg "Started new session"
+        &&
+        match Agent.session command_agent with
+        | Some session -> session.Session.path <> command_session.Session.path
+        | None -> false
+      in
+      Option.iter Session.close (Agent.session command_agent);
+      let log = Tools.read_file_contents "lifecycle.log" in
+      let session_events =
+        switch_ok && contains0 log "session_before_switch manual next.jsonl"
+        && contains0 log "session_before_fork fork blocked-fork"
+        && contains0 log "session_before_compact 99" && contains0 log "session_start manual manual-id"
+        && contains0 log "session_shutdown manual manual-id" && contains0 log "session_compact 12 7"
+        && contains0 log "session_before_switch new" && contains0 log "session_shutdown new"
+        && contains0 log "session_start new"
+      in
+      (session_events, switch_cancel, fork_cancel, compact_cancel, command_new)
+    end
+  in
+  check "TypeScript extension session lifecycle events fire" session_events_ok;
+  check "TypeScript extension session_before_switch can cancel" switch_cancel_ok;
+  check "TypeScript extension session_before_fork can cancel" fork_cancel_ok;
+  check "TypeScript extension session_before_compact can cancel" compact_cancel_ok;
+  check "slash new starts a new persisted session" command_new_ok;
+  check "rpc Pi navigateTree uses default branch summarizer when hook omits summary"
+    ((not node_available)
+     ||
+     let _ =
+       run "write_file"
+         {|{"path":".pi/extensions/session-hooks.ts","content":"const fs = require(\"node:fs\");\nexport default function(pi) {\n  pi.on(\"session_before_tree\", async (event) => {\n    const prep = event.preparation || {};\n    fs.appendFileSync(\"lifecycle.log\", `session_before_tree_default ${prep.targetId || \"\"} ${prep.userWantsSummary} ${prep.customInstructions || \"\"} ${prep.replaceInstructions}\\n`);\n    return { label: \"default-summary-label\", customInstructions: \"Hook focus\", replaceInstructions: false };\n  });\n  pi.on(\"session_tree\", async (event) => {\n    fs.appendFileSync(\"lifecycle.log\", `session_tree_default ${event.newLeafId || \"\"} ${event.summaryEntry ? event.summaryEntry.type : \"\"} ${event.fromExtension}\\n`);\n  });\n}\n"}|}
+     in
+     Tools.write_file_contents "runtime-request.log" "";
+     let turns =
+       [ { Llm.role = Llm.User; content = [ Llm.Text "one" ] };
+         { Llm.role = Llm.Assistant; content = [ Llm.Text "two" ] } ]
+     in
+     let session = Session.create_new ~name:"nav-default-summary" () in
+     List.iter (Session.append session) turns;
+     let agent = Agent.create ~session ~initial_turns:turns (Llm.config_for "runtime") in
+     let results =
+       Commands.apply_extension_session_actions agent
+         [ j
+             {|{"kind":"navigate_tree","targetId":"turn-0","options":{"summarize":true,"label":"default-summary","customInstructions":"Original focus","replaceInstructions":true}}|} ]
+     in
+     let summary_entry =
+       session.Session.entries
+       |> List.find_map (function
+              | `Assoc fields when List.assoc_opt "type" fields = Some (`String "branch_summary") -> Some fields
+              | _ -> None)
+     in
+     let summary_id =
+       match summary_entry with
+       | Some fields -> (
+         match List.assoc_opt "id" fields with
+         | Some (`String id) -> Some id
+         | _ -> None)
+       | None -> None
+     in
+     let has_summary =
+       match summary_entry with
+       | Some fields ->
+         List.assoc_opt "parentId" fields = Some `Null
+         && List.assoc_opt "fromId" fields = Some (`String "root")
+         && List.assoc_opt "fromHook" fields = Some (`Bool false)
+         &&
+         (match List.assoc_opt "summary" fields with
+          | Some (`String summary) -> contains0 summary "runtime runtime-small:"
+          | _ -> false)
+       | None -> false
+     in
+     let has_label =
+       match summary_id with
+       | Some id ->
+         List.exists
+           (function
+             | `Assoc fields ->
+               List.assoc_opt "type" fields = Some (`String "label")
+               && List.assoc_opt "targetId" fields = Some (`String id)
+               && List.assoc_opt "label" fields = Some (`String "default-summary-label")
+             | _ -> false)
+           session.Session.entries
+       | None -> false
+     in
+     let log = Tools.read_file_contents "runtime-request.log" in
+     let lifecycle = Tools.read_file_contents "lifecycle.log" in
+     let result_ok =
+       match results with
+       | [ `Assoc fields ] ->
+         List.assoc_opt "kind" fields = Some (`String "navigate_tree")
+         && List.assoc_opt "cancelled" fields = Some (`Bool false)
+       | _ -> false
+     in
+     let ok =
+       result_ok && has_summary && has_label && Agent.turn_count agent = 0
+       && contains0 log "Hook focus" && not (contains0 log "Original focus")
+       && contains0 lifecycle "session_tree_default"
+       && contains0 lifecycle "branch_summary false"
+     in
+     Option.iter Session.close (Agent.session agent);
+     ok);
+  check "TypeScript extension tool_call mutates input"
+    ((not node_available)
+     ||
+     match Extensions.emit_tool_call ~tool_call_id:"call-1" ~tool_name:"ts_greet" (`Assoc [ ("name", `String "Pi") ]) with
+     | Extensions.Tool_continue (`Assoc fields) -> List.assoc_opt "name" fields = Some (`String "Pi!")
+     | _ -> false);
+  check "TypeScript extension tool_call can block"
+    ((not node_available)
+     ||
+     match Extensions.emit_tool_call ~tool_call_id:"call-2" ~tool_name:"bash" (`Assoc [ ("command", `String "blocked") ]) with
+     | Extensions.Tool_block reason -> contains0 reason "blocked by ts"
+     | _ -> false);
+  check "TypeScript extension tool_result can replace text"
+    ((not node_available)
+     ||
+     contains0
+       (Extensions.emit_tool_result ~tool_call_id:"call-3" ~tool_name:"ts_greet"
+          ~input:(`Assoc [ ("name", `String "Pi") ]) "Hello Pi")
+       "hooked");
+  check "TypeScript extension input event transforms text"
+    ((not node_available)
+     ||
+     match Extensions.emit_input "brief: explain pi" with
+     | Extensions.Input_continue text -> text = "Respond briefly: explain pi"
+     | Extensions.Input_handled -> false);
+  check "TypeScript extension input event can handle text"
+    ((not node_available)
+     ||
+     match Extensions.emit_input "handled" with
+     | Extensions.Input_handled -> true
+     | Extensions.Input_continue _ -> false);
+  let user_bash_replace_ok, user_bash_context_ok, user_bash_hidden_ok =
+    if not node_available then (true, true, true)
+    else
+      let user_bash_agent = Agent.create cfg_for_reset in
+      let intercepted = Agent.run_user_bash user_bash_agent "virtual" in
+      let replace_ok = contains0 intercepted "(exit 7)" && contains0 intercepted "virtual false" in
+      let context_ok = Agent.turn_count user_bash_agent = 1 in
+      let before_hidden = Agent.turn_count user_bash_agent in
+      let hidden = Agent.run_user_bash ~exclude_from_context:true user_bash_agent "virtual" in
+      let hidden_ok =
+        contains0 hidden "(exit 7)" && contains0 hidden "virtual true" && Agent.turn_count user_bash_agent = before_hidden
+      in
+      (replace_ok, context_ok, hidden_ok)
+  in
+  check "TypeScript extension user_bash can replace result" user_bash_replace_ok;
+  check "TypeScript extension user_bash records replacement context" user_bash_context_ok;
+  check "TypeScript extension user_bash honors excludeFromContext" user_bash_hidden_ok;
+  check "TypeScript extension user_bash can provide BashOperations"
+    ((not node_available)
+     ||
+     let ops_agent = Agent.create cfg_for_reset in
+     let result = Agent.run_user_bash ops_agent "ops" in
+     contains0 result "(exit 9)" && contains0 result "ops ops");
+  check "TypeScript extension createLocalBashOperations is exported"
+    ((not node_available)
+     ||
+     let ops_agent = Agent.create cfg_for_reset in
+     let result = Agent.run_user_bash ops_agent "localops" in
+     contains0 result "(exit 0)" && contains0 result "wrapped" && contains0 result "localops");
+  check "TypeScript extension createLocalFileOperations is exported"
+    ((not node_available)
+     ||
+     let ops_agent = Agent.create cfg_for_reset in
+     let result = Agent.run_user_bash ops_agent "fileops" in
+     contains0 result "(exit 0)" && contains0 result "fileops");
 
   (* --- autocomplete --- *)
   check "complete common_prefix" (Complete.common_prefix [ "abc"; "abd"; "abx" ] = "ab");
@@ -327,6 +3184,9 @@ let () =
   check "complete token last word" (Complete.token_of "read foo" = (5, "foo"));
   check "complete slash command" (List.mem "/model" (Complete.candidates "/mo"));
   check "complete slash multi" (List.mem "/session" (Complete.candidates "/se") && List.mem "/sessions" (Complete.candidates "/se"));
+  check "complete import command" (List.mem "/import" (Complete.candidates "/im"));
+  check "complete new builtin commands"
+    (List.mem "/scoped-models" (Complete.candidates "/sc") && List.mem "/hotkeys" (Complete.candidates "/ho"));
   check "complete path token" (List.mem "src/foo.ml" (Complete.candidates "read src/f"));
   check "menu matches slash prefix" (List.mem_assoc "/session" (Complete.menu "/se") && List.mem_assoc "/sessions" (Complete.menu "/se"));
   check "menu empty for non-slash" (Complete.menu "hello" = []);
@@ -361,6 +3221,46 @@ let () =
   let dls = Tui.wrap_segs 3 [ (Notty.A.empty, "abcdef") ] in
   check "wrap_segs splits to width" (List.length dls = 2);
   check "wrap_segs preserves text" (String.concat "" (List.map seg_text dls) = "abcdef");
+  let surface_state = Tui.create_extension_surface_state () in
+  Tui.apply_extension_surfaces surface_state
+    [ j {|{"kind":"status","key":"sync","text":"ready"}|};
+      j {|{"kind":"widget","key":"above","lines":["above widget"],"options":{"placement":"aboveEditor"}}|};
+      j {|{"kind":"widget","key":"below","lines":["below widget"],"options":{"placement":"belowEditor"}}|};
+      j {|{"kind":"header","lines":["native header"]}|};
+      j {|{"kind":"footer","lines":["native footer"]}|};
+      j {|{"kind":"editor_component","lines":["native editor"]}|} ];
+  let top, bottom, editor = Tui.extension_surface_lines surface_state in
+  check "extension surfaces render native TUI bands"
+    (List.mem "native header" top && List.mem "above widget" top && List.mem "below widget" bottom
+     && List.mem "native footer" bottom && editor = [ "native editor" ]);
+  Tui.apply_extension_surfaces surface_state
+    [ j {|{"kind":"widget","key":"above","action":"clear"}|};
+      j {|{"kind":"footer","action":"clear"}|} ];
+  let top, bottom, _ = Tui.extension_surface_lines surface_state in
+  check "extension surfaces clear widgets and fall back to statuses"
+    ((not (List.mem "above widget" top)) && List.mem "sync: ready" bottom);
+  let working_state = Tui.create_extension_surface_state () in
+  Tui.apply_extension_surfaces working_state
+    [ j {|{"kind":"working_message","message":"custom work"}|};
+      j {|{"kind":"working_indicator","options":{"frames":["A","B"],"intervalMs":1000}}|} ];
+  check "extension working state customizes active status"
+    (Tui.extension_working_status ~now:1.0 working_state ~spin:0 ~turn_start:0.0 = Some "B custom work 1s");
+  Tui.apply_extension_surfaces working_state [ j {|{"kind":"working_visible","visible":false}|} ];
+  check "extension working visible hides active status"
+    (Tui.extension_working_status ~now:2.0 working_state ~spin:0 ~turn_start:0.0 = None);
+  Tui.apply_extension_surfaces working_state
+    [ j {|{"kind":"working_visible","visible":true}|};
+      j {|{"kind":"working_indicator","options":{"frames":[]}}|};
+      j {|{"kind":"hidden_thinking_label","label":"condensed"}|} ];
+  check "extension working indicator can hide frame"
+    (Tui.extension_working_status ~now:2.0 working_state ~spin:0 ~turn_start:0.0 = Some "custom work 2s"
+     && working_state.Tui.hidden_thinking_label = Some "condensed");
+  Tui.apply_extension_surfaces working_state
+    [ j {|{"kind":"working_message","message":null}|}; j {|{"kind":"working_indicator","options":null}|};
+      j {|{"kind":"hidden_thinking_label","label":null}|} ];
+  check "extension working state resets to defaults"
+    (working_state.Tui.working_message = None && working_state.Tui.working_indicator = None
+     && working_state.Tui.hidden_thinking_label = None);
   check "input_window keeps cursor visible" (Tui.input_window ~height:10 ~menu_rows:0 ~cursor_row:20 ~total_rows:30 = (14, 7));
   check "input_window leaves body room" (snd (Tui.input_window ~height:4 ~menu_rows:0 ~cursor_row:3 ~total_rows:10) = 1);
 

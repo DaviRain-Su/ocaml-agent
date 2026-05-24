@@ -8,7 +8,7 @@ type t =
     body : string;
     location : string }
 
-let prompt_dirs = [ ".ocaml-agent/prompts"; ".pi/prompts" ]
+let prompt_dirs () = Config_paths.uniq [ Config_paths.user_prompts_dir (); ".ocaml-agent/prompts"; ".pi/prompts" ]
 
 let read_file path =
   let ic = open_in_bin path in
@@ -75,6 +75,8 @@ let extra_paths () =
   | None -> []
   | Some s -> s |> String.split_on_char '\n' |> List.map String.trim |> List.filter (fun p -> p <> "")
 
+let settings_paths () = Settings.string_list "prompts"
+
 let disabled () =
   match getenv_nonempty "AGENT_NO_PROMPT_TEMPLATES" with
   | Some ("1" | "true" | "yes" | "y") -> true
@@ -82,7 +84,12 @@ let disabled () =
 
 let discover () =
   if disabled () then List.concat_map templates_from_path (extra_paths ())
-  else List.concat_map templates_from_dir prompt_dirs @ List.concat_map templates_from_path (extra_paths ())
+  else
+    List.concat_map templates_from_dir (prompt_dirs ())
+    @ List.concat_map templates_from_path (Packages.paths Packages.Prompt)
+    @ List.concat_map templates_from_path (settings_paths ())
+    @ List.concat_map templates_from_path (Extensions.prompt_paths ())
+    @ List.concat_map templates_from_path (extra_paths ())
 
 let menu () =
   discover ()

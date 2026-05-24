@@ -16,6 +16,7 @@ exception Api_error of string
 
 type content =
   | Text of string
+  | Image of { mime_type : string; data : string } (* base64 encoded inline image *)
   | Thinking of { text : string; signature : string } (* Anthropic extended thinking *)
   | Tool_use of { id : string; name : string; input : Yojson.Safe.t }
   | Tool_result of { id : string; content : string }
@@ -41,6 +42,7 @@ type config =
     model : string;
     max_tokens : int;
     extra_headers : string list;
+    runtime : string option;
     thinking : string (* "off" | "low" | "medium" | "high" *) }
 
 let getenv k =
@@ -62,12 +64,13 @@ type known =
     base_url : string;
     env_keys : string list;
     default_model : string;
-    headers : string list (* extra request headers, e.g. a required User-Agent *) }
+    headers : string list; (* extra request headers, e.g. a required User-Agent *)
+    runtime : string option }
 
-let mk ?(headers = []) names protocol base_url env_keys default_model =
-  { names; protocol; base_url; env_keys; default_model; headers }
+let mk ?(headers = []) ?runtime names protocol base_url env_keys default_model =
+  { names; protocol; base_url; env_keys; default_model; headers; runtime }
 
-let registry : known list =
+let builtin_registry : known list =
   [ mk [ "anthropic"; "claude" ] Anthropic "https://api.anthropic.com" [ "ANTHROPIC_API_KEY" ]
       "claude-opus-4-7";
     mk [ "deepseek" ] Openai "https://api.deepseek.com" [ "DEEPSEEK_API_KEY" ] "deepseek-v4-pro";
@@ -92,17 +95,73 @@ let registry : known list =
     mk [ "gemini"; "google" ] Openai "https://generativelanguage.googleapis.com/v1beta/openai"
       [ "GEMINI_API_KEY"; "GOOGLE_API_KEY" ] "gemini-2.0-flash" ]
 
+let extension_registry : known list ref = ref []
+
+type runtime_complete =
+  config ->
+  system:string ->
+  on_text:(string -> unit) ->
+  tools_enabled:bool ->
+  ?tool_names:string list ->
+  turn list ->
+  content list * usage
+
+let extension_runtimes : (string, runtime_complete) Hashtbl.t = Hashtbl.create 8
+
+let provider_request_hook : (Yojson.Safe.t -> Yojson.Safe.t) ref = ref (fun payload -> payload)
+
+let provider_response_hook : (status:int -> headers:(string * string) list -> unit) ref =
+  ref (fun ~status:_ ~headers:_ -> ())
+
+let set_provider_request_hook hook = provider_request_hook := hook
+let set_provider_response_hook hook = provider_response_hook := hook
+let apply_provider_request_hooks payload = !provider_request_hook payload
+let emit_provider_response_hooks ~status ~headers = !provider_response_hook ~status ~headers
+
+let registry () = !extension_registry @ builtin_registry
+
+let normalize_name name = String.lowercase_ascii (String.trim name)
+
+let uniq xs =
+  List.fold_left (fun acc x -> if x = "" || List.mem x acc then acc else acc @ [ x ]) [] xs
+
+let register_provider ?(aliases = []) ?(headers = []) ?runtime ~name ~protocol ~base_url ~env_keys
+    ~default_model () =
+  let names = uniq (List.map normalize_name (name :: aliases)) in
+  if names <> [] && String.trim base_url <> "" && String.trim default_model <> "" then begin
+    let provider = { names; protocol; base_url; env_keys = uniq env_keys; default_model; headers; runtime } in
+    extension_registry :=
+      provider
+      :: List.filter
+           (fun existing -> not (List.exists (fun name -> List.mem name existing.names) names))
+           !extension_registry
+  end
+
+let register_provider_runtime runtime handler =
+  Hashtbl.replace extension_runtimes runtime handler
+
+let clear_extension_providers () =
+  extension_registry := [];
+  Hashtbl.clear extension_runtimes
+
 let find_known name =
   let n = String.lowercase_ascii name in
-  List.find_opt (fun k -> List.mem n k.names) registry
+  List.find_opt (fun k -> List.mem n k.names) (registry ())
 
-let all_env_keys = List.concat_map (fun k -> k.env_keys) registry
+let is_known_provider name = find_known name <> None
+
+let all_env_keys () = List.concat_map (fun k -> k.env_keys) (registry ())
 
 let read_max_tokens () =
   match getenv "AGENT_MAX_TOKENS" with Some s -> ( try int_of_string s with _ -> 4096) | None -> 4096
 
 let read_thinking () =
-  match getenv "AGENT_THINKING" with
+  let configured =
+    match getenv "AGENT_THINKING" with
+    | Some s -> Some s
+    | None -> Config_paths.settings_string [ "defaultThinkingLevel" ]
+  in
+  match configured with
   | Some s -> (
     match String.lowercase_ascii (String.trim s) with
     | ("off" | "none" | "") -> "off"
@@ -114,7 +173,12 @@ let read_thinking () =
 
 (* Canonical provider names paired with whether their key env var is set. *)
 let provider_status () =
-  List.map (fun k -> (List.hd k.names, first_env k.env_keys <> None)) registry
+  List.filter_map
+    (fun k ->
+      match k.names with
+      | name :: _ -> Some (name, k.runtime <> None || first_env k.env_keys <> None)
+      | [] -> None)
+    (registry ())
 
 (* Build a config for an explicitly named provider (used by /model switching).
    Uses the registry's own base URL / default model, reads the key from the
@@ -133,6 +197,7 @@ let config_for ?model alias : config =
       | None -> (
         match getenv "AGENT_API_KEY" with
         | Some x -> x
+        | None when k.runtime <> None -> ""
         | None ->
           raise
             (Config_error
@@ -145,13 +210,19 @@ let config_for ?model alias : config =
       model;
       max_tokens = read_max_tokens ();
       extra_headers = k.headers;
+      runtime = k.runtime;
       thinking = read_thinking () }
 
 let config () : config =
   let max_tokens = read_max_tokens () in
   (* Resolve the chosen provider entry (or a generic fallback). *)
   let chosen : [ `Known of known | `Generic of provider ] =
-    match getenv "AGENT_PROVIDER" with
+    let configured_provider =
+      match getenv "AGENT_PROVIDER" with
+      | Some p -> Some p
+      | None -> Config_paths.settings_string [ "defaultProvider" ]
+    in
+    match configured_provider with
     | Some p -> (
       match find_known p with
       | Some k -> `Known k
@@ -161,16 +232,16 @@ let config () : config =
         `Generic proto)
     | None -> (
       (* Auto-detect: first registry entry whose key env var is present. *)
-      match List.find_opt (fun k -> first_env k.env_keys <> None) registry with
+      match List.find_opt (fun k -> first_env k.env_keys <> None) (registry ()) with
       | Some k -> `Known k
       | None -> if getenv "AGENT_API_KEY" <> None then `Generic Openai else `Generic Anthropic)
   in
-  let provider, default_base, key_envs, default_model, extra_headers =
+  let provider, default_base, key_envs, default_model, extra_headers, runtime =
     match chosen with
-    | `Known k -> (k.protocol, k.base_url, k.env_keys, Some k.default_model, k.headers)
+    | `Known k -> (k.protocol, k.base_url, k.env_keys, Some k.default_model, k.headers, k.runtime)
     | `Generic Anthropic ->
-      (Anthropic, "https://api.anthropic.com", [ "ANTHROPIC_API_KEY" ], Some "claude-opus-4-7", [])
-    | `Generic Openai -> (Openai, "https://api.openai.com/v1", [ "OPENAI_API_KEY" ], None, [])
+      (Anthropic, "https://api.anthropic.com", [ "ANTHROPIC_API_KEY" ], Some "claude-opus-4-7", [], None)
+    | `Generic Openai -> (Openai, "https://api.openai.com/v1", [ "OPENAI_API_KEY" ], None, [], None)
   in
   let base_url = getenv_or "AGENT_BASE_URL" default_base in
   let api_key =
@@ -179,22 +250,26 @@ let config () : config =
     | None -> (
       match first_env key_envs with
       | Some k -> k
+      | None when runtime <> None -> ""
       | None ->
         raise
           (Config_error
              (Printf.sprintf
                 "no API key found. Set one of these env vars and re-run:\n  %s\nor set AGENT_API_KEY (with AGENT_PROVIDER / AGENT_BASE_URL for a custom endpoint)."
-                (String.concat ", " all_env_keys))))
+                (String.concat ", " (all_env_keys ())))))
   in
   let model =
     match getenv "AGENT_MODEL" with
     | Some m -> m
     | None -> (
-      match default_model with
+      match Config_paths.settings_string [ "defaultModel" ] with
       | Some m -> m
-      | None -> raise (Config_error "AGENT_MODEL must be set for a generic openai endpoint"))
+      | None -> (
+        match default_model with
+        | Some m -> m
+        | None -> raise (Config_error "AGENT_MODEL must be set for a generic openai endpoint")))
   in
-  { provider; base_url; api_key; model; max_tokens; extra_headers; thinking = read_thinking () }
+  { provider; base_url; api_key; model; max_tokens; extra_headers; runtime; thinking = read_thinking () }
 
 let describe cfg =
   let p = match cfg.provider with Anthropic -> "anthropic" | Openai -> "openai" in
@@ -211,6 +286,8 @@ let sse_data line =
 
 let content_to_json = function
   | Text s -> `Assoc [ ("type", `String "text"); ("text", `String s) ]
+  | Image { mime_type; data } ->
+    `Assoc [ ("type", `String "image"); ("mime_type", `String mime_type); ("data", `String data) ]
   | Thinking { text; signature } ->
     `Assoc [ ("type", `String "thinking"); ("text", `String text); ("signature", `String signature) ]
   | Tool_use { id; name; input } ->
@@ -223,6 +300,13 @@ let content_of_json j =
   try
     match j |> member "type" |> to_string with
     | "text" -> Text (j |> member "text" |> to_string)
+    | "image" ->
+      let mime_type =
+        match j |> member "mime_type" with
+        | `String s -> s
+        | _ -> j |> member "mimeType" |> to_string
+      in
+      Image { mime_type; data = j |> member "data" |> to_string }
     | "thinking" ->
       Thinking { text = j |> member "text" |> to_string; signature = j |> member "signature" |> to_string }
     | "tool_use" ->
@@ -253,6 +337,14 @@ let thinking_budget = function "low" -> 2048 | "medium" -> 8192 | "high" -> 1638
 
 let anthropic_block = function
   | Text s -> `Assoc [ ("type", `String "text"); ("text", `String s) ]
+  | Image { mime_type; data } ->
+    `Assoc
+      [ ("type", `String "image");
+        ( "source",
+          `Assoc
+            [ ("type", `String "base64");
+              ("media_type", `String mime_type);
+              ("data", `String data) ] ) ]
   | Thinking { text; signature } ->
     `Assoc [ ("type", `String "thinking"); ("thinking", `String text); ("signature", `String signature) ]
   | Tool_use { id; name; input } ->
@@ -285,20 +377,21 @@ let anthropic_complete cfg ~system ~on_text ~tools_enabled ?tool_names turns : c
   (* Extended thinking requires max_tokens strictly greater than the budget. *)
   let max_tokens = if budget > 0 && cfg.max_tokens <= budget then budget + 4096 else cfg.max_tokens in
   let tool_schemas = if tools_enabled then Tools.anthropic_schemas ?allowed:tool_names () else [] in
-  let body =
-    `Assoc
-      ([ ("model", `String cfg.model);
+	  let body =
+	    `Assoc
+	      ([ ("model", `String cfg.model);
          ("max_tokens", `Int max_tokens);
          ("system", `String system);
          ("stream", `Bool true);
          ("messages", `List (anthropic_messages turns)) ]
       @ (if tool_schemas = [] then [] else [ ("tools", `List tool_schemas) ])
       @
-      if budget > 0 then
-        [ ("thinking", `Assoc [ ("type", `String "enabled"); ("budget_tokens", `Int budget) ]) ]
-      else [])
-  in
-  let url = cfg.base_url ^ "/v1/messages" in
+	      if budget > 0 then
+	        [ ("thinking", `Assoc [ ("type", `String "enabled"); ("budget_tokens", `Int budget) ]) ]
+	      else [])
+	  in
+	  let body = apply_provider_request_hooks body in
+	  let url = cfg.base_url ^ "/v1/messages" in
   let headers =
     [ "content-type: application/json";
       "x-api-key: " ^ cfg.api_key;
@@ -369,17 +462,18 @@ let anthropic_complete cfg ~system ~on_text ~tools_enabled ?tool_names turns : c
           | _ -> ())
         | "content_block_stop" -> finalize (j |> member "index" |> to_int)
         | _ -> ())
-    with _ -> ()
+    with Api_error _ as e -> raise e | _ -> ()
   in
-  (try
-     Http.post_stream ~url ~headers body ~on_line:(fun line ->
-         match sse_data line with
-         | Some data when data <> "[DONE]" -> handle data
-         | Some _ -> ()
-         | None -> if String.trim line <> "" then Buffer.add_string err (line ^ "\n"))
-   with Http.Http_error e ->
-     let msg = if Buffer.length err > 0 then e ^ "\n" ^ Buffer.contents err else e in
-     raise (Api_error msg));
+	  (try
+	     Http.post_stream ~url ~headers body ~on_line:(fun line ->
+	         match sse_data line with
+	         | Some data when data <> "[DONE]" -> handle data
+	         | Some _ -> ()
+	         | None -> if String.trim line <> "" then Buffer.add_string err (line ^ "\n"));
+	     emit_provider_response_hooks ~status:200 ~headers:[]
+	   with Http.Http_error e ->
+	     let msg = if Buffer.length err > 0 then e ^ "\n" ^ Buffer.contents err else e in
+	     raise (Api_error msg));
   if !blocks = [] && Buffer.length err > 0 then raise (Api_error (Buffer.contents err));
   (List.rev !blocks, { input_tokens = !in_tok; output_tokens = !out_tok })
 
@@ -390,18 +484,37 @@ let openai_messages ~system turns =
   let of_turn t =
     match t.role with
     | User ->
-      List.map
-        (fun c ->
-          match c with
-          | Text s -> `Assoc [ ("role", `String "user"); ("content", `String s) ]
-          | Tool_result { id; content } ->
-            `Assoc
-              [ ("role", `String "tool");
-                ("tool_call_id", `String id);
-                ("content", `String content) ]
-          | Thinking _ | Tool_use _ -> `Null (* not represented in OpenAI user turns *))
+      let user_blocks =
         t.content
-      |> List.filter (fun j -> j <> `Null)
+        |> List.filter_map (function
+             | Text s -> Some (`Assoc [ ("type", `String "text"); ("text", `String s) ])
+             | Image { mime_type; data } ->
+               Some
+                 (`Assoc
+                    [ ("type", `String "image_url");
+                      ( "image_url",
+                        `Assoc [ ("url", `String ("data:" ^ mime_type ^ ";base64," ^ data)) ] ) ])
+             | Thinking _ | Tool_use _ | Tool_result _ -> None)
+      in
+      let user_messages =
+        match user_blocks with
+        | [] -> []
+        | [ `Assoc [ ("type", `String "text"); ("text", `String s) ] ] ->
+          [ `Assoc [ ("role", `String "user"); ("content", `String s) ] ]
+        | blocks -> [ `Assoc [ ("role", `String "user"); ("content", `List blocks) ] ]
+      in
+      let tool_messages =
+        t.content
+        |> List.filter_map (function
+             | Tool_result { id; content } ->
+               Some
+                 (`Assoc
+                    [ ("role", `String "tool");
+                      ("tool_call_id", `String id);
+                      ("content", `String content) ])
+             | _ -> None)
+      in
+      user_messages @ tool_messages
     | Assistant ->
       let text =
         t.content
@@ -431,20 +544,21 @@ let openai_messages ~system turns =
 
 let openai_complete cfg ~system ~on_text ~tools_enabled ?tool_names turns : content list * usage =
   let tool_schemas = if tools_enabled then Tools.openai_schemas ?allowed:tool_names () else [] in
-  let body =
-    `Assoc
-      ([ ("model", `String cfg.model);
+	  let body =
+	    `Assoc
+	      ([ ("model", `String cfg.model);
          ("max_tokens", `Int cfg.max_tokens);
          ("stream", `Bool true);
          ("stream_options", `Assoc [ ("include_usage", `Bool true) ]);
          ("messages", `List (openai_messages ~system turns)) ]
       @ (if cfg.thinking <> "off" then [ ("reasoning_effort", `String cfg.thinking) ] else [])
       @
-      if tool_schemas <> [] then
-        [ ("tools", `List tool_schemas); ("tool_choice", `String "auto") ]
-      else [])
-  in
-  let url = cfg.base_url ^ "/chat/completions" in
+	      if tool_schemas <> [] then
+	        [ ("tools", `List tool_schemas); ("tool_choice", `String "auto") ]
+	      else [])
+	  in
+	  let body = apply_provider_request_hooks body in
+	  let url = cfg.base_url ^ "/chat/completions" in
   let headers =
     [ "content-type: application/json"; "Authorization: Bearer " ^ cfg.api_key ] @ cfg.extra_headers
   in
@@ -498,17 +612,18 @@ let openai_complete cfg ~system ~on_text ~tools_enabled ?tool_names turns : cont
                      | _ -> ()))
           | [] -> ())
         | _ -> raise (Api_error data))
-    with _ -> ()
+    with Api_error _ as e -> raise e | _ -> ()
   in
-  (try
-     Http.post_stream ~url ~headers body ~on_line:(fun line ->
-         match sse_data line with
-         | Some data when data <> "[DONE]" -> handle data
-         | Some _ -> ()
-         | None -> if String.trim line <> "" then Buffer.add_string err (line ^ "\n"))
-   with Http.Http_error e ->
-     let msg = if Buffer.length err > 0 then e ^ "\n" ^ Buffer.contents err else e in
-     raise (Api_error msg));
+	  (try
+	     Http.post_stream ~url ~headers body ~on_line:(fun line ->
+	         match sse_data line with
+	         | Some data when data <> "[DONE]" -> handle data
+	         | Some _ -> ()
+	         | None -> if String.trim line <> "" then Buffer.add_string err (line ^ "\n"));
+	     emit_provider_response_hooks ~status:200 ~headers:[]
+	   with Http.Http_error e ->
+	     let msg = if Buffer.length err > 0 then e ^ "\n" ^ Buffer.contents err else e in
+	     raise (Api_error msg));
   let text_blocks =
     if Buffer.length text > 0 then [ Text (Buffer.contents text) ] else []
   in
@@ -530,7 +645,14 @@ let openai_complete cfg ~system ~on_text ~tools_enabled ?tool_names turns : cont
 
 (* --- dispatch --- *)
 
-let complete cfg ~system ?(on_text = fun _ -> ()) ?(tools_enabled = true) ?tool_names turns : content list * usage =
-  match cfg.provider with
+let complete (cfg : config) ~system ?(on_text = fun _ -> ()) ?(tools_enabled = true) ?tool_names turns :
+    content list * usage =
+  match cfg.runtime with
+  | Some runtime -> (
+    match Hashtbl.find_opt extension_runtimes runtime with
+    | Some complete -> complete cfg ~system ~on_text ~tools_enabled ?tool_names turns
+    | None -> raise (Api_error ("extension provider runtime is not registered: " ^ runtime)))
+  | None -> (
+    match cfg.provider with
   | Anthropic -> anthropic_complete cfg ~system ~on_text ~tools_enabled ?tool_names turns
-  | Openai -> openai_complete cfg ~system ~on_text ~tools_enabled ?tool_names turns
+  | Openai -> openai_complete cfg ~system ~on_text ~tools_enabled ?tool_names turns)

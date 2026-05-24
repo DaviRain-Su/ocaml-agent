@@ -5,8 +5,9 @@
 
 type t = { name : string; description : string; location : string }
 
-(* Directories searched for "*.md" skills, relative to the cwd. *)
-let skill_dirs = [ ".ocaml-agent/skills"; ".claude/skills" ]
+(* Directories searched for "*.md" skills, relative to the cwd plus the Pi-style
+   user agent directory. *)
+let skill_dirs () = Config_paths.uniq [ Config_paths.user_skills_dir (); ".ocaml-agent/skills"; ".pi/skills"; ".claude/skills" ]
 
 (* Also check for Veldt scaffold in the project root *)
 let veldt_scaffold_marker = "scaffold/veldt"
@@ -18,6 +19,8 @@ let extra_paths () =
   match getenv_nonempty "AGENT_SKILL_PATHS" with
   | None -> []
   | Some s -> s |> String.split_on_char '\n' |> List.map String.trim |> List.filter (fun p -> p <> "")
+
+let settings_paths () = Settings.string_list "skills"
 
 let disabled () =
   match getenv_nonempty "AGENT_NO_SKILLS" with
@@ -64,10 +67,27 @@ let parse_skill path : t option =
 
 let discover_dir dir =
   if (try Sys.is_directory dir with _ -> false) then
-    Sys.readdir dir |> Array.to_list
-    |> List.filter (fun f -> Filename.check_suffix f ".md")
-    |> List.sort compare
-    |> List.filter_map (fun f -> parse_skill (Filename.concat dir f))
+    let rec go root =
+      let entries = try Sys.readdir root |> Array.to_list |> List.sort compare with _ -> [] in
+      let markdown =
+        entries
+        |> List.filter (fun f -> Filename.check_suffix f ".md")
+        |> List.filter_map (fun f -> parse_skill (Filename.concat root f))
+      in
+      let nested =
+        entries
+        |> List.concat_map (fun e ->
+               let path = Filename.concat root e in
+               if (try Sys.is_directory path with _ -> false) then
+                 let skill_file = Filename.concat path "SKILL.md" in
+                 if Sys.file_exists skill_file then
+                   match parse_skill skill_file with Some s -> [ s ] | None -> []
+                 else go path
+               else [])
+      in
+      markdown @ nested
+    in
+    go dir
   else []
 
 let discover_path path =
@@ -77,7 +97,12 @@ let discover_path path =
 
 let discover () : t list =
   if disabled () then List.concat_map discover_path (extra_paths ())
-  else List.concat_map discover_dir skill_dirs @ List.concat_map discover_path (extra_paths ())
+  else
+    List.concat_map discover_dir (skill_dirs ())
+    @ List.concat_map discover_path (Packages.paths Packages.Skill)
+    @ List.concat_map discover_path (settings_paths ())
+    @ List.concat_map discover_path (Extensions.skill_paths ())
+    @ List.concat_map discover_path (extra_paths ())
 
 (* Render the skill inventory for the system prompt. Returns "" if none. *)
 let format = function

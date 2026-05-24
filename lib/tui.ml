@@ -7,6 +7,22 @@
 open Notty
 open Notty_unix
 
+type working_indicator =
+  { frames : string list;
+    interval_ms : int }
+
+type extension_surface_state =
+  { mutable statuses : (string * string) list;
+    mutable widgets_above : (string * string list) list;
+    mutable widgets_below : (string * string list) list;
+    mutable header : string list;
+    mutable footer : string list;
+    mutable editor_component : string list;
+    mutable working_message : string option;
+    mutable working_visible : bool;
+    mutable working_indicator : working_indicator option;
+    mutable hidden_thinking_label : string option }
+
 type ui =
   { term : Term.t;
     mutable lines : (A.t * string) list list; (* scrollback (oldest first); each line is a list of styled segments *)
@@ -25,12 +41,64 @@ type ui =
     mutable asst_in_code : bool; (* inside a ``` fence while streaming assistant text *)
     mutable menu_sel : int; (* selected row in the live slash-command menu *)
     mutable pasting : bool; (* inside a bracketed-paste sequence *)
+    mutable tools_expanded : bool;
+    extension_surfaces : extension_surface_state;
     mtx : Mutex.t }
+
+let create_extension_surface_state () =
+  { statuses = [];
+    widgets_above = [];
+    widgets_below = [];
+    header = [];
+    footer = [];
+    editor_component = [];
+    working_message = None;
+    working_visible = true;
+    working_indicator = None;
+    hidden_thinking_label = None }
 
 let menu_max = 8
 
 let max_lines = 5000
 let spinner = [| "\xe2\xa0\x8b"; "\xe2\xa0\x99"; "\xe2\xa0\xb9"; "\xe2\xa0\xb8"; "\xe2\xa0\xbc"; "\xe2\xa0\xb4"; "\xe2\xa0\xa6"; "\xe2\xa0\xa7"; "\xe2\xa0\x87"; "\xe2\xa0\x8f" |]
+let default_working_message = "thinking\xe2\x80\xa6"
+
+let tfg token = Themes.fg token
+let tbg token = Themes.bg token
+let selected_attr () = A.(fg black ++ tbg "selectedBg")
+
+let extension_theme_json (theme : Themes.t) =
+  `Assoc
+    [ ("name", `String theme.name);
+      ("path", (if theme.location = "<builtin>" then `Null else `String theme.location));
+      ("location", `String theme.location) ]
+
+let extension_theme_context () =
+  (List.map extension_theme_json (Themes.discover ()), (Themes.current_theme ()).Themes.name)
+
+let extension_model_json (cfg : Llm.config) =
+  let provider = match cfg.provider with Llm.Anthropic -> "anthropic" | Llm.Openai -> "openai" in
+  `Assoc
+    [ ("id", `String cfg.model);
+      ("name", `String cfg.model);
+      ("provider", `String provider);
+      ("api", `String provider);
+      ("baseUrl", `String cfg.base_url);
+      ("reasoning", `Bool (cfg.thinking <> "off"));
+      ("contextWindow", `Int (Option.value (Models.context_window cfg.model) ~default:0));
+      ("maxTokens", `Int cfg.max_tokens) ]
+
+let extension_context_usage agent =
+  let used, window, frac = Agent.usage_info agent in
+  `Assoc
+    [ ("tokens", `Int used);
+      ("contextWindow", `Int window);
+      ("percent", `Float (frac *. 100.)) ]
+
+let extension_session_context agent =
+  match Agent.session agent with
+  | Some session -> Extensions.session_context_json ~entries:session.Session.entries ~info:(Session.info_of session) (Agent.turns agent)
+  | None -> Extensions.session_context_json (Agent.turns agent)
 
 (* --- UTF-8 cursor helpers --- *)
 let is_cont c = Char.code c land 0xC0 = 0x80
@@ -59,7 +127,7 @@ let style_inline base s =
   let active () =
     let a = base in
     let a = if !bold then A.(a ++ st bold) else a in
-    if !code then A.(a ++ fg cyan) else a
+    if !code then A.(a ++ tfg "mdCode") else a
   in
   let flush () = if Buffer.length buf > 0 then (segs := (active (), Buffer.contents buf) :: !segs; Buffer.clear buf) in
   let n = String.length s and i = ref 0 in
@@ -111,6 +179,49 @@ let prompt_label = "you> "
 
 let sublist start len l = l |> List.filteri (fun i _ -> i >= start && i < start + len)
 
+let assoc_set key value entries =
+  (key, value) :: List.filter (fun (existing, _) -> existing <> key) entries
+
+let assoc_remove key entries = List.filter (fun (existing, _) -> existing <> key) entries
+
+let extension_surface_lines state =
+  let widget_lines widgets =
+    widgets
+    |> List.rev
+    |> List.concat_map (fun (_, lines) -> lines)
+  in
+  let status_lines =
+    state.statuses
+    |> List.rev
+    |> List.map (fun (key, text) -> if key = "" then text else key ^ ": " ^ text)
+  in
+  let top = state.header @ widget_lines state.widgets_above in
+  let bottom =
+    widget_lines state.widgets_below
+    @ (if state.footer = [] then status_lines else state.footer)
+  in
+  let editor = state.editor_component in
+  (top, bottom, editor)
+
+let extension_working_status ?now state ~spin ~turn_start =
+  if not state.working_visible then None
+  else
+    let now = Option.value now ~default:(Unix.gettimeofday ()) in
+    let message = Option.value state.working_message ~default:default_working_message in
+    let frame =
+      match state.working_indicator with
+      | None -> spinner.(spin mod Array.length spinner)
+      | Some { frames = []; _ } -> ""
+      | Some { frames; interval_ms } ->
+        let len = List.length frames in
+        let interval = max 1 interval_ms in
+        let elapsed_ms = int_of_float (max 0. ((now -. turn_start) *. 1000.)) in
+        List.nth frames ((elapsed_ms / interval) mod len)
+    in
+    let elapsed = max 0. (now -. turn_start) in
+    let prefix = if frame = "" then "" else frame ^ " " in
+    Some (Printf.sprintf "%s%s %.0fs" prefix message elapsed)
+
 let cursor_row_col input cursor =
   let row = ref 0 and col = ref 0 in
   String.iteri
@@ -149,8 +260,18 @@ let redraw ui =
       let in_lines = String.split_on_char '\n' ui.input in
       let in_rows = List.length in_lines in
       let cursor_row, cursor_col = cursor_row_col ui.input ui.cursor in
-      let input_start, input_rows = input_window ~height:h ~menu_rows ~cursor_row ~total_rows:in_rows in
-      let visible = max 1 (h - 2 - menu_rows - input_rows) in
+      let ext_top_lines, ext_bottom_lines, editor_lines = extension_surface_lines ui.extension_surfaces in
+      let ext_top_lines = List.map safe_line ext_top_lines in
+      let ext_bottom_lines = List.map safe_line ext_bottom_lines in
+      let editor_lines = List.map safe_line editor_lines in
+      let ext_top_rows = List.length ext_top_lines in
+      let ext_bottom_rows = List.length ext_bottom_lines in
+      let editor_rows = List.length editor_lines in
+      let input_start, input_rows =
+        input_window ~height:(max 4 (h - ext_top_rows - ext_bottom_rows - editor_rows)) ~menu_rows ~cursor_row
+          ~total_rows:in_rows
+      in
+      let visible = max 1 (h - 2 - menu_rows - input_rows - ext_top_rows - ext_bottom_rows - editor_rows) in
       let all = List.concat_map (wrap_segs w) ui.lines in
       let total = List.length all in
       (* maxscroll: how many lines we can scroll up from the bottom.
@@ -172,6 +293,14 @@ let redraw ui =
         else
           I.vsnap ~align:`Bottom visible (I.vcat (List.map line_img window))
       in
+      let extension_band attr lines =
+        match lines with
+        | [] -> I.void 0 0
+        | lines -> I.vcat (List.map (fun line -> I.string attr line) lines)
+      in
+      let ext_top_img = extension_band (tfg "muted") ext_top_lines in
+      let ext_bottom_img = extension_band (tfg "muted") ext_bottom_lines in
+      let editor_img = extension_band (tfg "accent") editor_lines in
       let menu_img =
         if menu_rows = 0 then I.void 0 0
         else
@@ -180,28 +309,30 @@ let redraw ui =
             (List.mapi
                (fun i (c, help) ->
                  let selected = i = ui.menu_sel in
-                 let mark = if selected then A.(fg black ++ bg cyan) else A.(fg green) in
-                 I.(string mark (Printf.sprintf " %-12s " c) <|> string A.(fg (gray 9)) (" " ^ help)))
+                 let mark = if selected then selected_attr () else tfg "accent" in
+                 I.(string mark (Printf.sprintf " %-12s " c) <|> string (tfg "muted") (" " ^ help)))
                shown)
       in
       let status =
         if ui.turn_active then
-          I.string A.(fg yellow) (Printf.sprintf "%s thinking… %.0fs" spinner.(ui.spin mod Array.length spinner) (Unix.gettimeofday () -. ui.turn_start))
-        else if ui.scroll > 0 then I.string A.(fg (gray 8)) (Printf.sprintf "-- scrolled %d lines (End to return) --" ui.scroll)
+          match extension_working_status ui.extension_surfaces ~spin:ui.spin ~turn_start:ui.turn_start with
+          | Some line -> I.string (tfg "warning") line
+          | None -> I.void 1 1
+        else if ui.scroll > 0 then I.string (tfg "dim") (Printf.sprintf "-- scrolled %d lines (End to return) --" ui.scroll)
         else I.void 1 1
       in
-      let sep = I.char A.(fg (gray 6)) '_' w 1 in
+      let sep = I.char (tfg "borderMuted") '_' w 1 in
       let indent = String.make (String.length prompt_label) ' ' in
       let prompt =
         I.vcat
           (List.mapi
              (fun i l ->
                let absolute = input_start + i in
-               let pfx = if absolute = 0 then I.string A.(fg green) prompt_label else I.string A.empty indent in
+               let pfx = if absolute = 0 then I.string (tfg "accent") prompt_label else I.string A.empty indent in
                I.(pfx <|> string A.empty (safe_line l)))
              (sublist input_start input_rows in_lines))
       in
-      Term.image ui.term I.(body <-> status <-> menu_img <-> sep <-> prompt);
+      Term.image ui.term I.(ext_top_img <-> body <-> ext_bottom_img <-> status <-> menu_img <-> sep <-> editor_img <-> prompt);
       let cursor_y = h - input_rows + (cursor_row - input_start) in
       let cursor_x = min (w - 1) (String.length prompt_label + cursor_col) in
       Term.cursor ui.term (Some (cursor_x, cursor_y))
@@ -213,9 +344,9 @@ let redraw ui =
 let asst_segs ui line =
   let t = String.trim line in
   let fence = String.length t >= 3 && String.sub t 0 3 = "```" in
-  if fence then (ui.asst_in_code <- not ui.asst_in_code; [ (A.(fg (gray 8)), line) ])
-  else if ui.asst_in_code then [ (A.(fg cyan), line) ]
-  else if String.length t > 0 && t.[0] = '#' then [ (A.(st bold), line) ]
+  if fence then (ui.asst_in_code <- not ui.asst_in_code; [ (tfg "dim", line) ])
+  else if ui.asst_in_code then [ (tfg "mdCodeBlock", line) ]
+  else if String.length t > 0 && t.[0] = '#' then [ (A.(tfg "mdHeading" ++ st bold), line) ]
   else style_inline A.empty line
 
 (* --- frontend callbacks --- *)
@@ -243,7 +374,7 @@ let push_result ui res =
   |> List.iter (fun line ->
          let a =
            if line = "" then A.empty
-           else match line.[0] with '-' -> A.(fg red) | '+' -> A.(fg green) | _ -> A.(fg (gray 12))
+           else match line.[0] with '-' -> tfg "toolDiffRemoved" | '+' -> tfg "toolDiffAdded" | _ -> tfg "toolDiffContext"
          in
          push ui a line);
   redraw ui
@@ -267,16 +398,16 @@ let rec confirm ui cmd =
 let make_frontend ui : Agent.frontend =
   { text_delta = (fun s -> feed_assistant ui s);
     text_done = (fun () -> flush_assistant ui);
-    thinking = (fun s -> if String.trim s <> "" then (push ui A.(fg (gray 10)) ("\xf0\x9f\x92\xad " ^ s); redraw ui));
-    tool_call = (fun name prev -> push ui A.(fg cyan) ("\xe2\x9a\x99 " ^ name ^ " " ^ prev); redraw ui);
+    thinking = (fun s -> if String.trim s <> "" then (push ui (tfg "thinkingText") ("\xf0\x9f\x92\xad " ^ s); redraw ui));
+    tool_call = (fun name prev -> push ui (tfg "toolTitle") ("\xe2\x9a\x99 " ^ name ^ " " ^ prev); redraw ui);
     tool_result = (fun res -> if String.trim res <> "" then push_result ui res);
-    notice = (fun s -> push ui A.(fg yellow) s; redraw ui);
+    notice = (fun s -> push ui (tfg "warning") s; redraw ui);
     message_end = (fun _ _ _ _ -> ());
     tool_result_end = (fun _ -> ());
     confirm_bash =
       (fun cmd ->
-        push ui A.(fg yellow) ("\xe2\x9a\xa0 run command: " ^ cmd);
-        push ui A.(fg (gray 12)) "approve? [y]es / [N]o / [a]lways";
+        push ui (tfg "warning") ("\xe2\x9a\xa0 run command: " ^ cmd);
+        push ui (tfg "muted") "approve? [y]es / [N]o / [a]lways";
         redraw ui;
         confirm ui cmd) }
 
@@ -295,15 +426,15 @@ let select ui ~title (items : string list) : int option =
           ~finally:(fun () -> Mutex.unlock ui.mtx)
           (fun () ->
             let w, h = Term.size ui.term in
-            let header = I.string A.(fg green ++ st bold) title in
+            let header = I.string A.(tfg "accent" ++ st bold) title in
             let rows =
               List.mapi
                 (fun i it ->
-                  let a = if i = !sel then A.(fg black ++ bg cyan) else A.empty in
+                  let a = if i = !sel then selected_attr () else A.empty in
                   I.string a (Printf.sprintf " %s %s " (if i = !sel then ">" else " ") it))
                 items
             in
-            let hint = I.string A.(fg (gray 8)) "↑/↓ select · Enter confirm · Esc cancel" in
+            let hint = I.string (tfg "dim") "↑/↓ select · Enter confirm · Esc cancel" in
             let img = I.vsnap ~align:`Top (max 4 h) (I.vcat ((header :: rows) @ [ I.void 1 1; hint ])) in
             Term.image ui.term (I.hsnap ~align:`Left (max 1 w) img);
             Term.cursor ui.term None)
@@ -329,7 +460,7 @@ let select ui ~title (items : string list) : int option =
 let model_picker ui =
   let avail = List.filter_map (fun (n, has) -> if has then Some n else None) (Llm.provider_status ()) in
   let entries =
-    let all = Models.list () in
+    let all = Models.scoped_from_env () in
     let filtered = List.filter (fun (e : Models.entry) -> List.mem e.Models.provider avail) all in
     if filtered = [] then all else filtered
   in
@@ -339,8 +470,24 @@ let model_picker ui =
   | Some i ->
     let e = List.nth entries i in
     (match Llm.config_for ~model:e.Models.id e.Models.provider with
-     | c -> Agent.set_config ui.agent c; push ui A.(fg green) ("Switched: " ^ Llm.describe c)
-     | exception Llm.Config_error m -> push ui A.(fg red) ("Error: " ^ m));
+     | c -> Agent.set_config ui.agent c; push ui (tfg "success") ("Switched: " ^ Llm.describe c)
+     | exception Llm.Config_error m -> push ui (tfg "error") ("Error: " ^ m));
+    redraw ui
+
+let theme_picker ui =
+  let themes = Themes.discover () in
+  let labels =
+    List.map
+      (fun (t : Themes.t) ->
+        if t.location = "<builtin>" then t.name else Printf.sprintf "%s  (%s)" t.name t.location)
+      themes
+  in
+  match select ui ~title:"Select a theme" labels with
+  | None -> ()
+  | Some i ->
+    let t = List.nth themes i in
+    ignore (Themes.set_active_name ~persist:true t.Themes.name);
+    push ui (tfg "success") ("Theme: " ^ t.name);
     redraw ui
 
 (* Interactive settings modal: pick a row to toggle/cycle it; Esc closes. *)
@@ -350,6 +497,7 @@ let rec settings ui =
     [ Printf.sprintf "auto-approve cmd  : %b" (Agent.auto_approve a);
       Printf.sprintf "auto-compact      : %b" (Agent.auto_compact a);
       Printf.sprintf "thinking level    : %s" (Agent.config a).Llm.thinking;
+      Printf.sprintf "theme             : %s" (Themes.current_theme ()).Themes.name;
       "close" ]
   in
   match select ui ~title:"Settings (Enter toggles)" items with
@@ -359,7 +507,199 @@ let rec settings ui =
     let next = match (Agent.config a).Llm.thinking with "off" -> "low" | "low" -> "medium" | "medium" -> "high" | _ -> "off" in
     Agent.set_thinking a next;
     settings ui
+  | Some 3 -> theme_picker ui; settings ui
   | _ -> redraw ui
+
+let json_string field json =
+  match Yojson.Safe.Util.member field json with
+  | `String s when String.trim s <> "" -> Some s
+  | `Bool b -> Some (string_of_bool b)
+  | `Int n -> Some (string_of_int n)
+  | _ -> None
+
+let json_default json =
+  List.find_map (fun field -> json_string field json) [ "defaultValue"; "default"; "value" ]
+
+let select_labels json =
+  match Yojson.Safe.Util.member "options" json with
+  | `List options ->
+    options
+    |> List.filter_map (fun option ->
+           match json_string "label" option with
+           | Some label -> Some label
+	           | None -> json_string "value" option)
+  | _ -> []
+
+let json_lines field json =
+  match Yojson.Safe.Util.member field json with
+  | `List xs -> List.filter_map (function `String s -> Some s | _ -> None) xs
+  | _ -> []
+
+let json_bool field json =
+  match Yojson.Safe.Util.member field json with
+  | `Bool value -> Some value
+  | _ -> None
+
+let json_int field json =
+  match Yojson.Safe.Util.member field json with
+  | `Int value -> Some value
+  | _ -> None
+
+let json_action json = Option.value (json_string "action" json) ~default:"set"
+
+let json_is_null field json =
+  match Yojson.Safe.Util.member field json with
+  | `Null -> true
+  | _ -> false
+
+let apply_extension_surface state surface =
+  match json_string "kind" surface with
+  | Some "status" ->
+    let key = Option.value (json_string "key" surface) ~default:"" in
+    if json_action surface = "clear" || json_is_null "text" surface then
+      state.statuses <- assoc_remove key state.statuses
+    else
+      let text = Option.value (json_string "text" surface) ~default:"" in
+      state.statuses <- assoc_set key text state.statuses
+  | Some "widget" ->
+    let key = Option.value (json_string "key" surface) ~default:"" in
+    state.widgets_above <- assoc_remove key state.widgets_above;
+    state.widgets_below <- assoc_remove key state.widgets_below;
+    if json_action surface <> "clear" then begin
+      let lines = json_lines "lines" surface in
+      let options = Yojson.Safe.Util.member "options" surface in
+      let placement = Option.value (json_string "placement" options) ~default:"aboveEditor" in
+      if placement = "belowEditor" then state.widgets_below <- assoc_set key lines state.widgets_below
+      else state.widgets_above <- assoc_set key lines state.widgets_above
+    end
+  | Some "header" ->
+    state.header <- if json_action surface = "clear" then [] else json_lines "lines" surface
+  | Some "footer" ->
+    state.footer <- if json_action surface = "clear" then [] else json_lines "lines" surface
+  | Some "editor_component" ->
+    state.editor_component <- if json_action surface = "clear" then [] else json_lines "lines" surface
+  | Some "working_message" ->
+    state.working_message <-
+      if json_action surface = "clear" || json_is_null "message" surface then None
+      else Some (Option.value (json_string "message" surface) ~default:"")
+  | Some "working_visible" ->
+    state.working_visible <- Option.value (json_bool "visible" surface) ~default:true
+  | Some "working_indicator" ->
+    let options = Yojson.Safe.Util.member "options" surface in
+    state.working_indicator <-
+      (match options with
+       | `Null -> None
+       | _ ->
+         Some
+           { frames = json_lines "frames" options;
+             interval_ms = Option.value (json_int "intervalMs" options) ~default:100 })
+  | Some "hidden_thinking_label" ->
+    state.hidden_thinking_label <-
+      if json_action surface = "clear" || json_is_null "label" surface then None
+      else Some (Option.value (json_string "label" surface) ~default:"")
+  | _ -> ()
+
+let apply_extension_surfaces state surfaces =
+  List.iter (apply_extension_surface state) surfaces
+
+let json_plain_text json =
+  match json with
+  | `String s -> s
+  | `List xs ->
+    xs
+    |> List.filter_map (fun item ->
+           match json_string "text" item with
+           | Some text -> Some text
+           | None -> json_string "markdown" item)
+    |> String.concat "\n"
+  | _ -> ""
+
+let push_extension_ui_requests ui (capture : Extensions.ui_capture) =
+  apply_extension_surfaces ui.extension_surfaces capture.surfaces;
+  let show req =
+    match json_string "kind" req with
+    | Some "notify" | None -> ()
+    | Some kind ->
+      let message = Option.value (json_string "message" req) ~default:"" in
+      let suffix =
+        match kind with
+        | "confirm" -> " [default: false]"
+        | "input" -> (
+          match json_default (Yojson.Safe.Util.member "options" req) with
+          | Some value -> " [default: " ^ value ^ "]"
+          | None -> "")
+        | "select" -> (
+          match select_labels req with
+          | [] -> ""
+          | labels -> " [" ^ String.concat " / " labels ^ "]")
+        | _ -> ""
+      in
+      push ui (tfg "warning") ("extension ui " ^ kind ^ ": " ^ message ^ suffix)
+  in
+  let show_surface surface =
+    let show_lines () =
+      List.iter (fun line -> push ui (tfg "muted") ("  " ^ line)) (json_lines "lines" surface)
+    in
+    match json_string "kind" surface with
+    | None -> ()
+    | Some
+        ( "status" | "widget" | "header" | "footer" | "editor_component" | "working_message"
+        | "working_visible" | "working_indicator" | "hidden_thinking_label" ) ->
+      ()
+    | Some "title" ->
+      Option.iter (fun title -> push ui (tfg "muted") ("extension title: " ^ title)) (json_string "title" surface)
+    | Some ("custom" as kind) ->
+      push ui (tfg "muted") ("extension " ^ kind);
+      show_lines ()
+    | Some "editor_text" ->
+      Option.iter (fun text -> push ui (tfg "muted") ("extension editor text: " ^ text)) (json_string "text" surface)
+    | Some "paste" ->
+      Option.iter (fun text -> push ui (tfg "muted") ("extension paste: " ^ text)) (json_string "text" surface)
+    | Some kind ->
+      push ui (tfg "muted") ("extension ui surface " ^ kind)
+  in
+  List.iter show capture.requests;
+  List.iter show_surface capture.surfaces;
+  List.iter
+    (fun message ->
+      match Yojson.Safe.Util.member "display" message with
+      | `Bool false -> ()
+      | _ ->
+        let custom_type = Option.value (json_string "customType" message) ~default:"extension" in
+        let content =
+          match json_string "rendered" message with
+          | Some rendered when String.trim rendered <> "" -> rendered
+          | _ -> (
+            match json_lines "lines" message with
+            | [] -> json_plain_text (Yojson.Safe.Util.member "content" message)
+            | lines -> String.concat "\n" lines)
+        in
+        let text =
+          if String.trim content = "" then "extension custom message " ^ custom_type
+          else "extension custom message " ^ custom_type ^ ": " ^ content
+        in
+        push ui (tfg "muted") text)
+    capture.messages
+
+let apply_extension_runtime_actions ui (response : Extensions.command_response) =
+  if response.Extensions.reload_requested then begin
+    ignore (Extensions.load ~reason:"reload" ());
+    Agent.reload_system_prompt ui.agent;
+    push ui (tfg "muted") "Reloaded resources."
+  end;
+  List.iter (fun _ -> push ui (tfg "muted") (Agent.compact ui.agent)) response.Extensions.compact_requests;
+  Commands.apply_extension_session_actions ui.agent response.Extensions.session_actions
+  |> List.iter (fun result ->
+         (match Yojson.Safe.Util.member "editorText" result with
+          | `String text ->
+            ui.input <- text;
+            ui.cursor <- String.length text
+          | _ -> ());
+         match Yojson.Safe.Util.member "text" result with
+         | `String text when String.trim text <> "" -> push ui (tfg "muted") text
+         | _ -> ());
+  if response.Extensions.abort_requested then push ui (tfg "warning") "Extension requested abort.";
+  if response.Extensions.shutdown_requested then ui.running <- false
 
 (* --- slash commands (TUI-native) --- *)
 let rec cmd ui line =
@@ -369,18 +709,23 @@ let rec cmd ui line =
   | "/help" :: _ ->
     List.iter (push ui A.empty)
       [ "/model [alias] [name]  switch model (no args = picker)";
+        "/scoped-models [pats]  show/set model picker scope";
         "/think <level>         reasoning level (off/low/medium/high)";
         "/compact               summarize older turns";
         "/session               model, turns, context usage";
         "/sessions              list saved sessions";
         "/resume <n|id>         resume a saved session";
         "/name <text>           name the current session";
+        "/fork [id|path]        fork current or named session";
         "/clone                 duplicate the current session";
         "/export <file>         export (.html or .jsonl)";
+        "/import <file>         import and resume a JSONL session";
         "/copy                  copy last reply to clipboard";
+        "/changelog             show changelog entries";
+        "/hotkeys               show keyboard shortcuts";
         "/reload                reload context / skills / prompts / extensions";
-        "/settings              toggle auto-approve / compact / thinking";
-        "/new                   clear the conversation";
+        "/settings              toggle auto-approve / compact / thinking / theme";
+        "/new                   start a new session";
         "Tab / type /           live command completion menu";
         "Tab                    complete command / file path";
         "!cmd / !!cmd          run shell (with / without model context)";
@@ -396,36 +741,90 @@ let rec cmd ui line =
       (Printf.sprintf "%s | think:%s | %d turns | ctx ~%d/%d (%.0f%%)" (Llm.describe c) c.Llm.thinking
          (Agent.turn_count ui.agent) used window (pct *. 100.));
     redraw ui
-  | "/new" :: _ -> Agent.reset ui.agent; push ui A.(fg (gray 12)) "Conversation cleared."; redraw ui
-  | "/compact" :: _ -> push ui A.(fg (gray 12)) (Agent.compact ui.agent); redraw ui
+  | "/new" :: _ -> push ui (tfg "muted") (Commands.new_session ui.agent); redraw ui
+  | "/compact" :: _ -> push ui (tfg "muted") (Agent.compact ui.agent); redraw ui
   | "/sessions" :: _ -> List.iter (push ui A.empty) (String.split_on_char '\n' (Commands.format_sessions ())); redraw ui
-  | "/resume" :: a :: _ -> push ui A.(fg (gray 12)) (Commands.resume ui.agent a); redraw ui
-  | "/name" :: rest when rest <> [] -> push ui A.(fg (gray 12)) (Commands.name ui.agent (String.concat " " rest)); redraw ui
-  | "/clone" :: _ -> push ui A.(fg (gray 12)) (Commands.clone ui.agent); redraw ui
-  | "/export" :: p :: _ -> push ui A.(fg (gray 12)) (Commands.export ui.agent p); redraw ui
-  | "/copy" :: _ -> push ui A.(fg (gray 12)) (Commands.copy ui.agent); redraw ui
+  | "/resume" :: a :: _ -> push ui (tfg "muted") (Commands.resume ui.agent a); redraw ui
+  | "/name" :: rest when rest <> [] -> push ui (tfg "muted") (Commands.name ui.agent (String.concat " " rest)); redraw ui
+  | "/scoped-models" :: rest ->
+    let arg = match rest with [] -> None | xs -> Some (String.concat " " xs) in
+    push ui (tfg "muted") (Commands.scoped_models arg);
+    redraw ui
+  | "/fork" :: rest ->
+    let arg = match rest with [] -> None | x :: _ -> Some x in
+    push ui (tfg "muted") (Commands.fork ui.agent arg);
+    redraw ui
+  | "/clone" :: _ -> push ui (tfg "muted") (Commands.clone ui.agent); redraw ui
+  | "/export" :: p :: _ -> push ui (tfg "muted") (Commands.export ui.agent p); redraw ui
+  | "/import" :: p :: _ -> push ui (tfg "muted") (Commands.import_session ui.agent p); redraw ui
+  | "/copy" :: _ -> push ui (tfg "muted") (Commands.copy ui.agent); redraw ui
+  | "/changelog" :: _ -> List.iter (push ui A.empty) (String.split_on_char '\n' (Commands.changelog ())); redraw ui
+  | "/hotkeys" :: _ -> List.iter (push ui A.empty) (String.split_on_char '\n' (Commands.hotkeys ())); redraw ui
   | "/reload" :: _ ->
-    ignore (Extensions.load ());
+    ignore (Extensions.load ~reason:"reload" ());
+    ignore (Themes.active ());
     Agent.reload_system_prompt ui.agent;
-    push ui A.(fg (gray 12)) "Reloaded resources.";
+    push ui (tfg "muted") "Reloaded resources.";
     redraw ui
   | "/settings" :: _ -> settings ui
   | "/think" :: rest ->
     let lvl = match rest with l :: _ -> l | [] -> "off" in
     Agent.set_thinking ui.agent lvl;
-    push ui A.(fg (gray 12)) ("reasoning level = " ^ lvl);
+    push ui (tfg "muted") ("reasoning level = " ^ lvl);
     redraw ui
   | "/model" :: [] -> model_picker ui
-  | "/model" :: alias :: rest ->
-    let model = match rest with m :: _ -> Some m | [] -> None in
-    (match Llm.config_for ?model alias with
-     | c -> Agent.set_config ui.agent c; push ui A.(fg green) ("Switched: " ^ Llm.describe c)
-     | exception Llm.Config_error e -> push ui A.(fg red) ("Error: " ^ e));
+  | "/model" :: spec :: rest ->
+    let parsed =
+      match rest with
+      | model :: _ -> Model_spec.parse ~provider:spec (Some model)
+      | [] -> Model_spec.parse (Some spec)
+    in
+    (match parsed.Model_spec.provider with
+     | None -> push ui (tfg "error") ("Error: unknown provider in model spec " ^ spec)
+     | Some provider -> (
+       match Llm.config_for ?model:parsed.model provider with
+       | c ->
+         let c =
+           match parsed.thinking with
+           | Some t -> { c with Llm.thinking = Model_spec.normalize_thinking t }
+           | None -> c
+         in
+         Agent.set_config ui.agent c;
+         push ui (tfg "success") ("Switched: " ^ Llm.describe c)
+       | exception Llm.Config_error e -> push ui (tfg "error") ("Error: " ^ e)));
     redraw ui
   | c :: _ -> (
     match Prompts.expand_command line with
     | Some prompt -> run_turn ui prompt
-    | None -> push ui A.(fg red) ("Unknown command " ^ c ^ " (try /help)"); redraw ui)
+    | None -> (
+      let themes, theme_name = extension_theme_context () in
+      match
+        Extensions.execute_command_response ?session_name:(Agent.session_name ui.agent) ~themes ~theme_name
+          ~session_context:(extension_session_context ui.agent)
+          ~model:(extension_model_json (Agent.config ui.agent)) ~models:(Extensions.model_catalog_json ())
+          ~context_usage:(extension_context_usage ui.agent)
+          ~system_prompt:(Agent.system_prompt ui.agent) ~has_ui:true ~is_idle:(not ui.turn_active)
+          ~tools_expanded:ui.tools_expanded line
+      with
+      | Some response ->
+        Option.iter
+          (fun choice ->
+            match Agent.apply_extension_model ui.agent choice with
+            | Ok _ -> ()
+            | Error msg -> push ui (tfg "error") ("Extension setModel failed: " ^ msg))
+          response.Extensions.model_choice;
+        Option.iter (fun name -> ignore (Agent.set_session_name ui.agent name)) response.Extensions.session_name;
+        List.iter
+          (fun entry -> ignore (Agent.append_extension_session_entry ui.agent entry))
+          response.Extensions.session_entries;
+        Option.iter (fun name -> ignore (Themes.set_active_name ~persist:true name)) response.Extensions.theme_name;
+        Option.iter (fun expanded -> ui.tools_expanded <- expanded) response.Extensions.tools_expanded;
+        Option.iter (Agent.set_thinking ui.agent) response.Extensions.thinking_level;
+        apply_extension_runtime_actions ui response;
+        List.iter (push ui (tfg "muted")) (String.split_on_char '\n' response.Extensions.text);
+        push_extension_ui_requests ui response.Extensions.ui;
+        redraw ui
+      | None -> push ui (tfg "error") ("Unknown command " ^ c ^ " (try /help)"); redraw ui))
   | [] -> ()
 
 (* Run one turn with an animated spinner thread. *)
@@ -443,8 +842,8 @@ and run_turn ui line =
       ()
   in
   (try ignore (Agent.send ui.agent line) with
-   | Llm.Api_error m -> push ui A.(fg red) ("API error: " ^ m)
-   | e -> push ui A.(fg red) ("Error: " ^ Printexc.to_string e));
+   | Llm.Api_error m -> push ui (tfg "error") ("API error: " ^ m)
+   | e -> push ui (tfg "error") ("Error: " ^ Printexc.to_string e));
   ui.turn_active <- false;
   Thread.join spinner_thread;
   flush_assistant ui;
@@ -459,7 +858,7 @@ and run_bang ui line =
   let command = String.trim (String.sub line off (String.length line - off)) in
   if command = "" then false
   else begin
-    push ui A.(fg cyan) ("$ " ^ command ^ if exclude then " (no context)" else "");
+    push ui (tfg "bashMode") ("$ " ^ command ^ if exclude then " (no context)" else "");
     redraw ui;
     let result = Agent.run_user_bash ~exclude_from_context:exclude ui.agent command in
     push_result ui result;
@@ -477,7 +876,7 @@ let submit ui =
     (* echo the (possibly multi-line) input under the prompt *)
     let indent = String.make (String.length prompt_label) ' ' in
     List.iteri
-      (fun i l -> push ui A.(fg green) ((if i = 0 then prompt_label else indent) ^ l))
+      (fun i l -> push ui (tfg "accent") ((if i = 0 then prompt_label else indent) ^ l))
       (String.split_on_char '\n' line);
     redraw ui;
     if line.[0] = '!' && run_bang ui line then ()
@@ -515,13 +914,12 @@ let page ui delta =
 
 (* Tab completion of the current token (slash command or file path). *)
 let complete ui =
-  let start, _ = Complete.token_of ui.input in
-  match Complete.candidates ui.input with
-  | [] -> ()
-  | cands ->
+  match Complete.completion ui.input with
+  | _, [] -> ()
+  | start, cands ->
     let repl = match cands with [ one ] -> one | _ -> Complete.common_prefix cands in
     if repl <> "" then (ui.input <- String.sub ui.input 0 start ^ repl; ui.cursor <- String.length ui.input);
-    (match cands with _ :: _ :: _ -> push ui A.(fg (gray 10)) (String.concat "   " cands) | _ -> ());
+    (match cands with _ :: _ :: _ -> push ui (tfg "thinkingText") (String.concat "   " cands) | _ -> ());
     redraw ui
 
 let kill_to_start ui =
@@ -546,17 +944,19 @@ let run agent =
     | _ -> true
   in
   let term = Term.create ~mouse () in
+  ignore (Themes.active ());
   let ui =
     { term; lines = []; input = ""; cursor = 0; history = []; hist_idx = -1; buf = Buffer.create 256;
       agent; running = true; scroll = 0; turn_active = false; quiet = false; spin = 0; turn_start = 0.;
-      asst_in_code = false; menu_sel = 0; pasting = false; mtx = Mutex.create () }
+      asst_in_code = false; menu_sel = 0; pasting = false; tools_expanded = false;
+      extension_surfaces = create_extension_surface_state (); mtx = Mutex.create () }
   in
   Agent.set_frontend agent (make_frontend ui);
-  push ui A.(fg green ++ st bold) "OCaml Code Agent";
-  push ui A.(fg (gray 12)) (Llm.describe (Agent.config agent));
-  push ui A.(fg (gray 12)) "Type your request. /help for commands, Ctrl-P model picker, Ctrl-D to quit.";
-  push ui A.(fg (gray 12)) "PgUp/PgDn or mouse wheel to scroll; End to jump to latest.";
-  push ui A.(fg (gray 12)) "Set AGENT_TUI_MOUSE=0 if mouse wheel interferes with text selection.";
+  push ui A.(tfg "accent" ++ st bold) "OCaml Code Agent";
+  push ui (tfg "muted") (Llm.describe (Agent.config agent));
+  push ui (tfg "muted") "Type your request. /help for commands, Ctrl-P model picker, Ctrl-D to quit.";
+  push ui (tfg "muted") "PgUp/PgDn or mouse wheel to scroll; End to jump to latest.";
+  push ui (tfg "muted") "Set AGENT_TUI_MOUSE=0 if mouse wheel interferes with text selection.";
   push ui A.empty "";
   let km = Keymap.load () in
   redraw ui;
@@ -573,13 +973,51 @@ let run agent =
   (* A Ctrl-key or other ASCII press: a configured action, an editing key, or insert. *)
   let on_ascii c mods =
     let ctrl = List.mem `Ctrl mods in
+    let shortcut_spec = (if ctrl then "ctrl+" else "") ^ String.make 1 (Char.lowercase_ascii c) in
+    let handle_extension_shortcut () =
+      let themes, theme_name = extension_theme_context () in
+      match
+        Extensions.execute_shortcut_response ?session_name:(Agent.session_name ui.agent) ~themes ~theme_name
+          ~session_context:(extension_session_context ui.agent)
+          ~model:(extension_model_json (Agent.config ui.agent)) ~models:(Extensions.model_catalog_json ())
+          ~context_usage:(extension_context_usage ui.agent)
+          ~system_prompt:(Agent.system_prompt ui.agent) ~has_ui:true ~is_idle:(not ui.turn_active)
+          ~tools_expanded:ui.tools_expanded shortcut_spec
+      with
+      | None -> false
+      | Some (Extensions.Shortcut_response_output response) ->
+        Option.iter
+          (fun choice ->
+            match Agent.apply_extension_model ui.agent choice with
+            | Ok _ -> ()
+            | Error msg -> push ui (tfg "error") ("Extension setModel failed: " ^ msg))
+          response.Extensions.model_choice;
+        Option.iter (fun name -> ignore (Agent.set_session_name ui.agent name)) response.Extensions.session_name;
+        List.iter
+          (fun entry -> ignore (Agent.append_extension_session_entry ui.agent entry))
+          response.Extensions.session_entries;
+        Option.iter (fun name -> ignore (Themes.set_active_name ~persist:true name)) response.Extensions.theme_name;
+        Option.iter (fun expanded -> ui.tools_expanded <- expanded) response.Extensions.tools_expanded;
+        Option.iter (Agent.set_thinking ui.agent) response.Extensions.thinking_level;
+        apply_extension_runtime_actions ui response;
+        if String.trim response.Extensions.text <> "" then
+          List.iter (push ui (tfg "muted")) (String.split_on_char '\n' response.Extensions.text);
+        push_extension_ui_requests ui response.Extensions.ui;
+        redraw ui;
+        true
+      | Some (Extensions.Shortcut_response_command line) ->
+        let line = String.trim line in
+        if line <> "" then if String.length line > 0 && line.[0] = '/' then cmd ui line else run_turn ui line;
+        true
+    in
     match Keymap.lookup km (Char.lowercase_ascii c, ctrl) with
     | Some Keymap.Quit -> ui.running <- false
     | Some Keymap.Model_picker -> model_picker ui
     | Some Keymap.Settings -> settings ui
     | Some Keymap.Help -> cmd ui "/help"
     | None ->
-      if ctrl then (
+      if handle_extension_shortcut () then ()
+      else if ctrl then (
         match Char.lowercase_ascii c with
         | 'a' -> ui.cursor <- 0; redraw ui
         | 'e' -> ui.cursor <- String.length ui.input; redraw ui
