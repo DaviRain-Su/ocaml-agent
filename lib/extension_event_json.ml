@@ -82,3 +82,50 @@ let model_payload ?provider (cfg : Llm.config) =
 
 let same_model (left : Llm.config) (right : Llm.config) =
   inferred_model_provider left = inferred_model_provider right && left.model = right.model
+
+let truthy s =
+  match String.lowercase_ascii (String.trim s) with
+  | "1" | "true" | "yes" | "y" | "all" | "on" -> true
+  | _ -> false
+
+let is_true_member names json =
+  List.exists
+    (fun name ->
+      match json |> member name with
+      | `Bool true -> true
+      | `String s -> truthy s
+      | _ -> false)
+    names
+
+let bool_member name json =
+  match json |> member name with
+  | `Bool value -> Some value
+  | `String s -> (
+    match String.lowercase_ascii (String.trim s) with
+    | "1" | "true" | "yes" | "y" | "on" -> Some true
+    | "0" | "false" | "no" | "n" | "off" -> Some false
+    | _ -> None)
+  | _ -> None
+
+let reason_member json =
+  List.find_map
+    (fun name ->
+      match json |> member name with
+      | `String s when String.trim s <> "" -> Some s
+      | _ -> None)
+    [ "reason"; "message"; "error" ]
+
+let cancellation_from_json json =
+  match json with
+  | `Assoc _ as obj when is_true_member [ "cancel"; "cancelled"; "abort"; "aborted" ] obj ->
+    Some (Option.value (reason_member obj) ~default:"Cancelled by extension")
+  | _ -> None
+
+let summary_from_json json =
+  match json with
+  | `Assoc _ -> (
+    match json |> member "summary" with
+    | `Assoc _ as summary -> Some summary
+    | `String summary when String.trim summary <> "" -> Some (`Assoc [ ("summary", `String summary) ])
+    | _ -> None)
+  | _ -> None

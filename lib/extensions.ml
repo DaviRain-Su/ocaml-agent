@@ -1312,48 +1312,6 @@ type session_before_tree_result =
     tree_custom_instructions : string option;
     tree_replace_instructions : bool option }
 
-let is_true_member names json =
-  List.exists
-    (fun name ->
-      match json |> member name with
-      | `Bool true -> true
-      | `String s -> truthy s
-      | _ -> false)
-    names
-
-let bool_member name json =
-  match json |> member name with
-  | `Bool value -> Some value
-  | `String s -> (
-    match String.lowercase_ascii (String.trim s) with
-    | "1" | "true" | "yes" | "y" | "on" -> Some true
-    | "0" | "false" | "no" | "n" | "off" -> Some false
-    | _ -> None)
-  | _ -> None
-
-let reason_member json =
-  List.find_map
-    (fun name ->
-      match json |> member name with
-      | `String s when String.trim s <> "" -> Some s
-      | _ -> None)
-    [ "reason"; "message"; "error" ]
-
-let cancellation_from_json json =
-  match json with
-  | `Assoc _ as obj when is_true_member [ "cancel"; "cancelled"; "abort"; "aborted" ] obj ->
-    Some (Option.value (reason_member obj) ~default:"Cancelled by extension")
-  | _ -> None
-
-let summary_from_json json =
-  match json with
-  | `Assoc _ -> (
-    match json |> member "summary" with
-    | `Assoc _ as summary -> Some summary
-    | `String summary when String.trim summary <> "" -> Some (`Assoc [ ("summary", `String summary) ])
-    | _ -> None)
-  | _ -> None
-
 let session_before event payload =
   let decision = ref Session_continue in
   let cancelled () = match !decision with Session_cancel _ -> true | Session_continue -> false in
@@ -1364,8 +1322,8 @@ let session_before event payload =
            match emit_event runtime path event payload with
            | Error _ -> ()
            | Ok json ->
-             let result_cancel = cancellation_from_json (json |> member "result") in
-             let event_cancel = cancellation_from_json (json |> member "event") in
+             let result_cancel = Extension_event_json.cancellation_from_json (json |> member "result") in
+             let event_cancel = Extension_event_json.cancellation_from_json (json |> member "event") in
              (match Option.value result_cancel ~default:(Option.value event_cancel ~default:"") with
               | "" -> ()
               | reason -> decision := Session_cancel reason));
@@ -1442,8 +1400,8 @@ let emit_session_before_tree ~target_id ?old_leaf_id ?common_ancestor_id ?label 
                | `Assoc _ as result -> result
                | _ -> `Assoc []
              in
-             let result_cancel = cancellation_from_json handler_result in
-             let event_cancel = cancellation_from_json event in
+             let result_cancel = Extension_event_json.cancellation_from_json handler_result in
+             let event_cancel = Extension_event_json.cancellation_from_json event in
              (match Option.value result_cancel ~default:(Option.value event_cancel ~default:"") with
               | reason when String.trim reason <> "" ->
                 result := { !result with tree_cancel = Some reason }
@@ -1455,9 +1413,9 @@ let emit_session_before_tree ~target_id ?old_leaf_id ?common_ancestor_id ?label 
                   | None -> first_string event_preparation [ "label" ]
                 in
                 let next_summary =
-                  match summary_from_json handler_result with
+                  match Extension_event_json.summary_from_json handler_result with
                   | Some summary -> Some summary
-                  | None -> summary_from_json event
+                  | None -> Extension_event_json.summary_from_json event
                 in
                 let next_custom_instructions =
                   match first_string handler_result [ "customInstructions" ] with
@@ -1465,9 +1423,9 @@ let emit_session_before_tree ~target_id ?old_leaf_id ?common_ancestor_id ?label 
                   | None -> first_string event_preparation [ "customInstructions" ]
                 in
                 let next_replace_instructions =
-                  match bool_member "replaceInstructions" handler_result with
+                  match Extension_event_json.bool_member "replaceInstructions" handler_result with
                   | Some _ as replace -> replace
-                  | None -> bool_member "replaceInstructions" event_preparation
+                  | None -> Extension_event_json.bool_member "replaceInstructions" event_preparation
                 in
                 result :=
                   { !result with
