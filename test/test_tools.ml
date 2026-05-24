@@ -995,6 +995,10 @@ let () =
   in
   let _ =
     run "write_file"
+      {|{"path":".pi/extensions/tool-factories.ts","content":"const { createReadTool, createWriteTool, createEditTool, createBashTool, createGrepTool, createFindTool, createLsTool, createCodingTools, createReadOnlyTools, createReadToolDefinition, createBashToolDefinition, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateHead, truncateTail, truncateLine, formatSize } = require(\"@earendil-works/pi-coding-agent\");\n\nexport default function(pi) {\n  const cwd = process.cwd();\n  const rename = (tool, name) => ({ ...tool, name, description: `${name} via factory` });\n  pi.registerTool(rename(createReadTool(cwd), \"factory_read\"));\n  pi.registerTool(rename(createWriteTool(cwd), \"factory_write\"));\n  pi.registerTool(rename(createEditTool(cwd), \"factory_edit\"));\n  pi.registerTool(rename(createBashTool(cwd), \"factory_bash\"));\n  pi.registerTool(rename(createGrepTool(cwd), \"factory_grep\"));\n  pi.registerTool(rename(createFindTool(cwd), \"factory_find\"));\n  pi.registerTool(rename(createLsTool(cwd), \"factory_ls\"));\n  pi.registerCommand(\"factoryprobe\", {\n    description: \"Probe tool factory exports\",\n    handler: async () => {\n      const remoteRead = createReadToolDefinition(cwd, { operations: { readFile: async () => \"remote\\nbody\" } });\n      const remote = await remoteRead.execute(\"remote\", { path: \"ignored.txt\", limit: 1 });\n      const hookedBash = createBashToolDefinition(cwd, {\n        operations: { exec: async (command, _cwd, options) => { options.onData(Buffer.from(`hooked:${command}`)); return { exitCode: 0 }; } },\n        spawnHook: ({ command }) => ({ command: `${command}:spawned` }),\n      });\n      const bash = await hookedBash.execute(\"bash\", { command: \"cmd\" });\n      const head = truncateHead(\"a\\nb\\nc\", { maxLines: 2 }).content.replace(/\\n/g, \",\");\n      const tail = truncateTail(\"a\\nb\\nc\", { maxLines: 2 }).content.replace(/\\n/g, \",\");\n      const line = truncateLine(\"abcdef\", 3).content;\n      return [\n        createCodingTools(cwd).map((tool) => tool.name).join(\",\"),\n        createReadOnlyTools(cwd).map((tool) => tool.name).join(\",\"),\n        DEFAULT_MAX_LINES,\n        DEFAULT_MAX_BYTES,\n        formatSize(2048),\n        head,\n        tail,\n        line,\n        remote.content[0].text,\n        bash.content[0].text,\n      ].join(\":\");\n    },\n  });\n}\n"}|}
+  in
+  let _ =
+    run "write_file"
       {|{"path":".pi/extensions/model.ts","content":"export default function(pi) {\n  pi.registerCommand(\"modelscope\", {\n    description: \"Set runtime model\",\n    handler: async () => `${await pi.setModel({ provider: \"runtime\", id: \"runtime-small\" })}`,\n  });\n}\n"}|}
   in
   let _ =
@@ -1272,6 +1276,56 @@ let () =
      | Some output ->
        output = "function:0:0:queuedai:true:true:true:true:true:true:true:inline:ok:true"
      | None -> false);
+  check "TypeScript extension exports tool factory APIs"
+    ((not node_available)
+     ||
+     match Extensions.execute_command "/factoryprobe" with
+     | Some output ->
+       output = "read,bash,edit,write:read,grep,find,ls:2000:51200:2.0KB:a,b:b,c:abc:remote:hooked:cmd:spawned"
+     | None -> false);
+  check "TypeScript extension factory read/write/edit/bash tools execute"
+    ((not node_available)
+     ||
+     let write_ok =
+       match Tools.find "factory_write" with
+       | Some t -> contains0 (t.Tools.execute (`Assoc [ ("path", `String "factory-tools.txt"); ("content", `String "alpha") ])) "Wrote 5 bytes"
+       | None -> false
+     in
+     let edit_ok =
+       match Tools.find "factory_edit" with
+       | Some t -> contains0 (t.Tools.execute (`Assoc [ ("path", `String "factory-tools.txt"); ("old_str", `String "alpha"); ("new_str", `String "beta") ])) "Edited factory-tools.txt"
+       | None -> false
+     in
+     let read_ok =
+       match Tools.find "factory_read" with
+       | Some t -> t.Tools.execute (`Assoc [ ("path", `String "factory-tools.txt") ]) = "beta"
+       | None -> false
+     in
+     let bash_ok =
+       match Tools.find "factory_bash" with
+       | Some t -> t.Tools.execute (`Assoc [ ("command", `String "printf factory-bash") ]) = "factory-bash"
+       | None -> false
+     in
+     write_ok && edit_ok && read_ok && bash_ok);
+  check "TypeScript extension factory grep/find/ls tools execute"
+    ((not node_available)
+     ||
+     let grep_ok =
+       match Tools.find "factory_grep" with
+       | Some t -> contains0 (t.Tools.execute (`Assoc [ ("pattern", `String "beta"); ("path", `String "."); ("include", `String "factory-tools.txt") ])) "factory-tools.txt:1:beta"
+       | None -> false
+     in
+     let find_ok =
+       match Tools.find "factory_find" with
+       | Some t -> contains0 (t.Tools.execute (`Assoc [ ("pattern", `String "factory-tools.txt"); ("path", `String ".") ])) "factory-tools.txt"
+       | None -> false
+     in
+     let ls_ok =
+       match Tools.find "factory_ls" with
+       | Some t -> contains0 (t.Tools.execute (`Assoc [ ("path", `String ".") ])) "factory-tools.txt"
+       | None -> false
+     in
+     grep_ok && find_ok && ls_ok);
   check "TypeScript extension get/setThinkingLevel updates runtime state"
     ((not node_available)
      ||

@@ -420,7 +420,11 @@ tool-event type guards such as `isToolCallEventType()` and
 SDK-compatible tool wrapping. It also exposes the Pi extension loader/runtime
 entry points `createExtensionRuntime()`, `loadExtensionFromFactory()`,
 `loadExtensions()`, `discoverAndLoadExtensions()`, and `ExtensionRunner()` for
-programmatic extension composition. Custom UI surface calls such as status, widget, title,
+programmatic extension composition. Tool factory exports such as
+`createReadTool()`, `createBashTool()`, `createCodingTools()`,
+`createReadToolDefinition()`, and truncation helpers are available for
+extensions that need Pi-compatible built-in tool instances with custom
+operations. Custom UI surface calls such as status, widget, title,
 header/footer, editor text, paste, and working-state updates are captured for
 terminal and RPC adapters. TUI working message, visibility, and indicator
 settings drive the active turn status row. Component factories that can render

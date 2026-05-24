@@ -132,131 +132,10 @@ let effective_tool_names base =
 let effective_thinking base =
   match !active_thinking_level with Some level -> level | None -> base
 
-let env_nonempty k =
-  match Sys.getenv_opt k with Some s when String.trim s <> "" -> Some s | _ -> None
-
 let truthy s =
   match String.lowercase_ascii (String.trim s) with
   | "1" | "true" | "yes" | "y" | "all" -> true
   | _ -> false
-
-let split_paths s =
-  s |> String.split_on_char '\n' |> List.map String.trim |> List.filter (fun p -> p <> "")
-
-let user_extensions_dir () = Filename.concat (Config_paths.agent_dir ()) "extensions"
-
-let manifest_paths () =
-  let explicit =
-    (match env_nonempty "AGENT_TOOLS_FILE" with Some p -> [ p ] | None -> [])
-    @ (match env_nonempty "AGENT_EXTENSION_PATHS" with Some s -> split_paths s | None -> [])
-  in
-  let defaults =
-    match Sys.getenv_opt "AGENT_NO_EXTENSIONS" with
-    | Some s when truthy s -> []
-    | _ ->
-      [ Config_paths.user_tools_manifest ();
-        Config_paths.user_tools_dir ();
-        user_extensions_dir ();
-        ".ocaml-agent/extensions";
-        ".ocaml-agent/tools.json";
-        ".pi/extensions";
-        ".pi/tools.json" ]
-      @ Packages.paths Packages.Extension
-      @ Settings.string_list "extensions"
-  in
-  Config_paths.uniq (defaults @ explicit)
-
-let is_json_file path = Filename.check_suffix path ".json"
-
-let is_js_extension_file path =
-  List.exists (Filename.check_suffix path) [ ".ts"; ".js"; ".mjs"; ".cjs" ]
-
-let is_ocaml_sdk_extension_file path =
-  List.exists (Filename.check_suffix path) [ ".ocamlext"; ".ocaml-extension" ]
-
-let files_in_dir path =
-  match Sys.readdir path with
-  | exception _ -> []
-  | entries ->
-    Array.to_list entries
-    |> List.filter (fun name -> is_json_file name || is_js_extension_file name || is_ocaml_sdk_extension_file name)
-    |> List.sort compare
-    |> List.map (Filename.concat path)
-
-let index_files path =
-  [ "index.ts"; "index.js"; "index.mjs"; "index.cjs"; "index.ocamlext"; "index.ocaml-extension" ]
-  |> List.map (Filename.concat path)
-  |> List.filter Sys.file_exists
-
-let expand_manifest_path path =
-  if Sys.file_exists path && Sys.is_directory path then
-    let direct = files_in_dir path in
-    let nested =
-      match Sys.readdir path with
-      | exception _ -> []
-      | entries ->
-        Array.to_list entries
-        |> List.concat_map (fun name ->
-               let full = Filename.concat path name in
-               if Sys.file_exists full && Sys.is_directory full then index_files full else [])
-    in
-    direct @ nested |> Config_paths.uniq
-  else if is_json_file path || is_js_extension_file path || is_ocaml_sdk_extension_file path then [ path ]
-  else []
-
-(* Run [command], feeding [input] on stdin, returning combined stdout+stderr. *)
-let run_command command input =
-  let code, body = Tools.run_process ~stdin_data:input command in
-  if code = 0 then body else Printf.sprintf "(exit %d)\n%s" code body
-
-let tool_of_json (j : Yojson.Safe.t) : Tools.tool option =
-  match (j |> member "name", j |> member "command") with
-  | `String name, `String command when name <> "" && command <> "" ->
-    let description = match j |> member "description" with `String s -> s | _ -> "" in
-    let parameters =
-      match j |> member "parameters" with
-      | `Null -> `Assoc [ ("type", `String "object"); ("properties", `Assoc []) ]
-      | p -> p
-    in
-    Some
-      { Tools.name;
-        description;
-        parameters;
-        requires_approval = true;
-        execute = (fun input -> try run_command command (Yojson.Safe.to_string input) with
-        | Sys.Break as e -> raise e
-        | e -> "Error: " ^ Printexc.to_string e) }
-  | _ -> None
-
-let load_manifest path =
-  if not (Sys.file_exists path) then []
-  else
-    match
-      let ic = open_in path in
-      Fun.protect ~finally:(fun () -> close_in_noerr ic) (fun () -> Yojson.Safe.from_channel ic)
-    with
-    | exception Yojson.Json_error msg ->
-      Printf.eprintf "[warning] extension manifest %s has invalid JSON: %s\n%!" path msg;
-      []
-    | exception e ->
-      Printf.eprintf "[warning] failed to read extension manifest %s: %s\n%!" path (Printexc.to_string e);
-      []
-    | json ->
-      let entries = match json |> member "tools" with `List l -> l | _ -> [] in
-      if entries = [] then
-        Printf.eprintf "[warning] extension manifest %s has no tools array or it is empty\n%!" path;
-      List.filter_map
-        (fun j ->
-          match tool_of_json j with
-          | Some t when Tools.register t -> Some t.Tools.name
-          | Some _ -> None
-          | None ->
-            let name =
-              match j |> member "name" with `String s -> s | _ -> "(unnamed)"
-            in
-            Printf.eprintf "[warning] extension tool %s in %s is missing a required field (name or command)\n%!" name path;
-            None)
-        entries
 
 let node_bridge_source =
   {js|
@@ -541,6 +420,539 @@ function createLocalToolOperations(options = {}) {
   };
 }
 
+const DEFAULT_MAX_LINES = 2000;
+const DEFAULT_MAX_BYTES = 50 * 1024;
+
+function splitLinesForCounting(content) {
+  if (content.length === 0) return [];
+  const lines = content.split("\n");
+  if (content.endsWith("\n")) lines.pop();
+  return lines;
+}
+
+function formatSize(bytes) {
+  const value = Number(bytes || 0);
+  if (value < 1024) return `${value}B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)}KB`;
+  return `${(value / (1024 * 1024)).toFixed(1)}MB`;
+}
+
+function truncationResult(content, truncated, truncatedBy, totalLines, totalBytes, maxLines, maxBytes, extra = {}) {
+  return {
+    content,
+    truncated,
+    truncatedBy,
+    totalLines,
+    totalBytes,
+    outputLines: splitLinesForCounting(content).length,
+    outputBytes: Buffer.byteLength(content, "utf8"),
+    lastLinePartial: false,
+    firstLineExceedsLimit: false,
+    maxLines,
+    maxBytes,
+    ...extra,
+  };
+}
+
+function truncateHead(content, options = {}) {
+  const text = String(content || "");
+  const maxLines = options.maxLines ?? DEFAULT_MAX_LINES;
+  const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
+  const lines = splitLinesForCounting(text);
+  const totalLines = lines.length;
+  const totalBytes = Buffer.byteLength(text, "utf8");
+  if (totalLines <= maxLines && totalBytes <= maxBytes) {
+    return truncationResult(text, false, null, totalLines, totalBytes, maxLines, maxBytes);
+  }
+  if (lines.length && Buffer.byteLength(lines[0], "utf8") > maxBytes) {
+    return truncationResult("", true, "bytes", totalLines, totalBytes, maxLines, maxBytes, { firstLineExceedsLimit: true });
+  }
+  const out = [];
+  let bytes = 0;
+  let truncatedBy = "lines";
+  for (const line of lines) {
+    if (out.length >= maxLines) {
+      truncatedBy = "lines";
+      break;
+    }
+    const candidate = out.length === 0 ? line : `\n${line}`;
+    const candidateBytes = Buffer.byteLength(candidate, "utf8");
+    if (bytes + candidateBytes > maxBytes) {
+      truncatedBy = "bytes";
+      break;
+    }
+    out.push(line);
+    bytes += candidateBytes;
+  }
+  return truncationResult(out.join("\n"), true, truncatedBy, totalLines, totalBytes, maxLines, maxBytes);
+}
+
+function truncateTail(content, options = {}) {
+  const text = String(content || "");
+  const maxLines = options.maxLines ?? DEFAULT_MAX_LINES;
+  const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
+  const lines = splitLinesForCounting(text);
+  const totalLines = lines.length;
+  const totalBytes = Buffer.byteLength(text, "utf8");
+  if (totalLines <= maxLines && totalBytes <= maxBytes) {
+    return truncationResult(text, false, null, totalLines, totalBytes, maxLines, maxBytes);
+  }
+  const out = [];
+  let bytes = 0;
+  let truncatedBy = "lines";
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (out.length >= maxLines) {
+      truncatedBy = "lines";
+      break;
+    }
+    const candidate = out.length === 0 ? lines[i] : `${lines[i]}\n`;
+    const candidateBytes = Buffer.byteLength(candidate, "utf8");
+    if (bytes + candidateBytes > maxBytes) {
+      truncatedBy = "bytes";
+      break;
+    }
+    out.unshift(lines[i]);
+    bytes += candidateBytes;
+  }
+  return truncationResult(out.join("\n"), true, truncatedBy, totalLines, totalBytes, maxLines, maxBytes);
+}
+
+function truncateLine(line, maxBytes = DEFAULT_MAX_BYTES) {
+  const text = String(line || "");
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) return { content: text, truncated: false };
+  let out = "";
+  for (const char of text) {
+    if (Buffer.byteLength(out + char, "utf8") > maxBytes) break;
+    out += char;
+  }
+  return { content: out, truncated: true };
+}
+
+function toolTextResult(text, details = {}) {
+  return { content: [{ type: "text", text: String(text ?? "") }], details };
+}
+
+function toolPath(input) {
+  return String(input && (input.path ?? input.filePath ?? input.file_path ?? input.target ?? "") || "");
+}
+
+function resolveToolPath(cwd, filePath) {
+  const raw = String(filePath || "");
+  return path.isAbsolute(raw) ? raw : path.resolve(cwd || process.cwd(), raw);
+}
+
+function createReadToolDefinition(cwd = process.cwd(), options = {}) {
+  const operations = options.operations || createLocalFileOperations();
+  return {
+    name: "read",
+    label: "Read",
+    description: `Read the contents of a file. Supports text files. Output is truncated to ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB.`,
+    parameters: Type.Object({
+      path: Type.String({ description: "File path to read" }),
+      offset: Type.Optional(Type.Integer({ description: "1-based line offset" })),
+      limit: Type.Optional(Type.Integer({ description: "Maximum number of lines" })),
+    }),
+    execute: async (_toolCallId, input = {}) => {
+      const filePath = toolPath(input);
+      const absolutePath = resolveToolPath(cwd, filePath);
+      let text = await operations.readFile(absolutePath, { encoding: "utf8" });
+      text = Buffer.isBuffer(text) ? text.toString("utf8") : String(text);
+      const lines = text.split(/\r?\n/);
+      if (input.offset !== undefined || input.limit !== undefined) {
+        const offset = Math.max(1, Number(input.offset || 1));
+        const limit = input.limit === undefined ? lines.length : Math.max(0, Number(input.limit));
+        text = lines.slice(offset - 1, offset - 1 + limit).join("\n");
+      }
+      const truncated = truncateHead(text, options.truncation || {});
+      return toolTextResult(truncated.content, { path: filePath, absolutePath, truncation: truncated });
+    },
+  };
+}
+
+function createWriteToolDefinition(cwd = process.cwd(), options = {}) {
+  const operations = options.operations || createLocalFileOperations();
+  return {
+    name: "write",
+    label: "Write",
+    description: "Write content to a file, creating parent directories when needed.",
+    parameters: Type.Object({
+      path: Type.String({ description: "File path to write" }),
+      content: Type.String({ description: "Content to write" }),
+    }),
+    execute: async (_toolCallId, input = {}) => {
+      const filePath = toolPath(input);
+      const absolutePath = resolveToolPath(cwd, filePath);
+      const content = String(input.content ?? input.text ?? "");
+      const result = await withFileMutationQueue(absolutePath, () => operations.writeFile(absolutePath, content, "utf8"));
+      const bytes = result && typeof result.bytes === "number" ? result.bytes : Buffer.byteLength(content);
+      return toolTextResult(`Wrote ${bytes} bytes to ${filePath}`, { path: filePath, absolutePath, bytes });
+    },
+  };
+}
+
+function createEditToolDefinition(cwd = process.cwd(), options = {}) {
+  const operations = options.operations || createLocalFileOperations();
+  return {
+    name: "edit",
+    label: "Edit",
+    description: "Replace text in a file.",
+    parameters: Type.Object({
+      path: Type.String({ description: "File path to edit" }),
+      old_str: Type.Optional(Type.String({ description: "Text to replace" })),
+      new_str: Type.Optional(Type.String({ description: "Replacement text" })),
+      oldText: Type.Optional(Type.String({ description: "Text to replace" })),
+      newText: Type.Optional(Type.String({ description: "Replacement text" })),
+    }),
+    execute: async (_toolCallId, input = {}) => {
+      const filePath = toolPath(input);
+      const absolutePath = resolveToolPath(cwd, filePath);
+      const oldText = String(input.old_str ?? input.oldText ?? "");
+      const newText = String(input.new_str ?? input.newText ?? "");
+      return withFileMutationQueue(absolutePath, async () => {
+        const beforeRaw = await operations.readFile(absolutePath, { encoding: "utf8" });
+        const before = Buffer.isBuffer(beforeRaw) ? beforeRaw.toString("utf8") : String(beforeRaw);
+        if (!before.includes(oldText)) throw new Error("old text not found");
+        const after = before.replace(oldText, newText);
+        await operations.writeFile(absolutePath, after, "utf8");
+        return toolTextResult(`Edited ${filePath}`, { path: filePath, absolutePath, replacements: 1 });
+      });
+    },
+  };
+}
+
+function createBashToolDefinition(cwd = process.cwd(), options = {}) {
+  const operations = options.operations || createLocalBashOperations(options);
+  return {
+    name: "bash",
+    label: "Bash",
+    description: `Execute a bash command in the current working directory. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB.`,
+    parameters: Type.Object({
+      command: Type.String({ description: "Command to execute" }),
+      timeout: Type.Optional(Type.Number({ description: "Timeout in seconds" })),
+      cwd: Type.Optional(Type.String({ description: "Working directory" })),
+    }),
+    execute: async (_toolCallId, input = {}) => {
+      let command = String(input.command || "");
+      let commandCwd = resolveToolPath(cwd, input.cwd || ".");
+      let env = process.env;
+      if (typeof options.spawnHook === "function") {
+        const hooked = await options.spawnHook({ command, cwd: commandCwd, env });
+        if (hooked && typeof hooked === "object") {
+          if (hooked.command) command = String(hooked.command);
+          if (hooked.cwd) commandCwd = String(hooked.cwd);
+          if (hooked.env) env = hooked.env;
+        }
+      }
+      const chunks = [];
+      const result = await operations.exec(command, commandCwd, {
+        timeout: input.timeout,
+        env,
+        onData: (data) => chunks.push(outputText(data)),
+      });
+      const output = truncateTail(chunks.join("").replace(/\r/g, ""), options.truncation || {});
+      return toolTextResult(output.content, { command, cwd: commandCwd, exitCode: result.exitCode ?? 0, truncation: output });
+    },
+  };
+}
+
+function walkFiles(root, limit = 10000) {
+  const out = [];
+  const visit = (dir) => {
+    if (out.length >= limit) return;
+    let entries = [];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.name === ".git" || entry.name === "node_modules" || entry.name === "_build") continue;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) visit(full);
+      else if (entry.isFile()) out.push(full);
+      if (out.length >= limit) return;
+    }
+  };
+  visit(root);
+  return out;
+}
+
+function globToRegExp(glob) {
+  const escaped = String(glob || "*").replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".");
+  return new RegExp(`^${escaped}$`);
+}
+
+function createGrepToolDefinition(cwd = process.cwd(), options = {}) {
+  return {
+    name: "grep",
+    label: "Grep",
+    description: "Search file contents for a pattern.",
+    parameters: Type.Object({
+      pattern: Type.String({ description: "Pattern to search for" }),
+      path: Type.Optional(Type.String({ description: "Directory to search" })),
+      include: Type.Optional(Type.String({ description: "Filename glob" })),
+    }),
+    execute: async (_toolCallId, input = {}) => {
+      const root = resolveToolPath(cwd, input.path || ".");
+      const pattern = String(input.pattern ?? input.query ?? "");
+      const re = input.regex === false ? null : new RegExp(pattern, input.ignoreCase ? "i" : "");
+      const include = input.include ? globToRegExp(input.include) : null;
+      const matches = [];
+      for (const file of walkFiles(root, options.limit || 10000)) {
+        const rel = path.relative(cwd, file);
+        if (include && !include.test(path.basename(file)) && !include.test(rel)) continue;
+        let text;
+        try {
+          text = fs.readFileSync(file, "utf8");
+        } catch {
+          continue;
+        }
+        text.split(/\r?\n/).forEach((line, index) => {
+          const ok = re ? re.test(line) : line.includes(pattern);
+          if (ok) matches.push(`${rel}:${index + 1}:${line}`);
+        });
+      }
+      const truncated = truncateHead(matches.join("\n"), options.truncation || {});
+      return toolTextResult(truncated.content, { matches: matches.length, truncation: truncated });
+    },
+  };
+}
+
+function createFindToolDefinition(cwd = process.cwd(), options = {}) {
+  return {
+    name: "find",
+    label: "Find",
+    description: "Search for files by glob pattern.",
+    parameters: Type.Object({
+      pattern: Type.String({ description: "Glob pattern" }),
+      path: Type.Optional(Type.String({ description: "Directory to search" })),
+    }),
+    execute: async (_toolCallId, input = {}) => {
+      const root = resolveToolPath(cwd, input.path || ".");
+      const pattern = globToRegExp(input.pattern || input.glob || "*");
+      const matches = walkFiles(root, options.limit || 10000)
+        .map((file) => path.relative(cwd, file))
+        .filter((rel) => pattern.test(path.basename(rel)) || pattern.test(rel))
+        .sort();
+      const truncated = truncateHead(matches.join("\n"), options.truncation || {});
+      return toolTextResult(truncated.content, { matches: matches.length, truncation: truncated });
+    },
+  };
+}
+
+function createLsToolDefinition(cwd = process.cwd(), options = {}) {
+  const operations = options.operations || createLocalFileOperations();
+  return {
+    name: "ls",
+    label: "List",
+    description: "List directory contents.",
+    parameters: Type.Object({
+      path: Type.Optional(Type.String({ description: "Directory path" })),
+    }),
+    execute: async (_toolCallId, input = {}) => {
+      const dir = resolveToolPath(cwd, input.path || ".");
+      const entries = await operations.listDir(dir);
+      const rendered = [];
+      for (const entry of entries.sort()) {
+        const full = path.join(dir, entry);
+        let suffix = "";
+        try {
+          suffix = fs.statSync(full).isDirectory() ? "/" : "";
+        } catch {}
+        rendered.push(entry + suffix);
+      }
+      const truncated = truncateHead(rendered.join("\n"), options.truncation || {});
+      return toolTextResult(truncated.content, { path: input.path || ".", entries: entries.length, truncation: truncated });
+    },
+  };
+}
+
+function createReadTool(cwd, options) { return wrapToolDefinition(createReadToolDefinition(cwd, options)); }
+function createWriteTool(cwd, options) { return wrapToolDefinition(createWriteToolDefinition(cwd, options)); }
+function createEditTool(cwd, options) { return wrapToolDefinition(createEditToolDefinition(cwd, options)); }
+function createBashTool(cwd, options) { return wrapToolDefinition(createBashToolDefinition(cwd, options)); }
+function createGrepTool(cwd, options) { return wrapToolDefinition(createGrepToolDefinition(cwd, options)); }
+function createFindTool(cwd, options) { return wrapToolDefinition(createFindToolDefinition(cwd, options)); }
+function createLsTool(cwd, options) { return wrapToolDefinition(createLsToolDefinition(cwd, options)); }
+
+function createCodingTools(cwd, options = {}) {
+  return [
+    createReadTool(cwd, options.read),
+    createBashTool(cwd, options.bash),
+    createEditTool(cwd, options.edit),
+    createWriteTool(cwd, options.write),
+  ];
+}
+
+function createReadOnlyTools(cwd, options = {}) {
+  return [
+    createReadTool(cwd, options.read),
+    createGrepTool(cwd, options.grep),
+    createFindTool(cwd, options.find),
+    createLsTool(cwd, options.ls),
+  ];
+}
+
+function createCodingToolDefinitions(cwd, options = {}) {
+  return [
+    createReadToolDefinition(cwd, options.read),
+    createBashToolDefinition(cwd, options.bash),
+    createEditToolDefinition(cwd, options.edit),
+    createWriteToolDefinition(cwd, options.write),
+  ];
+}
+
+function createReadOnlyToolDefinitions(cwd, options = {}) {
+  return [
+    createReadToolDefinition(cwd, options.read),
+    createGrepToolDefinition(cwd, options.grep),
+    createFindToolDefinition(cwd, options.find),
+    createLsToolDefinition(cwd, options.ls),
+  ];
+}
+
+function bridgeHomeDir() {
+  return process.env.HOME || process.cwd();
+}
+
+function expandBridgeTilde(value) {
+  const text = String(value || "");
+  if (text === "~") return bridgeHomeDir();
+  if (text.startsWith("~/")) return path.join(bridgeHomeDir(), text.slice(2));
+  return text;
+}
+
+function getAgentDir() {
+  return expandBridgeTilde(process.env.PI_CODING_AGENT_DIR || process.env.AGENT_CODING_AGENT_DIR || process.env.OCAML_AGENT_DIR || process.env.AGENT_DIR || path.join(bridgeHomeDir(), ".pi", "agent"));
+}
+
+const VERSION = "ocaml-agent";
+
+function defaultSessionsDir() {
+  return expandBridgeTilde(process.env.AGENT_SESSION_DIR || process.env.PI_CODING_AGENT_SESSION_DIR || path.join(getAgentDir(), "sessions"));
+}
+
+function readJsonLines(filePath) {
+  try {
+    return fs.readFileSync(filePath, "utf8")
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function sessionDate(value, fallbackMs = 0) {
+  if (typeof value === "number") return new Date(value > 100000000000 ? value : value * 1000);
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Date.parse(value);
+    if (!Number.isNaN(parsed)) return new Date(parsed);
+  }
+  return new Date(fallbackMs || 0);
+}
+
+function textFromSessionContent(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.map((item) => item && item.type === "text" ? item.text || "" : "").filter(Boolean).join(" ");
+  }
+  return "";
+}
+
+function sessionInfoFromFile(filePath) {
+  const lines = readJsonLines(filePath);
+  if (lines.length === 0) return null;
+  const header = lines[0] || {};
+  const isOcamlHeader = header._session !== undefined;
+  const isPiHeader = header.type === "session";
+  if (!isOcamlHeader && !isPiHeader) return null;
+  let name = typeof header.name === "string" ? header.name : undefined;
+  let messageCount = 0;
+  let firstMessage = "";
+  const allMessages = [];
+  for (const entry of lines.slice(1)) {
+    if (entry && entry.type === "session_info" && typeof entry.name === "string") name = entry.name || undefined;
+    let message = null;
+    if (entry && entry.type === "message" && entry.message) message = entry.message;
+    else if (entry && typeof entry.role === "string") message = entry;
+    if (!message) continue;
+    messageCount += 1;
+    if (message.role !== "user" && message.role !== "assistant") continue;
+    const text = textFromSessionContent(message.content);
+    if (!text) continue;
+    allMessages.push(text);
+    if (!firstMessage && message.role === "user") firstMessage = text;
+  }
+  let stats = null;
+  try {
+    stats = fs.statSync(filePath);
+  } catch {}
+  const created = isOcamlHeader ? sessionDate(header.created, stats ? stats.birthtimeMs : 0) : sessionDate(header.timestamp, stats ? stats.birthtimeMs : 0);
+  const modified = stats ? stats.mtime : created;
+  return {
+    path: filePath,
+    file: filePath,
+    id: String(header.id || path.basename(filePath, ".jsonl")),
+    cwd: String(header.cwd || ""),
+    name,
+    parentSessionPath: header.parentSession,
+    created,
+    modified,
+    messageCount,
+    firstMessage: firstMessage || "(no messages)",
+    allMessagesText: allMessages.join(" "),
+  };
+}
+
+function listSessionsFromDir(sessionDir) {
+  let entries = [];
+  try {
+    entries = fs.readdirSync(sessionDir);
+  } catch {
+    return [];
+  }
+  return entries
+    .filter((name) => name.endsWith(".jsonl"))
+    .map((name) => sessionInfoFromFile(path.join(sessionDir, name)))
+    .filter(Boolean)
+    .sort((a, b) => b.modified.getTime() - a.modified.getTime());
+}
+
+class SessionManager {
+  static async list(_cwd = process.cwd(), sessionDir = undefined, onProgress = undefined) {
+    const dir = sessionDir ? expandBridgeTilde(sessionDir) : defaultSessionsDir();
+    const sessions = listSessionsFromDir(dir);
+    if (typeof onProgress === "function") onProgress(sessions.length, sessions.length);
+    return sessions;
+  }
+
+  static async listAll(onProgress = undefined) {
+    const root = defaultSessionsDir();
+    const sessions = [];
+    const addDir = (dir) => {
+      for (const session of listSessionsFromDir(dir)) sessions.push(session);
+    };
+    addDir(root);
+    try {
+      for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+        if (entry.isDirectory()) addDir(path.join(root, entry.name));
+      }
+    } catch {}
+    sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
+    if (typeof onProgress === "function") onProgress(sessions.length, sessions.length);
+    return sessions;
+  }
+}
+
 const fileMutationQueues = new Map();
 let fileMutationRegistrationQueue = Promise.resolve();
 
@@ -727,6 +1139,33 @@ function piCodingAgentExports() {
     createLocalBashOperations,
     createLocalFileOperations,
     createLocalToolOperations,
+    createReadToolDefinition,
+    createWriteToolDefinition,
+    createEditToolDefinition,
+    createBashToolDefinition,
+    createGrepToolDefinition,
+    createFindToolDefinition,
+    createLsToolDefinition,
+    createReadTool,
+    createWriteTool,
+    createEditTool,
+    createBashTool,
+    createGrepTool,
+    createFindTool,
+    createLsTool,
+    createCodingTools,
+    createReadOnlyTools,
+    createCodingToolDefinitions,
+    createReadOnlyToolDefinitions,
+    DEFAULT_MAX_LINES,
+    DEFAULT_MAX_BYTES,
+    getAgentDir,
+    VERSION,
+    SessionManager,
+    formatSize,
+    truncateHead,
+    truncateTail,
+    truncateLine,
     withFileMutationQueue,
     createEventBus,
     CustomEditor,
@@ -3708,9 +4147,9 @@ let load_ocaml_sdk_extension ?(reason = "startup") path =
     if List.mem "session_start" events then names @ emit_session_start_for_path ~reason Ocaml_sdk path else names
 
 let load_path ?(reason = "startup") path =
-  if is_json_file path then load_manifest path
-  else if is_js_extension_file path then load_js_extension ~reason path
-  else if is_ocaml_sdk_extension_file path then load_ocaml_sdk_extension ~reason path
+  if Extension_manifest.is_json_file path then Extension_manifest.load_manifest path
+  else if Extension_manifest.is_js_extension_file path then load_js_extension ~reason path
+  else if Extension_manifest.is_ocaml_sdk_extension_file path then load_ocaml_sdk_extension ~reason path
   else []
 
 (* Load and register manifest tools; returns the names registered.
@@ -3730,8 +4169,8 @@ let load ?(reason = "startup") () : string list =
   Llm.clear_extension_providers ();
   Models.clear_extension_models ();
   let names =
-    manifest_paths ()
-    |> List.concat_map expand_manifest_path
+    Extension_manifest.manifest_paths ()
+    |> List.concat_map Extension_manifest.expand_manifest_path
     |> List.concat_map (load_path ~reason)
   in
   emit_resources_discover ~reason ();
