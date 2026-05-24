@@ -36,6 +36,10 @@
  (libraries agent_lib)
  (deps ocaml_sdk_extension.exe))
 
+(test
+ (name test_extension_direct)
+ (libraries agent_lib))
+
 (executable
  (name ocaml_sdk_extension)
  (libraries agent_lib str))
